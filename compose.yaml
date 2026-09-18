@@ -1,0 +1,126 @@
+x-agent-environment: &agent-environment
+  AGENT_EXECUTION_MODE: redis
+  AGENT_DATABASE_URL: postgresql+asyncpg://agent:${AGENT_POSTGRES_PASSWORD:?AGENT_POSTGRES_PASSWORD is required}@postgres:5432/agent
+  AGENT_REDIS_URL: redis://:${AGENT_REDIS_PASSWORD:?AGENT_REDIS_PASSWORD is required}@redis:6379/0
+  AGENT_REDIS_NAMESPACE: ${AGENT_REDIS_NAMESPACE:-python-agent}
+  AGENT_LLM_BASE_URL: ${AGENT_LLM_BASE_URL}
+  AGENT_LLM_API_KEY: ${AGENT_LLM_API_KEY}
+  AGENT_LLM_MODEL: ${AGENT_LLM_MODEL}
+  AGENT_LLM_TIMEOUT_SECONDS: ${AGENT_LLM_TIMEOUT_SECONDS:-120}
+  AGENT_LLM_MAX_RETRIES: ${AGENT_LLM_MAX_RETRIES:-2}
+  AGENT_LLM_MAX_TOKENS: ${AGENT_LLM_MAX_TOKENS:-8192}
+  AGENT_DEFAULT_LLM_PROFILE: ${AGENT_DEFAULT_LLM_PROFILE:-default}
+  AGENT_LLM_PROFILES: ${AGENT_LLM_PROFILES:-{}}
+  AGENT_MAX_PARALLEL_SESSIONS: ${AGENT_MAX_PARALLEL_SESSIONS:-4}
+  AGENT_API_TOKEN: ${AGENT_API_TOKEN}
+  AGENT_ALLOW_NETWORK_TOOLS: ${AGENT_ALLOW_NETWORK_TOOLS:-false}
+  AGENT_NETWORK_ALLOWLIST: ${AGENT_NETWORK_ALLOWLIST:-[]}
+  AGENT_KNOWLEDGE_BASE_ENABLED: ${AGENT_KNOWLEDGE_BASE_ENABLED:-false}
+
+x-agent-service: &agent-service
+  build: .
+  restart: unless-stopped
+  user: ${AGENT_UID:-10001}:${AGENT_GID:-10001}
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  env_file:
+    - path: .env
+      required: false
+  environment: *agent-environment
+  volumes:
+    - ${AGENT_PROJECTS_ROOT:-./workspace}:/workspace
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agent
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: ${AGENT_POSTGRES_PASSWORD:?AGENT_POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command:
+      [
+        "sh",
+        "-c",
+        "exec redis-server --appendonly yes --appendfsync everysec --requirepass \"$${AGENT_REDIS_PASSWORD}\"",
+      ]
+    environment:
+      AGENT_REDIS_PASSWORD: ${AGENT_REDIS_PASSWORD:?AGENT_REDIS_PASSWORD is required}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "REDISCLI_AUTH=\"$${AGENT_REDIS_PASSWORD}\" redis-cli ping",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    command: [".venv/bin/alembic", "upgrade", "head"]
+    restart: "no"
+    user: ${AGENT_UID:-10001}:${AGENT_GID:-10001}
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - path: .env
+        required: false
+    environment: *agent-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *agent-service
+    environment:
+      <<: *agent-environment
+      AGENT_HOST: 0.0.0.0
+      AGENT_PORT: 8080
+    ports:
+      - ${AGENT_BIND_ADDRESS:-127.0.0.1}:${AGENT_PORT:-8080}:8080
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import os,urllib.request; r=urllib.request.Request('http://127.0.0.1:8080/api/health',headers={'X-Agent-Token':os.environ['AGENT_API_TOKEN']}); urllib.request.urlopen(r,timeout=3)\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  worker:
+    <<: *agent-service
+    command: [".venv/bin/agent-worker"]
+
+volumes:
+  postgres-data:
+  redis-data:
