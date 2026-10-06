@@ -513,3 +513,102 @@ def test_zero_byte_limit_and_negative_limit(project: Path, filesystem: SafeProje
     assert filesystem.read_text("empty.txt", max_bytes=0) == ""
     with pytest.raises(ToolError, match="non-negative"):
         filesystem.read_text("empty.txt", max_bytes=-1)
+
+
+def test_edit_many_applies_dependent_chain(project: Path, filesystem: SafeProjectFS) -> None:
+    (project / "notes.txt").write_text("alpha", encoding="utf-8")
+
+    assert filesystem.edit_many(
+        "notes.txt",
+        [("alpha", "beta", False), ("beta", "gamma", False)],
+    ) == (Path("notes.txt"), 2)
+    assert (project / "notes.txt").read_text(encoding="utf-8") == "gamma"
+
+
+def test_edit_many_reports_edit_number_and_is_atomic(
+    project: Path, filesystem: SafeProjectFS
+) -> None:
+    (project / "notes.txt").write_text("alpha beta", encoding="utf-8")
+
+    with pytest.raises(ToolError, match="Edit 2"):
+        filesystem.edit_many(
+            "notes.txt",
+            [("alpha", "ALPHA", False), ("missing", "x", False)],
+        )
+
+    assert (project / "notes.txt").read_text(encoding="utf-8") == "alpha beta"
+
+
+def test_edit_many_keeps_one_megabyte_limit(project: Path, filesystem: SafeProjectFS) -> None:
+    (project / "notes.txt").write_text("x" * 1_000_001, encoding="utf-8")
+
+    with pytest.raises(ToolError, match="larger than 1000000 bytes"):
+        filesystem.edit_many("notes.txt", [("x", "y", True)])
+
+
+def test_edit_many_rejects_exponential_growth(project: Path, filesystem: SafeProjectFS) -> None:
+    (project / "notes.txt").write_text("x", encoding="utf-8")
+
+    with pytest.raises(ToolError, match="Edit 20"):
+        filesystem.edit_many("notes.txt", [("x", "xx", True)] * 20)
+
+    assert (project / "notes.txt").read_text(encoding="utf-8") == "x"
+
+
+def test_edit_many_allows_growth_up_to_limit(project: Path, filesystem: SafeProjectFS) -> None:
+    # 19 doublings of "x" land on 2**19 = 524288 bytes, still under the 1 MB result limit.
+    (project / "notes.txt").write_text("x", encoding="utf-8")
+
+    assert filesystem.edit_many("notes.txt", [("x", "xx", True)] * 19) == (
+        Path("notes.txt"),
+        2**19 - 1,
+    )
+    assert (project / "notes.txt").read_text(encoding="utf-8") == "x" * 2**19
+
+
+def test_edit_many_detects_conflict_between_read_and_write(
+    project: Path, filesystem: SafeProjectFS, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = project / "notes.txt"
+    target.write_text("old", encoding="utf-8")
+    real_file_stat = SafeProjectFS._file_stat
+    calls = {"count": 0}
+
+    def external_change(self: SafeProjectFS, name: str, parent_fd: int) -> os.stat_result | None:
+        calls["count"] += 1
+        if calls["count"] == 2:
+            target.write_text("concurrent update", encoding="utf-8")
+        return real_file_stat(self, name, parent_fd)
+
+    monkeypatch.setattr(SafeProjectFS, "_file_stat", external_change)
+
+    with pytest.raises(ToolError, match="conflict"):
+        filesystem.edit_many("notes.txt", [("old", "new", False)])
+
+    assert target.read_text(encoding="utf-8") == "concurrent update"
+    assert sorted(item.name for item in project.iterdir()) == ["notes.txt"]
+
+
+def test_edit_many_detects_conflict_when_file_removed(
+    project: Path, filesystem: SafeProjectFS, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = project / "notes.txt"
+    target.write_text("old", encoding="utf-8")
+    real_file_stat = SafeProjectFS._file_stat
+    calls = {"count": 0}
+
+    def remove_before_replace(
+        self: SafeProjectFS, name: str, parent_fd: int
+    ) -> os.stat_result | None:
+        calls["count"] += 1
+        if calls["count"] == 2:
+            target.unlink()
+        return real_file_stat(self, name, parent_fd)
+
+    monkeypatch.setattr(SafeProjectFS, "_file_stat", remove_before_replace)
+
+    with pytest.raises(ToolError, match="conflict"):
+        filesystem.edit_many("notes.txt", [("old", "new", False)])
+
+    assert not target.exists()
+    assert not list(project.iterdir())

@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     raw_llm_log: bool = False
     knowledge_base_enabled: bool = False
     allow_network_tools: bool = False
+    # OS sandbox for shell commands: "off", "auto" (use it when the system has one) or
+    # "required" (refuse to run a command without it). See agent.sandbox.
+    shell_sandbox: Literal["off", "auto", "required"] = "off"
+    shell_sandbox_network: bool = False
+    shell_sandbox_read_paths: list[str] = Field(default_factory=list)
     network_allowlist: list[str] = Field(default_factory=list)
     http_max_response_bytes: int = Field(default=1_000_000, ge=1024, le=20_000_000)
     web_search_url_template: str = ""

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import secrets
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
@@ -49,6 +49,35 @@ class SafeProjectFS:
             updated = content.replace(old, new, -1 if replace_all else 1)
             self._replace_text(name, parent_fd, updated, existing, check_conflict=True)
         return relative, count if replace_all else 1
+
+    def edit_many(self, path: str, edits: Sequence[tuple[str, str, bool]]) -> tuple[Path, int]:
+        relative = self._relative_path(path)
+        with self._parent(relative) as (parent_fd, name):
+            content, existing = self._read_regular(name, parent_fd, _MAX_EDIT_BYTES)
+            content_bytes = len(content.encode("utf-8"))
+            replacements = 0
+            for number, (old, new, replace_all) in enumerate(edits, 1):
+                if not old or old not in content:
+                    raise ToolError(f"Edit {number}: old_text was not found")
+                count = content.count(old)
+                if count > 1 and not replace_all:
+                    raise ToolError(
+                        f"Edit {number}: old_text occurs {count} times; set replace_all=true"
+                    )
+                occurrence_count = count if replace_all else 1
+                try:
+                    delta_bytes = occurrence_count * (
+                        len(new.encode("utf-8")) - len(old.encode("utf-8"))
+                    )
+                except UnicodeEncodeError as exc:
+                    raise ToolError(f"Edit {number}: text is not valid UTF-8") from exc
+                if content_bytes + delta_bytes > _MAX_EDIT_BYTES:
+                    raise ToolError(f"Edit {number}: result would exceed {_MAX_EDIT_BYTES} bytes")
+                content = content.replace(old, new, -1 if replace_all else 1)
+                content_bytes += delta_bytes
+                replacements += occurrence_count
+            self._replace_text(name, parent_fd, content, existing, check_conflict=True)
+        return relative, replacements
 
     def read_text(self, path: str, *, max_bytes: int) -> str:
         relative = self._relative_path(path)

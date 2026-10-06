@@ -36,6 +36,7 @@ from agent.models import (
 )
 from agent.queue import RedisTaskQueue
 from agent.reasoning import ReasoningDecision, decide
+from agent.sandbox import policy_from_settings
 from agent.session_service import create_session_record
 from agent.tools import ToolRegistry
 from agent.tools.base import ToolContext, ToolError
@@ -634,6 +635,7 @@ class AgentSupervisor:
             depth=depth,
             audit_egress=partial(self._audit_egress, session.id),
             spawn_child=partial(self._spawn_child, session),
+            sandbox=policy_from_settings(self.settings),
         )
         try:
             output = await self.registry.execute(

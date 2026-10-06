@@ -52,9 +52,14 @@ boundary.
 
 File tools block `.env`, `.npmrc`, private keys and typical credential files. The shell does
 not inherit `AGENT_*`, cloud credentials or the SSH agent environment. The memory limit applies
-to stdout and stderr. An approved shell can still read the files of the system user and open
-network connections. Thus a non-root container user, a read-only root file system and a
-careful approval check are mandatory.
+to stdout and stderr.
+
+Without the sandbox, an approved shell can read the files of the system user and open network
+connections. The operating system sandbox (`AGENT_SHELL_SANDBOX=required`, macOS) keeps the
+command inside the project directory and the temporary directory of the session. The network,
+user files and information about other processes are closed to it. Details:
+[ADR 0005](adr/0005-shell-sandbox.en.md). Without the sandbox, a non-root container user, a
+read-only root file system and a careful approval check are mandatory.
 
 ## Model keys
 

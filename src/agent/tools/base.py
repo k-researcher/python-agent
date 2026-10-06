@@ -5,7 +5,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from agent.sandbox import SandboxPolicy
 
 
 class RiskLevel(enum.StrEnum):
@@ -29,6 +32,7 @@ class ToolContext:
     depth: int = 0
     audit_egress: AuditCallback | None = None
     spawn_child: SpawnChildCallback | None = None
+    sandbox: SandboxPolicy | None = None
 
 
 class Tool(ABC):
