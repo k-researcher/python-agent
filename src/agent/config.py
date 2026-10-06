@@ -95,9 +95,7 @@ class Settings(BaseSettings):
     api_token: str = ""
 
     # Browser access: exact Host names, the public origin of the UI and auth lifetimes.
-    allowed_hosts: list[str] = Field(
-        default_factory=lambda: ["localhost", "127.0.0.1", "[::1]"]
-    )
+    allowed_hosts: list[str] = Field(default_factory=lambda: ["localhost", "127.0.0.1", "[::1]"])
     public_origin: str = ""
     extra_origins: list[str] = Field(default_factory=list)
     trusted_proxy_ips: list[str] = Field(default_factory=list)
@@ -141,9 +139,7 @@ class Settings(BaseSettings):
 
     def validate_runtime_security(self) -> None:
         if not self.binds_loopback and not self.public_origin:
-            raise RuntimeError(
-                "AGENT_PUBLIC_ORIGIN is required when binding outside localhost"
-            )
+            raise RuntimeError("AGENT_PUBLIC_ORIGIN is required when binding outside localhost")
         if self.public_origin:
             origin = normalize_origin(self.public_origin)
             hostname = urlsplit(origin).hostname or ""
@@ -157,9 +153,7 @@ class Settings(BaseSettings):
         if self.execution_mode == "redis" and not self.database_url.startswith(
             ("postgresql+asyncpg://", "postgres+asyncpg://")
         ):
-            raise RuntimeError(
-                "Redis execution mode requires PostgreSQL via postgresql+asyncpg://"
-            )
+            raise RuntimeError("Redis execution mode requires PostgreSQL via postgresql+asyncpg://")
         if self.models_file is None and (PROJECT_ROOT / "config" / "models.yaml").is_file():
             return  # agent.model_registry validates the YAML file.
         if self.models_file is not None and str(self.models_file).strip():

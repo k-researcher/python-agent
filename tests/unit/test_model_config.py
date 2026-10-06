@@ -126,9 +126,7 @@ def test_broken_reference_has_field_path(
 
 
 @pytest.mark.parametrize("env", [{}, {"MODEL_KEY": ""}])
-def test_missing_secret_leaves_provider_unconfigured(
-    tmp_path: Path, env: dict[str, str]
-) -> None:
+def test_missing_secret_leaves_provider_unconfigured(tmp_path: Path, env: dict[str, str]) -> None:
     registry = load_models(_write(tmp_path, _data()), env, None)
     assert not registry.get("fast").configured
     assert any("providers.gateway.api_key_env" in warning for warning in registry.warnings)

@@ -380,9 +380,7 @@ def test_legacy_base_when_yaml_is_absent(
     assert model(changed.json(), "default")["sources"]["max_tokens"] == "ui"
 
 
-def test_models_in_use_by_sessions_cannot_be_removed(
-    client: TestClient, tmp_path: Path
-) -> None:
+def test_models_in_use_by_sessions_cannot_be_removed(client: TestClient, tmp_path: Path) -> None:
     project = client.post(
         "/api/projects", json={"name": "In use", "root_path": str(tmp_path)}
     ).json()

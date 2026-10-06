@@ -70,9 +70,7 @@ def test_content_and_reasoning_delta() -> None:
     ]
     accumulator.add(_chunk({"choices": [{"delta": {"content": "lo"}}]}))
     reasoning = _chunk({"choices": [{"delta": {"reasoning_content": "thinking"}}]})
-    assert accumulator.add(reasoning) == [
-        StreamEvent(kind="reasoning", text="thinking")
-    ]
+    assert accumulator.add(reasoning) == [StreamEvent(kind="reasoning", text="thinking")]
     accumulator.add(_chunk({"choices": [{"delta": {"reasoning": " more"}}]}))
     result = accumulator.result()
     assert result.content == "Hello"
@@ -226,13 +224,7 @@ def test_tool_calls_interleaved_and_concatenated() -> None:
 def test_tool_call_events_have_index() -> None:
     accumulator = ChatStreamAccumulator()
     events = accumulator.add(
-        _chunk(
-            {
-                "choices": [
-                    {"delta": {"tool_calls": [{"index": 2, "function": {"name": "x"}}]}}
-                ]
-            }
-        )
+        _chunk({"choices": [{"delta": {"tool_calls": [{"index": 2, "function": {"name": "x"}}]}}]})
     )
     assert events == [StreamEvent(kind="tool_call", index=2)]
 
@@ -277,11 +269,7 @@ def test_full_stream_result() -> None:
     )
     accumulator.add(
         _chunk(
-            {
-                "choices": [
-                    {"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "}"}}]}}
-                ]
-            }
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "}"}}]}}]}
         )
     )
     accumulator.add(

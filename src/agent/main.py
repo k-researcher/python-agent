@@ -98,6 +98,7 @@ if settings.frontend_dist.is_dir():
             return FileResponse(index)
         return JSONResponse({"status": "frontend is not built"}, status_code=404)
 else:
+
     @app.get("/", include_in_schema=False)
     async def root() -> JSONResponse:
         return JSONResponse(

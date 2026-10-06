@@ -31,9 +31,7 @@ class ToolRegistry:
             return False
         return not tool.knowledge_capability or self.settings.knowledge_base_enabled
 
-    def definitions(
-        self, mode: str, *, model_ids: list[str] | None = None
-    ) -> list[dict[str, Any]]:
+    def definitions(self, mode: str, *, model_ids: list[str] | None = None) -> list[dict[str, Any]]:
         return [
             {
                 "type": "function",

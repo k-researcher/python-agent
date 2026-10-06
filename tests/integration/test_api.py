@@ -205,18 +205,14 @@ def test_child_agent_and_outbound_audit(tmp_path: Path) -> None:
             wait_for_status(client, parent["id"], "awaiting_confirmation")
             approval = client.get(f"/api/sessions/{parent['id']}/approvals").json()[0]
             assert approval["tool_name"] == "run_agent"
-            response = client.post(
-                f"/api/approvals/{approval['id']}", json={"decision": "approve"}
-            )
+            response = client.post(f"/api/approvals/{approval['id']}", json={"decision": "approve"})
             assert response.status_code == 200
             wait_for_status(client, parent["id"], "completed")
 
             children = client.get(f"/api/sessions/{parent['id']}/children").json()
             assert len(children) == 1
             assert children[0]["status"] == "completed"
-            child_messages = client.get(
-                f"/api/sessions/{children[0]['id']}/messages"
-            ).json()
+            child_messages = client.get(f"/api/sessions/{children[0]['id']}/messages").json()
             assert child_messages[-1]["content"] == "Child result"
 
             audit = client.get(f"/api/sessions/{parent['id']}/outbound-audit").json()
@@ -275,9 +271,7 @@ def test_different_llm_profiles_run_concurrently(tmp_path: Path) -> None:
                 "reasoning",
             ]
             responses = [
-                client.get(f"/api/sessions/{session['id']}/messages").json()[-1][
-                    "content"
-                ]
+                client.get(f"/api/sessions/{session['id']}/messages").json()[-1]["content"]
                 for session in sessions
             ]
             assert responses == ["Response from fast", "Response from reasoning"]

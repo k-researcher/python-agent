@@ -137,11 +137,7 @@ async def create_project(payload: ProjectCreate, db: AsyncSession = Depends(get_
 async def list_sessions(
     archived: bool = Query(default=False), db: AsyncSession = Depends(get_db)
 ) -> list[Session]:
-    query = (
-        select(Session)
-        .where(Session.archived == archived)
-        .order_by(Session.updated_at.desc())
-    )
+    query = select(Session).where(Session.archived == archived).order_by(Session.updated_at.desc())
     return list((await db.execute(query)).scalars())
 
 
@@ -187,9 +183,7 @@ async def list_children(session_id: str, db: AsyncSession = Depends(get_db)) -> 
     return list((await db.execute(query)).scalars())
 
 
-@router.get(
-    "/sessions/{session_id}/outbound-audit", response_model=list[OutboundAuditRead]
-)
+@router.get("/sessions/{session_id}/outbound-audit", response_model=list[OutboundAuditRead])
 async def list_outbound_audit(
     session_id: str,
     limit: int = Query(default=200, ge=1, le=1000),
@@ -210,16 +204,12 @@ async def list_outbound_audit(
 async def session_context(session_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, int]:
     session = (
         await db.execute(
-            select(Session)
-            .where(Session.id == session_id)
-            .options(selectinload(Session.messages))
+            select(Session).where(Session.id == session_id).options(selectinload(Session.messages))
         )
     ).scalar_one_or_none()
     if session is None:
         raise HTTPException(404, "Session not found")
-    model = select_model(
-        await effective_registry(db, settings), session.llm_profile, strict=False
-    )
+    model = select_model(await effective_registry(db, settings), session.llm_profile, strict=False)
     context = supervisor.context_for(model)
     result = context.prepare(session.messages)
     return {

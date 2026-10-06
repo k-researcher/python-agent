@@ -90,9 +90,7 @@ class EventBroker:
         if self._redis is not None:
             envelope = {"origin": self._origin, "event": event}
             try:
-                await self._redis.publish(
-                    self._channel, json.dumps(envelope, ensure_ascii=False)
-                )
+                await self._redis.publish(self._channel, json.dumps(envelope, ensure_ascii=False))
             except RedisError:
                 logger.exception("Could not publish Redis event; database event remains durable")
 

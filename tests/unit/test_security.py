@@ -39,9 +39,7 @@ def test_allows_new_file_with_existing_parent(tmp_path: Path) -> None:
     assert resolved == tmp_path / "new.txt"
 
 
-@pytest.mark.parametrize(
-    "name", [".env", ".env.production", ".npmrc", "id_ed25519", "server.key"]
-)
+@pytest.mark.parametrize("name", [".env", ".env.production", ".npmrc", "id_ed25519", "server.key"])
 def test_blocks_secret_bearing_files(tmp_path: Path, name: str) -> None:
     secret = tmp_path / name
     secret.write_text("secret", encoding="utf-8")

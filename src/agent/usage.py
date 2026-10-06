@@ -29,9 +29,7 @@ def usage_from_response(usage: dict[str, Any] | None) -> UsageRecord:
     completion_details = usage.get("completion_tokens_details")
     prompt_details = usage.get("prompt_tokens_details")
     reasoning = (
-        completion_details.get("reasoning_tokens")
-        if isinstance(completion_details, dict)
-        else None
+        completion_details.get("reasoning_tokens") if isinstance(completion_details, dict) else None
     )
     cached = prompt_details.get("cached_tokens") if isinstance(prompt_details, dict) else None
     return UsageRecord(

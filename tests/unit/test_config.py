@@ -83,9 +83,7 @@ def test_unknown_llm_profile_is_rejected() -> None:
 
 def test_llm_profile_requires_http_url() -> None:
     settings = Settings(
-        llm_profiles={
-            "invalid": {"base_url": "file:///tmp/model", "model": "unsafe-model"}
-        },
+        llm_profiles={"invalid": {"base_url": "file:///tmp/model", "model": "unsafe-model"}},
         default_llm_profile="invalid",
     )
     with pytest.raises(RuntimeError, match=r"HTTP\(S\)"):

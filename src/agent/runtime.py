@@ -171,9 +171,7 @@ class AgentSupervisor:
         if self.task_queue is not None:
             await self.task_queue.close()
 
-    async def resolve_approval(
-        self, approval_id: str, decision: str, comment: str | None
-    ) -> str:
+    async def resolve_approval(self, approval_id: str, decision: str, comment: str | None) -> str:
         async with session_factory() as db:
             query = (
                 select(Approval)
@@ -367,11 +365,16 @@ class AgentSupervisor:
                     continue
 
                 # Conditional write: a Stop that landed after the SELECT above must win.
-                claimed = cast(CursorResult[Any], await db.execute(
-                    update(Session)
-                    .where(Session.id == session.id, Session.status.not_in(TERMINAL_STATUSES))
-                    .values(status=SessionStatus.running.value, error=None, stop_requested=False)
-                ))
+                claimed = cast(
+                    CursorResult[Any],
+                    await db.execute(
+                        update(Session)
+                        .where(Session.id == session.id, Session.status.not_in(TERMINAL_STATUSES))
+                        .values(
+                            status=SessionStatus.running.value, error=None, stop_requested=False
+                        )
+                    ),
+                )
                 await db.commit()
                 if claimed.rowcount == 0:
                     return

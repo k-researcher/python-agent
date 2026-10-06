@@ -66,7 +66,9 @@ def test_mutations_require_origin_and_csrf(tmp_path: object) -> None:
         )
         assert no_csrf.status_code == 403
 
-        foreign = client.post("/api/projects", json=body, headers={"Origin": "https://evil.example"})
+        foreign = client.post(
+            "/api/projects", json=body, headers={"Origin": "https://evil.example"}
+        )
         assert foreign.status_code == 403
 
 

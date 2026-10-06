@@ -124,7 +124,15 @@ async def test_truncation_retry_stays_inside_the_context_window(tmp_path: Path) 
     small = model("small", window=16_000, max_tokens=2_000)
     client = ScriptedClient([LLMResponse("cut", [], "length", 1, 1)] * 3)
     await supervisor._complete(
-        session_id, "chat:small", client, small, [], [], "{}", None, 13_000  # type: ignore[arg-type]
+        session_id,
+        "chat:small",
+        client,
+        small,
+        [],
+        [],
+        "{}",
+        None,
+        13_000,  # type: ignore[arg-type]
     )
     assert all(budget is not None and 13_000 + budget <= 16_000 for budget in client.budgets)
 

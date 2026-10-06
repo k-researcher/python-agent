@@ -56,4 +56,3 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("knowledge_documents")
     op.drop_table("outbound_audit")
-

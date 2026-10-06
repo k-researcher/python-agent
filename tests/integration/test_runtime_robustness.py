@@ -114,9 +114,7 @@ class TruncatingLLM:
     def __init__(self) -> None:
         self.budgets: list[int | None] = []
 
-    async def chat(
-        self, _m: list[dict[str, Any]], _t: list[dict[str, Any]], **options: Any
-    ) -> Any:
+    async def chat(self, _m: list[dict[str, Any]], _t: list[dict[str, Any]], **options: Any) -> Any:
         self.budgets.append(options.get("max_tokens"))
         if len(self.budgets) == 1:
             return LLMResponse("partial <｜DSML｜tool_calls", [], "stop", 1, 1)

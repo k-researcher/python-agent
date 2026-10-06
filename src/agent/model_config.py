@@ -524,10 +524,14 @@ def load_models(
         "AGENT_LLM_MAX_RETRIES",
         "AGENT_LLM_MAX_TOKENS",
     }
-    warnings = override_warnings + warnings_missing + (
-        ["Legacy LLM structure variables are ignored when YAML is present"]
-        if structural_vars.intersection(env)
-        else []
+    warnings = (
+        override_warnings
+        + warnings_missing
+        + (
+            ["Legacy LLM structure variables are ignored when YAML is present"]
+            if structural_vars.intersection(env)
+            else []
+        )
     )
     return _resolve(
         config, credentials, diagnostics, "yaml", hashlib.sha256(content).hexdigest(), warnings

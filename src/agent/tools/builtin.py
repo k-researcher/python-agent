@@ -133,9 +133,7 @@ class SearchFilesTool(Tool):
         matches: list[dict[str, Any]] = []
         candidates = [root] if root.is_file() else root.rglob("*")
         for path in candidates:
-            excluded = any(
-                part in {".git", ".venv", "node_modules"} for part in path.parts
-            )
+            excluded = any(part in {".git", ".venv", "node_modules"} for part in path.parts)
             if not path.is_file() or excluded:
                 continue
             try:

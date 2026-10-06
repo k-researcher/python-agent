@@ -44,11 +44,10 @@ async def init_database(
     *, run_migrations: bool | None = None, recover_running: bool | None = None
 ) -> None:
     should_migrate = (
-        settings.execution_mode == "embedded"
-        if run_migrations is None
-        else run_migrations
+        settings.execution_mode == "embedded" if run_migrations is None else run_migrations
     )
     if should_migrate:
+
         def migrate() -> None:
             migration_config = Config(str(PROJECT_ROOT / "alembic.ini"))
             command.upgrade(migration_config, "head")
@@ -56,9 +55,7 @@ async def init_database(
         await asyncio.to_thread(migrate)
 
     should_recover = (
-        settings.execution_mode == "embedded"
-        if recover_running is None
-        else recover_running
+        settings.execution_mode == "embedded" if recover_running is None else recover_running
     )
     async with session_factory() as db:
         await db.execute(select(Session.id).limit(1))

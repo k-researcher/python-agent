@@ -26,4 +26,3 @@ def test_parse_chat_completion() -> None:
     assert response.finish_reason == "tool_calls"
     assert response.tool_calls[0]["id"] == "call-1"
     assert response.prompt_tokens == 10
-

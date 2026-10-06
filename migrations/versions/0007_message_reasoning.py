@@ -17,9 +17,7 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     with op.batch_alter_table("messages") as batch:
-        batch.add_column(
-            sa.Column("kind", sa.String(20), nullable=False, server_default="normal")
-        )
+        batch.add_column(sa.Column("kind", sa.String(20), nullable=False, server_default="normal"))
         batch.add_column(sa.Column("reasoning_content", sa.Text(), nullable=True))
         batch.add_column(sa.Column("reasoning_effort", sa.String(20), nullable=True))
 

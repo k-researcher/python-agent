@@ -320,9 +320,7 @@ class ExcelSheetsTool(Tool):
 
     @staticmethod
     def read_sheets(path: Path) -> dict[str, Any]:
-        workbook = load_workbook(
-            path, read_only=True, data_only=True, keep_links=False
-        )
+        workbook = load_workbook(path, read_only=True, data_only=True, keep_links=False)
         try:
             return {"sheets": workbook.sheetnames}
         finally:
@@ -353,9 +351,7 @@ class ExcelReadTool(ExcelSheetsTool):
 
     @staticmethod
     def read_range(path: Path, arguments: dict[str, Any]) -> dict[str, Any]:
-        workbook = load_workbook(
-            path, read_only=True, data_only=True, keep_links=False
-        )
+        workbook = load_workbook(path, read_only=True, data_only=True, keep_links=False)
         try:
             sheet_name = str(arguments["sheet"])
             if sheet_name not in workbook.sheetnames:
@@ -384,6 +380,7 @@ class RunAgentTool(Tool):
     description = "Create a bounded child agent session and optionally wait for its final response."
     risk_level = RiskLevel.network_access
     allowed_modes = frozenset({"dev"})
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.input_schema = {
