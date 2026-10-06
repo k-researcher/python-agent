@@ -30,4 +30,3 @@ def test_context_truncates_large_tool_results() -> None:
 
     assert result.truncated_tool_results == 1
     assert "truncated" in result.messages[-1]["content"]
-

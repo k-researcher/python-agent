@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import secrets
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -10,9 +9,11 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from agent.auth import check_request
 from agent.config import Settings, get_settings
-from agent.database import get_db
+from agent.database import get_db, session_factory
 from agent.events import broker, emit_event
+from agent.model_registry import effective_registry, select_model
 from agent.models import (
     Approval,
     ApprovalStatus,
@@ -25,6 +26,7 @@ from agent.models import (
     SessionStatus,
     ToolCall,
 )
+from agent.reasoning import validate_effort
 from agent.runtime import TERMINAL_STATUSES, AgentSupervisor
 from agent.schemas import (
     ApprovalDecision,
@@ -48,8 +50,8 @@ supervisor = AgentSupervisor(settings)
 
 @router.get("/health")
 async def health() -> dict[str, object]:
-    infrastructure = await supervisor.infrastructure_status()
-    return {"status": "ok", "service": "python-agent", **infrastructure}
+    """Public liveness probe; infrastructure details live behind auth in /ready."""
+    return {"status": "ok", "service": "python-agent"}
 
 
 @router.get("/ready")
@@ -64,34 +66,41 @@ async def ready() -> dict[str, object]:
 
 
 @router.get("/config/public")
-async def public_config() -> dict[str, object]:
-    profiles = settings.available_llm_profiles()
-    default_profile = settings.resolve_llm_profile(settings.default_llm_profile)
-    llm_url = urlsplit(default_profile.base_url)
+async def public_config(db: AsyncSession = Depends(get_db)) -> dict[str, object]:
+    models = await effective_registry(db, settings)
+    default_model = models.get(models.default_id)
     return {
-        "llm_configured": bool(default_profile.api_key),
-        "llm_model": default_profile.model,
+        "llm_configured": default_model.configured,
+        "llm_model": default_model.model,
         "knowledge_base_enabled": settings.knowledge_base_enabled,
         "network_tools_enabled": settings.allow_network_tools,
         "raw_llm_log": settings.raw_llm_log,
-        "llm_destination": llm_url.hostname or default_profile.base_url,
+        "llm_destination": urlsplit(default_model.base_url).hostname or "",
         "network_allowlist": settings.network_allowlist,
         "database_connections": sorted(settings.database_connections),
         "ssh_connections": sorted(settings.ssh_connections),
-        "context_window": settings.context_window,
+        "context_window": default_model.context_window,
         "context_reserved_tokens": settings.context_reserved_tokens,
         "max_child_depth": settings.max_child_depth,
-        "api_auth_enabled": bool(settings.api_token),
+        "api_auth_enabled": True,
         "execution_mode": settings.execution_mode,
-        "default_llm_profile": settings.default_llm_profile,
+        "default_llm_profile": models.default_id,
+        "models_source": models.source,
+        "models_checksum": models.checksum,
         "llm_profiles": [
             {
-                "name": name,
-                "model": profile.model,
-                "destination": urlsplit(profile.base_url).hostname or profile.base_url,
-                "configured": bool(profile.api_key),
+                "name": model.id,
+                "model": model.model,
+                "provider": model.provider_id,
+                "kind": model.kind,
+                "destination": urlsplit(model.base_url).hostname or "",
+                "configured": model.configured,
+                "context_window": model.context_window,
+                "max_tokens": model.max_tokens,
+                "reasoning_efforts": model.reasoning.allowed_efforts,
+                "default_reasoning_effort": model.reasoning.default_effort,
             }
-            for name, profile in sorted(profiles.items())
+            for model in models.models.values()
         ],
     }
 
@@ -128,11 +137,7 @@ async def create_project(payload: ProjectCreate, db: AsyncSession = Depends(get_
 async def list_sessions(
     archived: bool = Query(default=False), db: AsyncSession = Depends(get_db)
 ) -> list[Session]:
-    query = (
-        select(Session)
-        .where(Session.archived == archived)
-        .order_by(Session.updated_at.desc())
-    )
+    query = select(Session).where(Session.archived == archived).order_by(Session.updated_at.desc())
     return list((await db.execute(query)).scalars())
 
 
@@ -151,7 +156,8 @@ async def create_session(payload: SessionCreate, db: AsyncSession = Depends(get_
             payload.mode,
             llm_profile=payload.llm_profile,
             title=payload.title,
-            configuration={"depth": 0},
+            configuration={"depth": 0}
+            | ({"reasoning_effort": payload.reasoning_effort} if payload.reasoning_effort else {}),
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -177,9 +183,7 @@ async def list_children(session_id: str, db: AsyncSession = Depends(get_db)) -> 
     return list((await db.execute(query)).scalars())
 
 
-@router.get(
-    "/sessions/{session_id}/outbound-audit", response_model=list[OutboundAuditRead]
-)
+@router.get("/sessions/{session_id}/outbound-audit", response_model=list[OutboundAuditRead])
 async def list_outbound_audit(
     session_id: str,
     limit: int = Query(default=200, ge=1, le=1000),
@@ -200,20 +204,20 @@ async def list_outbound_audit(
 async def session_context(session_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, int]:
     session = (
         await db.execute(
-            select(Session)
-            .where(Session.id == session_id)
-            .options(selectinload(Session.messages))
+            select(Session).where(Session.id == session_id).options(selectinload(Session.messages))
         )
     ).scalar_one_or_none()
     if session is None:
         raise HTTPException(404, "Session not found")
-    result = supervisor.context.prepare(session.messages)
+    model = select_model(await effective_registry(db, settings), session.llm_profile, strict=False)
+    context = supervisor.context_for(model)
+    result = context.prepare(session.messages)
     return {
         "approximate_tokens": result.approximate_tokens,
         "omitted_messages": result.omitted_messages,
         "truncated_tool_results": result.truncated_tool_results,
-        "context_window": settings.context_window,
-        "reserved_tokens": settings.context_reserved_tokens,
+        "context_window": model.context_window,
+        "reserved_tokens": model.context_window - context.budget,
     }
 
 
@@ -235,9 +239,23 @@ async def add_message(
     if session.status in {SessionStatus.running.value, SessionStatus.awaiting_confirmation.value}:
         raise HTTPException(409, f"Cannot add a message while session is {session.status}")
 
-    message = Message(session_id=session.id, role="user", content=payload.content)
+    if payload.reasoning_effort is not None:
+        model = select_model(
+            await effective_registry(db, settings), session.llm_profile, strict=False
+        )
+        try:
+            validate_effort(model, payload.reasoning_effort)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    message = Message(
+        session_id=session.id,
+        role="user",
+        content=payload.content,
+        reasoning_effort=payload.reasoning_effort,
+    )
     db.add(message)
     session.status = SessionStatus.pending.value
+    session.stop_requested = False
     session.error = None
     await db.commit()
     await db.refresh(message)
@@ -253,8 +271,9 @@ async def start_session(session_id: str, db: AsyncSession = Depends(get_db)) -> 
         raise HTTPException(404, "Session not found")
     if session.status == SessionStatus.awaiting_confirmation.value:
         raise HTTPException(409, "Resolve pending approvals before starting")
-    if session.status in TERMINAL_STATUSES:
+    if session.status in TERMINAL_STATUSES | {SessionStatus.interrupted.value}:
         session.status = SessionStatus.pending.value
+        session.stop_requested = False
         session.error = None
         await db.commit()
     return {"started": await supervisor.start(session.id)}
@@ -361,26 +380,43 @@ async def list_knowledge(
     return list((await db.execute(query)).scalars())
 
 
+WS_AUTH_RECHECK_SECONDS = 5
+WS_HEARTBEAT_SECONDS = 25
+
+
+async def _websocket_allowed(websocket: WebSocket) -> bool:
+    async with session_factory() as db:
+        check = await check_request(
+            db, settings, websocket.headers, websocket.cookies, "GET", require_origin=True
+        )
+    return check.ok
+
+
 async def websocket_endpoint(websocket: WebSocket) -> None:
+    # Host, Origin and the session cookie are verified before the handshake is accepted.
+    if not await _websocket_allowed(websocket):
+        await websocket.close(code=4401)
+        return
     await websocket.accept()
-    if settings.api_token:
-        try:
-            authentication = await asyncio.wait_for(websocket.receive_json(), timeout=5)
-        except (TimeoutError, ValueError, WebSocketDisconnect):
-            await websocket.close(code=4401, reason="Authentication timeout")
-            return
-        token = str(authentication.get("token", "")) if isinstance(authentication, dict) else ""
-        if not secrets.compare_digest(token, settings.api_token):
-            await websocket.close(code=4401, reason="Unauthorized")
-            return
     await websocket.send_json({"type": "connected", "payload": {"service": "python-agent"}})
+    loop = asyncio.get_running_loop()
+    last_sent = last_checked = loop.time()
     try:
         async with broker.subscribe() as queue:
             while True:
+                # Check the session on a clock, so a steady flow of events cannot skip it.
+                if loop.time() - last_checked >= WS_AUTH_RECHECK_SECONDS:
+                    if not await _websocket_allowed(websocket):
+                        await websocket.close(code=4401, reason="Session expired or revoked")
+                        return
+                    last_checked = loop.time()
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=25)
+                    event = await asyncio.wait_for(queue.get(), timeout=WS_AUTH_RECHECK_SECONDS)
                     await websocket.send_json(event)
+                    last_sent = loop.time()
                 except TimeoutError:
-                    await websocket.send_json({"type": "heartbeat", "payload": {}})
+                    if loop.time() - last_sent >= WS_HEARTBEAT_SECONDS:
+                        await websocket.send_json({"type": "heartbeat", "payload": {}})
+                        last_sent = loop.time()
     except WebSocketDisconnect:
         return

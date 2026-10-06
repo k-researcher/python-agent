@@ -8,14 +8,31 @@ import socket
 from contextlib import suppress
 
 from redis.exceptions import RedisError
+from sqlalchemy import select
 
 from agent.config import get_settings
-from agent.database import init_database
+from agent.database import init_database, session_factory
 from agent.events import broker
+from agent.models import Session, SessionStatus
 from agent.queue import QueueMessage, RedisTaskQueue
 from agent.runtime import AgentSupervisor
 
 logger = logging.getLogger(__name__)
+STOP_POLL_SECONDS = 0.5
+
+
+async def wait_for_stop(session_id: str, interval: float = STOP_POLL_SECONDS) -> None:
+    """Return when the API asks to stop the session. The API runs in another process."""
+    while True:
+        await asyncio.sleep(interval)
+        async with session_factory() as db:
+            row = (
+                await db.execute(
+                    select(Session.stop_requested, Session.status).where(Session.id == session_id)
+                )
+            ).one_or_none()
+        if row is None or row.stop_requested or row.status == SessionStatus.stopped.value:
+            return
 
 
 class AgentWorker:
@@ -91,20 +108,27 @@ class AgentWorker:
             self._refresh_lock(message.session_id, token),
             name=f"session-lock-{message.session_id}",
         )
+        stop_watch = asyncio.create_task(
+            wait_for_stop(message.session_id), name=f"stop-watch-{message.session_id}"
+        )
         run_task = asyncio.create_task(
             self.supervisor.run_job(message.session_id),
             name=f"execute-session-{message.session_id}",
         )
         try:
             done, _pending = await asyncio.wait(
-                {run_task, lock_heartbeat}, return_when=asyncio.FIRST_COMPLETED
+                {run_task, lock_heartbeat, stop_watch}, return_when=asyncio.FIRST_COMPLETED
             )
-            if lock_heartbeat in done:
+            if run_task not in done:
+                # Stop or a lost lock: cancel the execution. Cancellation kills a running
+                # shell command together with its children.
                 run_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await run_task
-                lock_heartbeat.result()
-            await run_task
+                if lock_heartbeat in done:
+                    lock_heartbeat.result()
+            else:
+                await run_task
             await self.queue.acknowledge(message.message_id, message.session_id)
         except asyncio.CancelledError:
             run_task.cancel()
@@ -112,9 +136,10 @@ class AgentWorker:
         except Exception:
             logger.exception("Worker failed session %s; job remains pending", message.session_id)
         finally:
-            lock_heartbeat.cancel()
-            with suppress(asyncio.CancelledError):
-                await lock_heartbeat
+            for helper in (lock_heartbeat, stop_watch):
+                helper.cancel()
+                with suppress(asyncio.CancelledError):
+                    await helper
             await self.queue.release_session_lock(message.session_id, token)
 
 

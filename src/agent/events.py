@@ -90,9 +90,7 @@ class EventBroker:
         if self._redis is not None:
             envelope = {"origin": self._origin, "event": event}
             try:
-                await self._redis.publish(
-                    self._channel, json.dumps(envelope, ensure_ascii=False)
-                )
+                await self._redis.publish(self._channel, json.dumps(envelope, ensure_ascii=False))
             except RedisError:
                 logger.exception("Could not publish Redis event; database event remains durable")
 
@@ -124,3 +122,59 @@ async def emit_event(
         }
     )
     return event
+
+
+class StreamPublisher:
+    """Send streamed text to WebSocket clients as temporary events.
+
+    The publisher joins fragments for up to 50 ms or 8 KiB. It does not write rows to the
+    events table: a client that misses deltas reads the saved message after the step.
+    """
+
+    FLUSH_SECONDS = 0.05
+    FLUSH_BYTES = 8192
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        self.stream_id = secrets.token_hex(8)
+        self._seq = 0
+        self._pending: dict[str, list[str]] = {}
+        self._size = 0
+        self._last_flush = asyncio.get_running_loop().time()
+
+    async def add(self, kind: str, text: str) -> None:
+        self._pending.setdefault(kind, []).append(text)
+        self._size += len(text)
+        now = asyncio.get_running_loop().time()
+        if self._size >= self.FLUSH_BYTES or now - self._last_flush >= self.FLUSH_SECONDS:
+            await self.flush()
+
+    async def flush(self) -> None:
+        self._last_flush = asyncio.get_running_loop().time()
+        pending, self._pending, self._size = self._pending, {}, 0
+        for kind, parts in pending.items():
+            self._seq += 1
+            await broker.broadcast(
+                {
+                    "type": f"{'reasoning' if kind == 'reasoning' else 'message'}.delta",
+                    "session_id": self.session_id,
+                    "ephemeral": True,
+                    "payload": {
+                        "stream_id": self.stream_id,
+                        "seq": self._seq,
+                        "delta": "".join(parts),
+                    },
+                }
+            )
+
+    async def reset(self) -> None:
+        """Tell clients to drop the text of this stream (a retry or a fallback starts)."""
+        self._pending, self._size = {}, 0
+        await broker.broadcast(
+            {
+                "type": "stream.reset",
+                "session_id": self.session_id,
+                "ephemeral": True,
+                "payload": {"stream_id": self.stream_id},
+            }
+        )

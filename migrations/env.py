@@ -4,12 +4,13 @@ import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import pool
+from sqlalchemy import event, pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+import agent.model_overrides  # noqa: F401  (registers override tables on Base)
 from agent.config import get_settings
+from agent.database import configure_sqlite_connection
 from agent.models import Base
-
 
 config = context.config
 config.set_main_option("sqlalchemy.url", get_settings().database_url)
@@ -43,6 +44,14 @@ async def run_async_migrations() -> None:
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
+    if connectable.dialect.name == "sqlite":
+        event.listen(
+            connectable.sync_engine,
+            "connect",
+            lambda dbapi_connection, _record: configure_sqlite_connection(
+                dbapi_connection, foreign_keys=False
+            ),
+        )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
     await connectable.dispose()
@@ -56,4 +65,3 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
-

@@ -25,6 +25,7 @@ class SessionCreate(BaseModel):
     prompt: str = Field(min_length=1, max_length=2_000_000)
     mode: Literal["dev", "ask"] = "dev"
     llm_profile: str | None = Field(default=None, min_length=1, max_length=100)
+    reasoning_effort: str | None = Field(default=None, max_length=20)
     title: str | None = Field(default=None, max_length=300)
     auto_start: bool = True
 
@@ -37,6 +38,7 @@ class SessionRead(BaseModel):
     parent_id: str | None
     mode: str
     llm_profile: str
+    configuration: dict[str, Any]
     title: str
     status: str
     error: str | None
@@ -47,6 +49,8 @@ class SessionRead(BaseModel):
 
 class MessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=2_000_000)
+    # Level for this message and the tool loop that follows it: "auto" or a model level.
+    reasoning_effort: str | None = Field(default=None, max_length=20)
 
 
 class MessageRead(BaseModel):
@@ -60,6 +64,9 @@ class MessageRead(BaseModel):
     tool_calls: list[dict[str, Any]] | None
     token_count: int | None
     skipped: bool
+    kind: str
+    reasoning_content: str | None
+    reasoning_effort: str | None
     created_at: datetime
 
 

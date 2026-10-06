@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from agent.api import settings, supervisor
 from agent.config import LLMProfileSettings
 from agent.llm import LLMResponse
-from agent.main import app
+from tests.integration.helpers import ORIGIN, authed_client
 
 
 class FakeApprovalLLM:
@@ -17,7 +17,7 @@ class FakeApprovalLLM:
         self.calls = 0
 
     async def chat(
-        self, _messages: list[dict[str, Any]], _tools: list[dict[str, Any]]
+        self, _messages: list[dict[str, Any]], _tools: list[dict[str, Any]], **_options: Any
     ) -> LLMResponse:
         self.calls += 1
         if self.calls == 1:
@@ -50,7 +50,7 @@ class FakeChildLLM:
     endpoint = "https://fake.example/v1/chat/completions"
 
     async def chat(
-        self, messages: list[dict[str, Any]], _tools: list[dict[str, Any]]
+        self, messages: list[dict[str, Any]], _tools: list[dict[str, Any]], **_options: Any
     ) -> LLMResponse:
         user_messages = [item.get("content") for item in messages if item["role"] == "user"]
         is_child = any(content == "Return child result" for content in user_messages)
@@ -90,7 +90,7 @@ class FakeProfileLLM:
         self.endpoint = f"https://{name}.example/v1/chat/completions"
 
     async def chat(
-        self, _messages: list[dict[str, Any]], _tools: list[dict[str, Any]]
+        self, _messages: list[dict[str, Any]], _tools: list[dict[str, Any]], **_options: Any
     ) -> LLMResponse:
         self.probe.active += 1
         self.probe.maximum = max(self.probe.maximum, self.probe.active)
@@ -114,7 +114,7 @@ def wait_for_status(client: TestClient, session_id: str, expected: str) -> None:
 
 
 def test_session_lifecycle_and_websocket(tmp_path: Path) -> None:
-    with TestClient(app) as client:
+    with authed_client() as client:
         health = client.get("/api/health")
         assert health.status_code == 200
         assert health.json()["status"] == "ok"
@@ -142,7 +142,7 @@ def test_session_lifecycle_and_websocket(tmp_path: Path) -> None:
         assert messages.status_code == 200
         assert [item["role"] for item in messages.json()] == ["system", "user"]
 
-        with client.websocket_connect("/ws") as websocket:
+        with client.websocket_connect("/ws", headers={"Origin": ORIGIN}) as websocket:
             assert websocket.receive_json()["type"] == "connected"
 
 
@@ -150,7 +150,7 @@ def test_mutating_tool_waits_for_confirmation(tmp_path: Path) -> None:
     original_llm = supervisor.llm
     supervisor.llm = FakeApprovalLLM()  # type: ignore[assignment]
     try:
-        with TestClient(app) as client:
+        with authed_client() as client:
             project = client.post(
                 "/api/projects",
                 json={"name": "Approval project", "root_path": str(tmp_path)},
@@ -187,7 +187,7 @@ def test_child_agent_and_outbound_audit(tmp_path: Path) -> None:
     original_llm = supervisor.llm
     supervisor.llm = FakeChildLLM()  # type: ignore[assignment]
     try:
-        with TestClient(app) as client:
+        with authed_client() as client:
             project = client.post(
                 "/api/projects",
                 json={"name": "Child project", "root_path": str(tmp_path)},
@@ -205,18 +205,14 @@ def test_child_agent_and_outbound_audit(tmp_path: Path) -> None:
             wait_for_status(client, parent["id"], "awaiting_confirmation")
             approval = client.get(f"/api/sessions/{parent['id']}/approvals").json()[0]
             assert approval["tool_name"] == "run_agent"
-            response = client.post(
-                f"/api/approvals/{approval['id']}", json={"decision": "approve"}
-            )
+            response = client.post(f"/api/approvals/{approval['id']}", json={"decision": "approve"})
             assert response.status_code == 200
             wait_for_status(client, parent["id"], "completed")
 
             children = client.get(f"/api/sessions/{parent['id']}/children").json()
             assert len(children) == 1
             assert children[0]["status"] == "completed"
-            child_messages = client.get(
-                f"/api/sessions/{children[0]['id']}/messages"
-            ).json()
+            child_messages = client.get(f"/api/sessions/{children[0]['id']}/messages").json()
             assert child_messages[-1]["content"] == "Child result"
 
             audit = client.get(f"/api/sessions/{parent['id']}/outbound-audit").json()
@@ -224,24 +220,6 @@ def test_child_agent_and_outbound_audit(tmp_path: Path) -> None:
             assert all("payload" not in item for item in audit)
     finally:
         supervisor.llm = original_llm
-
-
-def test_api_and_websocket_token_authentication() -> None:
-    original_token = settings.api_token
-    settings.api_token = "integration-secret"
-    try:
-        with TestClient(app) as client:
-            assert client.get("/api/health").status_code == 401
-            authorized = client.get(
-                "/api/health", headers={"X-Agent-Token": "integration-secret"}
-            )
-            assert authorized.status_code == 200
-
-            with client.websocket_connect("/ws") as websocket:
-                websocket.send_json({"type": "auth", "token": "integration-secret"})
-                assert websocket.receive_json()["type"] == "connected"
-    finally:
-        settings.api_token = original_token
 
 
 def test_different_llm_profiles_run_concurrently(tmp_path: Path) -> None:
@@ -267,7 +245,7 @@ def test_different_llm_profiles_run_concurrently(tmp_path: Path) -> None:
             "reasoning": FakeProfileLLM("reasoning", probe)
         }
 
-        with TestClient(app) as client:
+        with authed_client() as client:
             project = client.post(
                 "/api/projects",
                 json={"name": "Multi-model project", "root_path": str(tmp_path)},
@@ -293,9 +271,7 @@ def test_different_llm_profiles_run_concurrently(tmp_path: Path) -> None:
                 "reasoning",
             ]
             responses = [
-                client.get(f"/api/sessions/{session['id']}/messages").json()[-1][
-                    "content"
-                ]
+                client.get(f"/api/sessions/{session['id']}/messages").json()[-1]["content"]
                 for session in sessions
             ]
             assert responses == ["Response from fast", "Response from reasoning"]

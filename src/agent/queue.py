@@ -127,9 +127,7 @@ class RedisTaskQueue:
         end
         return 0
         """
-        await self.client.eval(
-            script, 1, f"{self.stream}:lock:{session_id}", token
-        )
+        await self.client.eval(script, 1, f"{self.stream}:lock:{session_id}", token)
 
     async def heartbeat(self, worker: str) -> None:
         await self.client.set(f"{self.stream}:worker:{worker}", "1", ex=30)
