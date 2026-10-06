@@ -177,7 +177,12 @@ def test_routing_ui_beats_env_and_preserves_other_fields(base: ModelsConfig) -> 
     assert result.registry.default_id == "spare"
     assert result.registry.fallback == ["fast"]
     assert result.registry.roles == {"review": "fast"}
-    assert result.view["routing"]["sources"] == {"default": "ui", "fallback": "ui", "roles": "file"}
+    assert result.view["routing"]["sources"] == {
+        "default": "ui",
+        "fallback": "ui",
+        "roles": "file",
+        "light": "file",
+    }
     env_result = merge_layers(
         base, None, OverrideSnapshot(), {"AGENT_DEFAULT_LLM_PROFILE": "spare"}
     )

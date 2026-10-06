@@ -142,6 +142,8 @@ class RoutingSpec(_Spec):
     default: str
     fallback: list[str] = Field(default_factory=list)
     roles: dict[str, str] = Field(default_factory=dict)
+    # Model for internal tasks: context summaries and session titles. None: use the default.
+    light: str | None = None
 
 
 class DecisionsSpec(_Spec):
@@ -194,6 +196,8 @@ class ModelsConfig(_Spec):
         selections.extend(
             (("routing", "roles", role), model_id) for role, model_id in self.routing.roles.items()
         )
+        if self.routing.light is not None:
+            selections.append((("routing", "light"), self.routing.light))
         for location, model_id in selections:
             selected_model = self.models.get(model_id)
             if selected_model is None:
@@ -274,6 +278,11 @@ class ResolvedModelRegistry:
     warnings: list[str]
     source: Literal["yaml", "legacy"]
     checksum: str
+    light_id: str | None = None
+
+    def light(self) -> ResolvedModel:
+        """Return the model for internal tasks, or the default model when none is set."""
+        return self.get(self.light_id or self.default_id)
 
     def get(self, model_id: str) -> ResolvedModel:
         """Return a model or explain an unknown ID."""
@@ -419,6 +428,7 @@ def _resolve(
         roles=dict(config.routing.roles),
         warnings=warnings,
         source=source,
+        light_id=config.routing.light,
         checksum=checksum,
     )
 

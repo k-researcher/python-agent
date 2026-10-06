@@ -89,6 +89,7 @@ class RoutingPatch(_Patch):
     default: str | None = None
     fallback: list[str] | None = None
     roles: dict[str, str] | None = None
+    light: str | None = None
 
 
 async def _layers(db: AsyncSession, settings: Settings) -> ModelLayers:

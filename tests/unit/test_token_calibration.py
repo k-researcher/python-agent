@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from agent.token_calibration import MAX_FACTOR, MIN_FACTOR, TokenCalibrator
+from agent.token_calibration import (
+    MAX_FACTOR,
+    MIN_FACTOR,
+    CalibrationKey,
+    TokenCalibrator,
+)
 
 
 def test_initial_factor_and_samples() -> None:
@@ -84,3 +89,75 @@ def test_restore_clamps_factors() -> None:
     restored = TokenCalibrator.restore({"low": (0.1, 2), "high": (9.0, 2)})
     assert restored.factor("low") == MIN_FACTOR
     assert restored.factor("high") == MAX_FACTOR
+
+
+def test_calibration_key_encode_decode() -> None:
+    key = CalibrationKey("openai", "gpt-4/turbo", "v1")
+    encoded = key.encode()
+    # Use exact string representation check to ensure separators and no spaces
+    assert encoded == '["openai","gpt-4/turbo","v1"]'
+    decoded = CalibrationKey.decode(encoded)
+    assert decoded == key
+
+
+def test_calibration_key_special_characters() -> None:
+    # Test model names with ":" and "/"
+    key = CalibrationKey("other-provider", "family-3:large/2024", "1.0")
+    encoded = key.encode()
+    assert "family-3:large/2024" in encoded
+    assert CalibrationKey.decode(encoded) == key
+
+
+def test_calibration_key_uniqueness() -> None:
+    key1 = CalibrationKey("p1", "m", "v")
+    key2 = CalibrationKey("p2", "m", "v")
+    key3 = CalibrationKey("p1", "m2", "v")
+    key4 = CalibrationKey("p1", "m", "v2")
+
+    assert key1.encode() != key2.encode()
+    assert key1.encode() != key3.encode()
+    assert key1.encode() != key4.encode()
+
+
+def test_calibration_key_decode_errors() -> None:
+    # Not a JSON list
+    with pytest.raises(ValueError, match="Invalid JSON format"):
+        CalibrationKey.decode("not-json")
+    with pytest.raises(ValueError, match="Invalid JSON format"):
+        CalibrationKey.decode('{"')
+
+    # Not a list
+    with pytest.raises(ValueError, match="Expected a list of exactly 3 elements"):
+        CalibrationKey.decode('["1", "2"]')
+
+    # Wrong number of elements
+    with pytest.raises(ValueError, match="Expected a list of exactly 3 elements"):
+        CalibrationKey.decode('["1", "2", "3", "4"]')
+
+    # Contains non-string
+    with pytest.raises(ValueError, match="All elements must be non-empty strings"):
+        CalibrationKey.decode('["a", 1, "c"]')
+
+    # Contains empty string
+    with pytest.raises(ValueError, match="All elements must be non-empty strings"):
+        CalibrationKey.decode('["", "b", "c"]')
+
+    # List is empty
+    with pytest.raises(ValueError, match="Expected a list of exactly 3 elements"):
+        CalibrationKey.decode("[]")
+
+
+def test_calibration_key_integration_with_calibrator() -> None:
+    calibrator = TokenCalibrator()
+    key = CalibrationKey("openai", "gpt-4", "v1")
+    encoded_key = key.encode()
+
+    # Test observe
+    calibrator.observe(encoded_key, 100, 150)
+    assert calibrator.factor(encoded_key) == pytest.approx(1.1)  # 0.8*1 + 0.2*1.5
+
+    # Test factor
+    assert calibrator.factor(encoded_key) == pytest.approx(1.1)
+
+    # Test adjust
+    assert calibrator.adjust(encoded_key, 100) == 111

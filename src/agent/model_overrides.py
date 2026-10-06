@@ -381,6 +381,7 @@ def merge_layers(
         warnings=warnings,
         source="yaml" if origin == "file" else "legacy",
         checksum=checksum,
+        light_id=config.routing.light,
     )
     return EffectiveModels(registry, config, view, provider_keys)
 

@@ -111,6 +111,7 @@ def test_duplicate_key_has_exact_line_and_field(tmp_path: Path) -> None:
         (lambda data: data["routing"].update(default="missing"), "routing.default"),
         (lambda data: data["routing"].update(fallback=["gateway"]), "routing.fallback[0]"),
         (lambda data: data["routing"].update(roles={"review": "missing"}), "routing.roles.review"),
+        (lambda data: data["routing"].update(light="missing"), "routing.light"),
         (lambda data: data.update(decisions={"provider": "missing"}), "decisions.provider"),
     ],
 )
@@ -567,3 +568,17 @@ def test_legacy_style_ids_are_accepted(tmp_path: Path) -> None:
     data["routing"]["default"] = "local:qwen"
     registry = load_models(_write(tmp_path, data), {"MODEL_KEY": _SECRET}, None)
     assert registry.default_id == "local:qwen"
+
+
+def test_light_model_falls_back_to_default(tmp_path: Path) -> None:
+    registry = load_models(_write(tmp_path, _data()), {"MODEL_KEY": _SECRET}, None)
+    assert registry.light_id is None
+    assert registry.light().id == "fast"
+
+
+def test_light_model_reference_resolves(tmp_path: Path) -> None:
+    data = _data()
+    data["models"]["small"] = dict(data["models"]["fast"], model="small-model")
+    data["routing"]["light"] = "small"
+    registry = load_models(_write(tmp_path, data), {"MODEL_KEY": _SECRET}, None)
+    assert registry.light().model == "small-model"

@@ -1,43 +1,58 @@
 from __future__ import annotations
 
 import asyncio
-import re
+import json
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import httpx
 
+from agent.llm_errors import (
+    LLMErrorKind,
+    ProviderErrorInfo,
+    classify_exception,
+    classify_http_error,
+)
 from agent.model_config import SUPPORTED_TRANSPORTS, ResolvedModel
 from agent.reasoning import ReasoningDecision, wire_parameters
+from agent.redaction import redact
+
+__all__ = ["LLMClient", "LLMError", "LLMResponse", "LLMTransientError", "redact"]
 
 # Receives ("content" | "reasoning", text) for each streamed fragment.
 DeltaCallback = Callable[[str, str], Awaitable[None]]
 
 
 class LLMError(RuntimeError):
-    pass
+    """A failed LLM request. ``info`` holds the typed classification.
+
+    ``started`` is True when the reply stream already sent content, reasoning or a tool call.
+    After that, no retry, fallback or context retry is permitted.
+    """
+
+    def __init__(
+        self, message: str, *, info: ProviderErrorInfo | None = None, started: bool = False
+    ) -> None:
+        super().__init__(message)
+        self.info = info or ProviderErrorInfo(
+            LLMErrorKind.unknown, None, None, message[:500], isinstance(self, LLMTransientError)
+        )
+        self.started = started
+
+    @property
+    def kind(self) -> LLMErrorKind:
+        return self.info.kind
 
 
 class LLMTransientError(LLMError):
     """The provider is temporarily unavailable. A fallback model can take the request."""
 
 
-# Generic credential shapes; the configured key is also removed by exact match.
-_SECRET_PATTERNS = (
-    re.compile(r"\b(sk|pk|rk|key)-[A-Za-z0-9_\-]{8,}"),
-    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-~+/]{8,}=*"),
-)
-
-
-def redact(text: str, secrets: tuple[str, ...] = ()) -> str:
-    """Remove credentials from provider text before it reaches logs, audit or the UI."""
-    for secret in secrets:
-        if len(secret) >= 4:
-            text = text.replace(secret, "[REDACTED]")
-    for pattern in _SECRET_PATTERNS:
-        text = pattern.sub("[REDACTED]", text)
-    return text
+def error_for(info: ProviderErrorInfo, message: str, *, started: bool = False) -> LLMError:
+    """Return the exception class that matches the classification."""
+    error = LLMTransientError if info.retryable else LLMError
+    return error(message, info=info, started=started)
 
 
 @dataclass(slots=True)
@@ -45,8 +60,9 @@ class LLMResponse:
     content: str | None
     tool_calls: list[dict[str, Any]]
     finish_reason: str
-    prompt_tokens: int
-    completion_tokens: int
+    # None: the provider did not report usage. Unknown is not zero.
+    prompt_tokens: int | None
+    completion_tokens: int | None
     reasoning: str | None = None
 
 
@@ -137,16 +153,13 @@ class LLMClient:
                 return self._parse_response(response.json())
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 if attempt >= retries:
-                    detail = redact(str(exc), secrets)
-                    raise LLMTransientError(f"LLM network error: {detail}") from exc
+                    info = _redacted(classify_exception(exc), secrets)
+                    raise error_for(info, f"LLM network error: {info.message}") from exc
                 await asyncio.sleep(min(8.0, 2.0**attempt))
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
-                detail = redact(exc.response.text[:1000], secrets)
-                message = f"LLM returned HTTP {status}: {detail}"
-                if status == 429 or status >= 500:
-                    raise LLMTransientError(message) from exc
-                raise LLMError(message) from exc
+                info = _redacted(classify_http_error(status, exc.response.text), secrets)
+                raise error_for(info, f"LLM returned HTTP {status}: {info.message}") from exc
             except (KeyError, TypeError, ValueError) as exc:
                 raise LLMError("LLM returned an invalid response") from exc
 
@@ -170,29 +183,34 @@ class LLMClient:
                     if response.status_code >= 400:
                         status = response.status_code
                         body = (await response.aread()).decode(errors="replace")
-                        detail = redact(body[:1000], secrets)
-                        retryable = status == 429 or status >= 500
-                        if retryable and attempt < retries:
+                        info = _redacted(classify_http_error(status, body), secrets)
+                        if info.retryable and attempt < retries:
                             await asyncio.sleep(min(8.0, 2.0**attempt))
                             continue
-                        error = LLMTransientError if retryable else LLMError
-                        raise error(f"LLM returned HTTP {status}: {detail}")
+                        raise error_for(info, f"LLM returned HTTP {status}: {info.message}")
                     decoder, accumulator = SSEDecoder(), ChatStreamAccumulator()
                     async for chunk in response.aiter_bytes():
                         for data in decoder.feed(chunk):
                             for event in accumulator.add(data):
-                                if event.kind in {"content", "reasoning"} and event.text:
+                                if event.kind == "tool_call":
+                                    started = True
+                                elif event.kind in {"content", "reasoning"} and event.text:
                                     started = True
                                     await on_delta(event.kind, event.text)
                     for data in decoder.close():
                         accumulator.add(data)
                     return accumulator.result()
+            except LLMError as exc:
+                # An error event inside the stream: keep its classification, add the state.
+                exc.started = exc.started or started
+                raise
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                detail = redact(str(exc), secrets)
+                info = _redacted(classify_exception(exc), secrets)
                 if started:
-                    raise LLMTransientError(f"LLM stream was interrupted: {detail}") from exc
+                    message = f"LLM stream was interrupted: {info.message}"
+                    raise error_for(info, message, started=True) from exc
                 if attempt >= retries:
-                    raise LLMTransientError(f"LLM network error: {detail}") from exc
+                    raise error_for(info, f"LLM network error: {info.message}") from exc
                 await asyncio.sleep(min(8.0, 2.0**attempt))
         raise LLMTransientError("LLM request failed")
 
@@ -206,7 +224,28 @@ class LLMClient:
             content=message.get("content"),
             tool_calls=message.get("tool_calls") or [],
             finish_reason=choice.get("finish_reason", "stop"),
-            prompt_tokens=int(usage.get("prompt_tokens", 0)),
-            completion_tokens=int(usage.get("completion_tokens", 0)),
+            prompt_tokens=token_count(usage, "prompt_tokens"),
+            completion_tokens=token_count(usage, "completion_tokens"),
             reasoning=reasoning if isinstance(reasoning, str) else None,
         )
+
+
+def token_count(usage: Any, name: str) -> int | None:
+    """Return a reported token count, or None when it is missing or not valid."""
+    value = usage.get(name) if isinstance(usage, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return int(value)
+
+
+def _redacted(info: ProviderErrorInfo, secrets: tuple[str | None, ...]) -> ProviderErrorInfo:
+    """Return the classification with the configured key removed from the message."""
+    known = tuple(secret for secret in secrets if secret)
+    return replace(info, message=redact(info.message, known))
+
+
+def stream_error_info(error: Any) -> ProviderErrorInfo:
+    """Classify an error event that arrives inside a successful SSE stream."""
+    body = json.dumps({"error": error}, ensure_ascii=False, default=str)
+    status = error.get("status") if isinstance(error, dict) else None
+    return classify_http_error(status if isinstance(status, int) else 0, body)

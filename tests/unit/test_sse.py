@@ -236,12 +236,21 @@ def test_error_after_successful_chunks() -> None:
         accumulator.add(_chunk({"error": {"message": "boom"}}))
 
 
-def test_result_no_usage_defaults_zero() -> None:
+def test_result_without_usage_is_unknown() -> None:
     accumulator = ChatStreamAccumulator()
     accumulator.add(_chunk({"choices": [{"delta": {"content": "hi"}}]}))
     result = accumulator.result()
-    assert result.prompt_tokens == 0
-    assert result.completion_tokens == 0
+    assert result.prompt_tokens is None
+    assert result.completion_tokens is None
+
+
+def test_stream_error_keeps_overflow_classification() -> None:
+    accumulator = ChatStreamAccumulator()
+    with pytest.raises(LLMError) as caught:
+        accumulator.add(
+            _chunk({"error": {"message": "too long", "code": "context_length_exceeded"}})
+        )
+    assert caught.value.kind == "context_overflow"
 
 
 def test_full_stream_result() -> None:

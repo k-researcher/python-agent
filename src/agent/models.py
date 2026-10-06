@@ -5,7 +5,20 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    PrimaryKeyConstraint,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -90,8 +103,29 @@ class Session(Base):
     )
 
 
+# A summary checkpoint is a user message with coverage data; other kinds have none.
+SUMMARY_FIELDS_CHECK = (
+    "(kind = 'summary' AND role = 'user' AND content IS NOT NULL AND content <> ''"
+    " AND covers_until > 0 AND summary_version > 0 AND source_hash IS NOT NULL)"
+    " OR (kind <> 'summary' AND covers_until IS NULL AND source_hash IS NULL"
+    " AND summary_version IS NULL AND summary_model IS NULL)"
+)
+
+
 class Message(Base):
     __tablename__ = "messages"
+    __table_args__ = (
+        CheckConstraint(SUMMARY_FIELDS_CHECK, name="ck_messages_summary_fields"),
+        UniqueConstraint(
+            "session_id",
+            "covers_until",
+            "source_hash",
+            "summary_version",
+            name="uq_messages_summary_checkpoint",
+        ),
+        Index("ix_messages_session_id_id", "session_id", "id"),
+        Index("ix_messages_session_kind_coverage", "session_id", "kind", "covers_until", "id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     session_id: Mapped[str] = mapped_column(
@@ -108,6 +142,12 @@ class Message(Base):
     reasoning_content: Mapped[str | None] = mapped_column(Text, nullable=True)
     # User message: the requested level ("auto" or an effort). Assistant: the level sent.
     reasoning_effort: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Summary checkpoint only: the last covered source message ID (inclusive), the hash of
+    # the covered source, the checkpoint format version and the model profile (None: local).
+    covers_until: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    summary_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    summary_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     session: Mapped[Session] = relationship(back_populates="messages")
@@ -115,6 +155,7 @@ class Message(Base):
 
 class ToolCall(Base):
     __tablename__ = "tool_calls"
+    __table_args__ = (Index("ix_tool_calls_session_status", "session_id", "status"),)
 
     id: Mapped[str] = mapped_column(String(200), primary_key=True)
     session_id: Mapped[str] = mapped_column(
@@ -179,7 +220,40 @@ class OutboundAudit(Base):
     payload_sha256: Mapped[str] = mapped_column(String(64), default="")
     status: Mapped[str] = mapped_column(String(30), default="started")
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # LLM attempt fields. One row covers one HTTP attempt: "started", then a terminal status.
+    inference_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    purpose: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    provider: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    model_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    wire_version: Mapped[str | None] = mapped_column(String(96), nullable=True)
+    raw_estimate: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    factor: Mapped[float | None] = mapped_column(Float(precision=53), nullable=True)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_kind: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TokenCalibration(Base):
+    """Correction factor of the token estimate for one provider, model and wire version."""
+
+    __tablename__ = "token_calibrations"
+    __table_args__ = (
+        PrimaryKeyConstraint("provider", "model", "wire_version", name="pk_token_calibrations"),
+        CheckConstraint("factor BETWEEN 0.5 AND 4.0", name="ck_token_calibrations_factor"),
+        CheckConstraint("samples >= 0", name="ck_token_calibrations_samples"),
+    )
+
+    provider: Mapped[str] = mapped_column(Text)
+    model: Mapped[str] = mapped_column(Text)
+    wire_version: Mapped[str] = mapped_column(String(96))
+    factor: Mapped[float] = mapped_column(Float(precision=53), default=1.0, server_default="1.0")
+    samples: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class KnowledgeDocument(Base):

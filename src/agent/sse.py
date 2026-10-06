@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from agent.llm import LLMError, LLMResponse
+from agent.llm import LLMError, LLMResponse, error_for, stream_error_info, token_count
 
 
 @dataclass(frozen=True)
@@ -105,7 +105,8 @@ class ChatStreamAccumulator:
             raise LLMError("LLM returned an invalid stream chunk")
         error = payload.get("error")
         if error:
-            raise LLMError(f"LLM stream error: {self._format_error(error)}")
+            info = stream_error_info(error)
+            raise error_for(info, f"LLM stream error: {info.message}")
 
         events: list[StreamEvent] = []
         choices = payload.get("choices")
@@ -163,12 +164,6 @@ class ChatStreamAccumulator:
                 entry.arguments += arguments
         events.append(StreamEvent(kind="tool_call", index=index))
 
-    @staticmethod
-    def _format_error(error: Any) -> str:
-        if isinstance(error, dict):
-            return str(error.get("message") or error)
-        return str(error)
-
     def result(self) -> LLMResponse:
         """Build the final LLMResponse from all collected chunks."""
         content = "".join(self._content) or None
@@ -185,8 +180,8 @@ class ChatStreamAccumulator:
             for _, entry in sorted(self._tool_calls.items(), key=lambda item: item[0])
         ]
         usage = self._usage or {}
-        prompt_tokens = int(usage.get("prompt_tokens", 0))
-        completion_tokens = int(usage.get("completion_tokens", 0))
+        prompt_tokens = token_count(usage, "prompt_tokens")
+        completion_tokens = token_count(usage, "completion_tokens")
         return LLMResponse(
             content=content,
             tool_calls=tool_calls,

@@ -271,7 +271,8 @@ def test_routing_override(client: TestClient) -> None:
     assert routing["default"] == "spare"
     assert routing["fallback"] == ["fast"]
     assert routing["roles"] == {"arch": "fast"}
-    assert set(routing["sources"].values()) == {"ui"}
+    assert {routing["sources"][key] for key in ("default", "fallback", "roles")} == {"ui"}
+    assert routing["sources"]["light"] == "file"
     assert client.put(f"{PREFIX}/routing", json={"default": "absent"}).status_code == 422
     assert client.get(PREFIX).json()["routing"] == routing
 

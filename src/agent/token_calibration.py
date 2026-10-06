@@ -2,12 +2,47 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 MIN_FACTOR = 0.5
 MAX_FACTOR = 4.0
 ALPHA = 0.2
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationKey:
+    """Unique key for a model based on provider, model name, and wire version."""
+
+    provider: str
+    model: str
+    wire_version: str
+
+    def encode(self) -> str:
+        """Return a JSON array string: ["provider", "model", "wire_version"]."""
+        return json.dumps(
+            [self.provider, self.model, self.wire_version],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def decode(cls, value: str) -> CalibrationKey:
+        """Parse the JSON array string. Raise ValueError for any other shape."""
+        try:
+            data = json.loads(value)
+        except json.JSONDecodeError as e:
+            raise ValueError("Invalid JSON format") from e
+
+        if not isinstance(data, list) or len(data) != 3:
+            raise ValueError("Expected a list of exactly 3 elements")
+
+        if not all(isinstance(x, str) and x for x in data):
+            raise ValueError("All elements must be non-empty strings")
+
+        return cls(provider=data[0], model=data[1], wire_version=data[2])
 
 
 class TokenCalibrator:
