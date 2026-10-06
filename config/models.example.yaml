@@ -1,0 +1,66 @@
+# Структура моделей (базовый слой). UI может переопределять поля поверх этого файла.
+# Ключи здесь не хранятся: api_key_env — имя переменной из окружения или .env.
+# Проверка: uv run agent config check
+providers:
+  gateway:
+    kind: openai
+    base_url: https://llm.example.com/v1
+    api_key_env: AGENT_LLM_API_KEY
+    timeout_seconds: 120
+    max_retries: 3
+
+  # --- Шаблоны других провайдеров: раскомментируйте нужные ---
+  # anthropic:                      # Claude (адаптер Messages API — фаза 2)
+  #   kind: anthropic
+  #   base_url: https://api.anthropic.com/v1
+  #   api_key_env: ANTHROPIC_API_KEY
+  # openai:                         # GPT / Codex-модели (адаптер Responses API — фаза 2)
+  #   kind: openai_responses
+  #   base_url: https://api.openai.com/v1
+  #   api_key_env: OPENAI_API_KEY
+  # glm:                            # Z.ai GLM (для Китая: https://open.bigmodel.cn/api/paas/v4)
+  #   kind: openai
+  #   base_url: https://api.z.ai/api/paas/v4
+  #   api_key_env: ZAI_API_KEY
+  # lmstudio:                       # LM Studio, локальный сервер
+  #   kind: openai
+  #   base_url: http://127.0.0.1:1234/v1
+  #   api_key_env: null
+  # mlx:                            # mlx_lm.server (по умолчанию тоже 8080 — смените порт)
+  #   kind: openai
+  #   base_url: http://127.0.0.1:8081/v1
+  #   api_key_env: null
+  # ollama:
+  #   kind: openai
+  #   base_url: http://127.0.0.1:11434/v1
+  #   api_key_env: null
+
+models:
+  main:                             # основная модель агента
+    provider: gateway
+    model: deepseek-v4-flash
+    context_window: 131070
+    max_tokens: 16000
+    # Пример: шлюз LiteLLM понимает только «выкл/вкл»: "none" выключает рассуждения,
+    # любой другой уровень включает их без регулировки силы (проверено 2026-10-06).
+    reasoning:
+      supported: true
+      allowed_efforts: [none, high]
+      default_effort: high
+      wire_parameter: reasoning_effort
+      history: current_turn             # рассуждения возвращаются модели в цикле инструментов
+  light:                            # служебные задачи (названия, суммаризация) и fallback
+    provider: gateway
+    model: gemma-4-26b
+    context_window: 131072
+    max_tokens: 8192
+    reasoning: {supported: false}
+
+routing:
+  default: main
+  # ID моделей (не провайдеров); используются после исчерпания повторов при сбоях.
+  fallback: [light]
+  roles: {}
+
+decisions:                          # слой решений (Jev) — фаза 4.5
+  enabled: false

@@ -1,49 +1,54 @@
-# Threat model
+# Модель угроз
+
+English version: [threat-model.en.md](threat-model.en.md).
 
 ## Активы
 
-- диалоги, prompts и файлы зарегистрированных проектов;
-- LLM, SSH, database и embedding credentials;
-- право выполнять локальные и удалённые побочные действия;
-- целостность PostgreSQL, Redis Stream и knowledge base.
+- Диалоги, промпты и файлы зарегистрированных проектов.
+- Учётные данные LLM, SSH, баз данных и эмбеддингов.
+- Право выполнять локальные и удалённые побочные действия.
+- Целостность PostgreSQL, Redis Stream и базы знаний.
 
 ## Границы доверия
 
 ```text
-Browser ──token──> API ──session ID──> Redis Stream ──> Workers
-                      └──────────────> PostgreSQL <───────┘
+Browser ──cookie + CSRF──> API ──session ID──> Redis Stream ──> Workers
+                              └──────────────> PostgreSQL <───────┘
 Workers ──approved egress──> LLM / HTTP / DB / SSH / embeddings
-Workers ──PathGuard────────> /workspace projects
+Workers ──SafeProjectFS────> /workspace projects
 ```
 
-LLM output и содержимое проекта считаются недоверенными. Redis/PostgreSQL находятся
-во внутренней Compose-сети. Администраторская конфигурация profiles/connections и
-решение пользователя в Approval являются доверенными управляющими входами.
+Вывод LLM и содержимое проекта — недоверенные данные. Redis и PostgreSQL находятся во
+внутренней сети Compose. Доверенные управляющие входы: конфигурация администратора
+(`models.yaml`, подключения) и решение пользователя при подтверждении.
 
 ## Основные угрозы и меры
 
 | Угроза | Меры |
 | --- | --- |
-| Prompt injection вызывает side effect | Централизованный risk registry и Approval до выполнения |
-| Кража ключей через `read_file`/shell | Блокировка secret-bearing paths; shell без inherited secrets; non-root container |
-| Path traversal/symlink escape | Canonical resolve + проверка принадлежности project/frontend root |
-| SSRF через HTTP tool | Явный hostname allowlist, DNS/IP private-range checks, redirects off, запрещённый Host header |
-| Повтор side effect после падения worker | `running` tool call не retry; возвращается uncertain error |
-| Два worker ведут одну сессию | Redis token lock с TTL heartbeat и session-level queue dedupe |
-| Потеря job при падении | Redis Stream consumer group, ACK после цикла, XAUTOCLAIM stale jobs |
-| Утечка prompts через очередь | Stream содержит только session ID; тексты находятся в PostgreSQL |
-| DoS через output/regex/XLSX | Limits, process kill, regex timeout/thread, zip size/parts limits |
-| Перехват внешнего API | Localhost bind по умолчанию, API token, рекомендация TLS reverse proxy |
-| Подмена модели/ключа | Профили задаёт администратор; сессия хранит только проверенное имя профиля |
+| Prompt injection вызывает побочный эффект | Центральный реестр рисков. Подтверждение до выполнения. Проверка аргументов по JSON Schema до подтверждения |
+| Кража ключей через `read_file` или shell | Блокировка файлов с секретами. Shell без унаследованных секретов. Non-root контейнер |
+| Выход за проект через `..` или symlink | `SafeProjectFS`: дескрипторы, `O_NOFOLLOW`, атомарная замена. `PathGuard` для чтения |
+| SSRF через HTTP-инструмент | Allowlist хостов. Проверка DNS и частных диапазонов IP. Редиректы выключены. Заголовок `Host` запрещён |
+| DNS rebinding к локальному API | Точная проверка `Host`. Проверка `Origin`. Cookie-сессия и CSRF-токен |
+| Кража или подделка входа в браузере | Одноразовая ссылка во fragment URL. Хеши кодов и сессий в БД. Cookie `HttpOnly; SameSite=Strict`, при HTTPS `__Host-` и `Secure`. Отзыв сессий |
+| Побочный эффект после Stop | Проверка Stop перед каждым инструментом. Атомарный захват вызова. Отмена ожидающих подтверждений. Завершение группы процессов shell. Наблюдатель Stop в worker |
+| Повтор побочного эффекта после сбоя worker | Вызов со статусом `running` не повторяется. Возвращается ошибка с неизвестным результатом |
+| Два worker ведут одну сессию | Блокировка Redis с TTL и heartbeat. Дедупликация очереди на уровне сессии |
+| Потеря задания при сбое | Consumer group Redis Stream. ACK после цикла. `XAUTOCLAIM` для зависших заданий |
+| Утечка промптов через очередь | Stream содержит только ID сессии. Тексты находятся в PostgreSQL |
+| Утечка ключа через ошибку провайдера | Удаление ключа и типовых форм ключей из текста ошибки до записи в журнал, сессию и события |
+| DoS через вывод, regex или XLSX | Лимиты. Завершение процесса. Timeout regex. Лимиты размера и частей zip |
+| Подмена модели или ключа | Модели задают `models.yaml` и защищённый API настроек. Ключи из интерфейса зашифрованы. Сессия хранит только ID модели |
 
 ## Остаточные риски
 
-- Одобренный shell/SSH/SQL является мощной операцией; Approval не доказывает её
+- Одобренный shell, SSH или SQL — мощная операция. Подтверждение не доказывает её
   безопасность.
-- DNS проверяется перед запросом, но доверенный allowlisted DNS всё равно остаётся
-  частью trusted computing base.
-- API token — single-user authentication без ролей и tenant isolation.
-- Pub/Sub события эфемерны; UI восстанавливает истину из PostgreSQL events/state.
-- Exactly-once для произвольной внешней системы невозможно без её idempotency key.
-- TLS, rate limiting, backups, log retention и secret manager обеспечивает deployment
-  perimeter, а не встроенный FastAPI runtime.
+- Сервер проверяет DNS перед запросом. Но DNS хостов из allowlist остаётся частью доверенной
+  базы.
+- Вход однопользовательский. Ролей и изоляции арендаторов нет.
+- События Pub/Sub временные. Интерфейс восстанавливает состояние из PostgreSQL.
+- Выполнение ровно один раз во внешней системе невозможно без её idempotency key.
+- TLS, ограничение частоты запросов, резервные копии, хранение журналов и менеджер секретов
+  обеспечивает периметр развёртывания, а не встроенный runtime FastAPI.

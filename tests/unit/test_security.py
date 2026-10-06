@@ -55,3 +55,14 @@ def test_allows_environment_template(tmp_path: Path) -> None:
     template.write_text("KEY=", encoding="utf-8")
 
     assert PathGuard(tmp_path).resolve(".env.example") == template
+
+
+def test_rejects_dangling_symlink_pointing_outside(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside.txt"
+    (project / "out.txt").symlink_to(outside)
+
+    with pytest.raises(PathSecurityError):
+        PathGuard(project).resolve("out.txt", must_exist=False)
+    assert not outside.exists()

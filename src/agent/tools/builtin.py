@@ -3,17 +3,38 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import signal
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import regex
 
 from agent.security import PathGuard
+
+if TYPE_CHECKING:
+    from agent.safe_fs import SafeProjectFS
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 
 MAX_TEXT_BYTES = 1_000_000
 MAX_COMMAND_OUTPUT = 100_000
+
+
+def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
+    """Kill the command and everything it spawned (it runs in its own session)."""
+    if os.name == "posix":
+        with suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+    elif process.returncode is None:
+        with suppress(ProcessLookupError):
+            process.kill()
+
+
+def _safe_fs(root: Path) -> SafeProjectFS:
+    # Imported lazily: agent.safe_fs imports agent.tools.base, which initialises this package.
+    from agent.safe_fs import SafeProjectFS
+
+    return SafeProjectFS(root)
 
 
 def _read_text(path: Path) -> str:
@@ -153,18 +174,9 @@ class WriteFileTool(Tool):
     }
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
-        guard = PathGuard(context.project_root)
-        raw = str(arguments["path"])
-        raw_path = Path(raw)
-        candidate = raw_path if raw_path.is_absolute() else context.project_root / raw_path
-        path = guard.resolve(raw, must_exist=candidate.exists())
         content = str(arguments["content"])
-        path.parent.mkdir(parents=False, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        return {
-            "path": str(path.relative_to(context.project_root)),
-            "bytes_written": len(content.encode()),
-        }
+        relative = _safe_fs(context.project_root).write_text(str(arguments["path"]), content)
+        return {"path": str(relative), "bytes_written": len(content.encode("utf-8"))}
 
 
 class EditFileTool(Tool):
@@ -185,19 +197,13 @@ class EditFileTool(Tool):
     }
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
-        path = PathGuard(context.project_root).resolve(str(arguments["path"]))
-        content = _read_text(path)
-        old = str(arguments["old_text"])
-        if not old or old not in content:
-            raise ToolError("old_text was not found")
-        count = content.count(old)
-        if count > 1 and not bool(arguments.get("replace_all", False)):
-            raise ToolError(f"old_text occurs {count} times; set replace_all=true")
-        replace_count = -1 if arguments.get("replace_all") else 1
-        updated = content.replace(old, str(arguments["new_text"]), replace_count)
-        path.write_text(updated, encoding="utf-8")
-        replacements = count if arguments.get("replace_all") else 1
-        return {"path": str(path.relative_to(context.project_root)), "replacements": replacements}
+        relative, replacements = _safe_fs(context.project_root).edit_text(
+            str(arguments["path"]),
+            str(arguments["old_text"]),
+            str(arguments["new_text"]),
+            replace_all=bool(arguments.get("replace_all", False)),
+        )
+        return {"path": str(relative), "replacements": replacements}
 
 
 class RemoveFileTool(Tool):
@@ -213,12 +219,8 @@ class RemoveFileTool(Tool):
     }
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
-        path = PathGuard(context.project_root).resolve(str(arguments["path"]))
-        if not path.is_file():
-            raise ToolError("Only individual files can be removed")
-        relative = str(path.relative_to(context.project_root))
-        path.unlink()
-        return {"removed": relative}
+        relative = _safe_fs(context.project_root).remove_file(str(arguments["path"]))
+        return {"removed": str(relative)}
 
 
 class ShellTool(Tool):
@@ -244,6 +246,9 @@ class ShellTool(Tool):
             name: os.environ[name]
             for name in (
                 "PATH",
+                "HOME",
+                "USER",
+                "LOGNAME",
                 "LANG",
                 "LC_ALL",
                 "TERM",
@@ -262,6 +267,7 @@ class ShellTool(Tool):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=safe_environment,
+            start_new_session=os.name == "posix",
         )
 
         async def read_stream(stream: asyncio.StreamReader | None) -> tuple[bytes, bool]:
@@ -275,9 +281,7 @@ class ShellTool(Tool):
                     collected.extend(chunk[:remaining])
                 if len(chunk) > remaining:
                     truncated = True
-                    if process.returncode is None:
-                        with suppress(ProcessLookupError):
-                            process.kill()
+                    _kill_process_tree(process)
             return bytes(collected), truncated
 
         try:
@@ -290,11 +294,15 @@ class ShellTool(Tool):
                 timeout=int(arguments.get("timeout_seconds", 60)),
             )
         except TimeoutError:
-            if process.returncode is None:
-                with suppress(ProcessLookupError):
-                    process.kill()
+            _kill_process_tree(process)
             await process.wait()
             raise ToolError("Command timed out") from None
+        except asyncio.CancelledError:
+            # Stop/shutdown cancels the task; the command must not outlive the session.
+            _kill_process_tree(process)
+            with suppress(Exception):
+                await asyncio.shield(process.wait())
+            raise
         stdout, stdout_truncated = stdout_result
         stderr, stderr_truncated = stderr_result
         return {

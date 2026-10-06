@@ -34,7 +34,11 @@ class PathGuard:
             raise PathSecurityError(f"Project root is not a directory: {self.root}")
 
     def resolve(
-        self, value: str, *, must_exist: bool = True, allow_sensitive: bool = False
+        self,
+        value: str,
+        *,
+        must_exist: bool = True,
+        allow_sensitive: bool = False,
     ) -> Path:
         raw = Path(value).expanduser()
         candidate = raw if raw.is_absolute() else self.root / raw
@@ -42,8 +46,10 @@ class PathGuard:
         if must_exist:
             resolved = candidate.resolve(strict=True)
         else:
-            parent = candidate.parent.resolve(strict=True)
-            resolved = parent / candidate.name
+            candidate.parent.resolve(strict=True)
+            # Non-strict resolve also follows dangling symlinks to their target, so a link
+            # pointing outside the project is rejected below instead of being written through.
+            resolved = candidate.resolve(strict=False)
 
         try:
             resolved.relative_to(self.root)

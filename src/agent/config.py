@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -9,6 +10,32 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def normalize_origin(value: str) -> str:
+    """Canonical scheme://host[:port] form; default ports are dropped."""
+    parts = urlsplit(value.strip())
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        raise ValueError(f"Invalid origin: {value!r}")
+    if parts.username or parts.password or parts.path not in {"", "/"} or parts.query:
+        raise ValueError(f"Origin must not contain credentials, path or query: {value!r}")
+    host = parts.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    default_port = 443 if parts.scheme == "https" else 80
+    port = f":{parts.port}" if parts.port and parts.port != default_port else ""
+    return f"{parts.scheme}://{host}{port}"
+
+
+def _env_file() -> Path | None:
+    """AGENT_ENV_FILE overrides the dotenv path; an empty value disables it (used by tests)."""
+    override = os.environ.get("AGENT_ENV_FILE")
+    if override is None:
+        return PROJECT_ROOT / ".env"
+    return Path(override) if override else None
 
 
 class LLMProfileSettings(BaseModel):
@@ -22,7 +49,7 @@ class LLMProfileSettings(BaseModel):
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=PROJECT_ROOT / ".env",
+        env_file=_env_file(),
         env_prefix="AGENT_",
         case_sensitive=False,
         extra="ignore",
@@ -67,6 +94,21 @@ class Settings(BaseSettings):
     max_child_wait_seconds: int = Field(default=600, ge=10, le=7200)
     api_token: str = ""
 
+    # Browser access: exact Host names, the public origin of the UI and auth lifetimes.
+    allowed_hosts: list[str] = Field(
+        default_factory=lambda: ["localhost", "127.0.0.1", "[::1]"]
+    )
+    public_origin: str = ""
+    extra_origins: list[str] = Field(default_factory=list)
+    trusted_proxy_ips: list[str] = Field(default_factory=list)
+    auth_link_ttl_seconds: int = Field(default=600, ge=60, le=86_400)
+    auth_session_ttl_seconds: int = Field(default=30 * 86_400, ge=3600, le=365 * 86_400)
+    auth_open_browser: bool = True
+
+    # Model catalogue: unset = config/models.yaml if present; "" = legacy AGENT_LLM_*;
+    # a path = that file, which must exist.
+    models_file: str | None = None
+
     data_dir: Path = PROJECT_ROOT / "data"
     prompts_dir: Path = PROJECT_ROOT / "prompts"
     frontend_dist: Path = PROJECT_ROOT / "frontend" / "dist"
@@ -74,15 +116,56 @@ class Settings(BaseSettings):
     def prepare_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def binds_loopback(self) -> bool:
+        return self.host in LOOPBACK_HOSTS
+
+    def effective_public_origin(self) -> str:
+        if self.public_origin:
+            return normalize_origin(self.public_origin)
+        return f"http://127.0.0.1:{self.port}"
+
+    def allowed_origins(self) -> frozenset[str]:
+        origins = {normalize_origin(item) for item in self.extra_origins}
+        if self.public_origin:
+            origins.add(normalize_origin(self.public_origin))
+        else:
+            origins.update(
+                f"http://{host}:{self.port}" for host in ("127.0.0.1", "localhost", "[::1]")
+            )
+        return frozenset(origins)
+
+    @property
+    def secure_cookies(self) -> bool:
+        return self.effective_public_origin().startswith("https://")
+
     def validate_runtime_security(self) -> None:
-        if self.host not in {"127.0.0.1", "localhost", "::1"} and not self.api_token:
-            raise RuntimeError("AGENT_API_TOKEN is required when binding outside localhost")
+        if not self.binds_loopback and not self.public_origin:
+            raise RuntimeError(
+                "AGENT_PUBLIC_ORIGIN is required when binding outside localhost"
+            )
+        if self.public_origin:
+            origin = normalize_origin(self.public_origin)
+            hostname = urlsplit(origin).hostname or ""
+            if hostname not in {host.strip("[]") for host in self.allowed_hosts}:
+                raise RuntimeError("AGENT_PUBLIC_ORIGIN host must be listed in AGENT_ALLOWED_HOSTS")
+            # A container binds 0.0.0.0 but may publish only on 127.0.0.1; HTTP is then local.
+            if not origin.startswith("https://") and hostname not in LOOPBACK_HOSTS:
+                raise RuntimeError("AGENT_PUBLIC_ORIGIN must use https:// for remote access")
+        if any("*" in host for host in self.allowed_hosts):
+            raise RuntimeError("AGENT_ALLOWED_HOSTS must list exact host names")
         if self.execution_mode == "redis" and not self.database_url.startswith(
             ("postgresql+asyncpg://", "postgres+asyncpg://")
         ):
             raise RuntimeError(
                 "Redis execution mode requires PostgreSQL via postgresql+asyncpg://"
             )
+        if self.models_file is None and (PROJECT_ROOT / "config" / "models.yaml").is_file():
+            return  # agent.model_registry validates the YAML file.
+        if self.models_file is not None and str(self.models_file).strip():
+            if not Path(self.models_file).expanduser().is_file():
+                raise RuntimeError(f"AGENT_MODELS_FILE does not exist: {self.models_file}")
+            return
         self.resolve_llm_profile(self.default_llm_profile)
         for name, profile in self.available_llm_profiles().items():
             if not 1 <= len(name) <= 100:

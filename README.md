@@ -4,56 +4,72 @@
 
 ## Что реализовано
 
-- FastAPI REST API и WebSocket на одном порту;
-- SQLite по умолчанию либо PostgreSQL для состояния runtime;
-- проекты, родительские и дочерние сессии, сообщения, tool calls, approvals и события;
-- восстановление запущенных сессий в статус `interrupted` после перезапуска;
-- OpenAI-совместимый `/chat/completions`, retry, таймауты и ограничение контекста;
-- режимы `dev` и `ask`, централизованные подтверждения до побочного эффекта;
-- безопасные файловые инструменты и запуск команд внутри корня проекта;
-- HTTP, web search, именованные подключения к БД, SSH и чтение XLSX;
-- опциональная база знаний с локальным лексическим поиском или удалёнными embeddings;
-- локальный журнал исходящих обращений без сохранения передаваемого текста;
-- Vue 3 + TypeScript UI с approvals, дочерними агентами, context stats и audit;
-- API token обязателен при bind на внешний интерфейс;
-- опциональный distributed runtime: Redis Streams, PostgreSQL и отдельные workers.
-- одновременные именованные LLM-профили на уровне сессии и дочернего агента.
+- FastAPI REST API и WebSocket на одном порту.
+- SQLite по умолчанию или PostgreSQL для состояния runtime.
+- Проекты, родительские и дочерние сессии, сообщения, вызовы инструментов, подтверждения и
+  события.
+- Перевод запущенных сессий в статус `interrupted` после перезапуска.
+- Модели и провайдеры в `config/models.yaml` плюс переопределения из UI. У каждой модели своё
+  окно контекста и свои уровни рассуждений. Есть запасная модель на случай сбоя основной.
+- OpenAI-совместимый `/chat/completions`: повторы, таймауты, повтор обрезанного ответа с
+  большим лимитом токенов.
+- Режимы `dev` и `ask`. Подтверждение до каждого побочного эффекта. Проверка аргументов по
+  JSON Schema до подтверждения.
+- Безопасные файловые инструменты (`SafeProjectFS`) и запуск команд внутри корня проекта.
+- Stop останавливает агента: проверка перед каждым инструментом, отмена ожидающих
+  подтверждений, завершение группы процессов shell.
+- HTTP, web search, именованные подключения к БД, SSH и чтение XLSX.
+- Необязательная база знаний с локальным поиском по ключевым словам или с внешними
+  эмбеддингами.
+- Локальный журнал исходящих обращений без сохранения передаваемого текста.
+- Vue 3 + TypeScript UI: подтверждения, дочерние агенты, статистика контекста, журнал.
+- Вход по одноразовой ссылке и cookie-сессия; токен в UI не нужен.
+- Необязательный распределённый runtime: Redis Streams, PostgreSQL и отдельные workers.
+
+Архитектурные решения: [docs/adr](docs/adr). Безопасность: [docs/security.md](docs/security.md),
+[docs/threat-model.md](docs/threat-model.md).
 
 ## Быстрый запуск
 
 Требуются Python 3.12+, `uv` и Node.js 20+.
 
 ```bash
-cd /Users/oxygen/Files/Code/ml/agents/python-agent
+cd python-agent
 uv sync --extra dev
 cp .env.example .env
 cd frontend && npm install && npm run build && cd ..
 uv run agent
 ```
 
-Перед запуском заполните как минимум:
+Перед запуском заполните ключ провайдера в `.env` и опишите модели в
+`config/models.yaml` (шаблон — `config/models.example.yaml`):
 
-```dotenv
-AGENT_LLM_BASE_URL=https://your-provider.example/v1
-AGENT_LLM_API_KEY=replace-me
-AGENT_LLM_MODEL=your-model
+```bash
+cp config/models.example.yaml config/models.yaml
+echo 'AGENT_LLM_API_KEY=...' >> .env
+uv run agent config check --strict
 ```
 
-### Несколько моделей одновременно
+### Модели и провайдеры
 
-Одиночные `AGENT_LLM_*` остаются обратносуместимым профилем `default`. Чтобы разные
-сессии и дочерние агенты одновременно использовали разные модели или провайдеров,
-задайте JSON-профили:
+Конфигурация моделей состоит из двух слоёв:
 
-```dotenv
-AGENT_DEFAULT_LLM_PROFILE=fast
-AGENT_LLM_PROFILES={"fast":{"base_url":"https://provider-a.example/v1","api_key":"key-a","model":"fast-model"},"reasoning":{"base_url":"https://provider-b.example/v1","api_key":"key-b","model":"reasoning-model","max_tokens":16000},"local":{"base_url":"http://host.docker.internal:11434/v1","api_key":"local","model":"local-model"}}
-```
+1. **`config/models.yaml`** — провайдеры, модели, маршрутизация. Ключей в файле нет: провайдер
+   ссылается на переменную окружения через `api_key_env`.
+2. **Переопределения из UI** (`/api/settings/models`) — хранятся в БД, общие для API и всех
+   workers. Перекрывают YAML по отдельным полям, могут отключать элементы файла, добавлять
+   новых провайдеров и модели и хранить ключи зашифрованными (мастер-ключ
+   `AGENT_SECRET_KEY`; в embedded-режиме при его отсутствии создаётся `data/secret.key`).
+   «Сбросить к файлу» удаляет переопределение.
 
-Профиль выбирается при создании сессии. `run_agent` наследует профиль родителя либо
-получает другой `llm_profile`. Redis хранит только session ID; worker читает имя
-профиля из PostgreSQL. Названия, модели и hostname видны в public config, API keys —
-нет. После изменения профилей API и workers необходимо перезапустить.
+Типы провайдеров: `openai` — любой OpenAI-совместимый `/chat/completions` (корпоративные шлюзы, GLM,
+LM Studio, `mlx_lm.server`, Ollama); `openai_responses` (Codex/GPT) и `anthropic` (Claude)
+объявляются заранее, их адаптеры появятся в следующей фазе. У каждой модели свои окно
+контекста, `max_tokens` и допустимые уровни рассуждений; уровень выбирается при создании
+сессии (`reasoning_effort`). Модель сессии: явная → по роли (`routing.roles`) → `routing.default`.
+
+Если `config/models.yaml` нет, используются прежние `AGENT_LLM_*`; JSON-строка
+`AGENT_LLM_PROFILES` устарела.
 
 Откройте `http://127.0.0.1:8080`. OpenAPI доступен на
 `http://127.0.0.1:8080/docs`. Миграции применяются автоматически.
@@ -124,12 +140,31 @@ AGENT_KNOWLEDGE_BASE_EMBEDDING_MODEL=embedding-model
 Поиск с удалёнными embeddings и любые изменения KB проходят через Approval. Агент не
 индексирует диалоги самостоятельно.
 
-## Внешний доступ
+## Вход и внешний доступ
 
-При `AGENT_HOST=0.0.0.0` или другом нелокальном bind запуск без
-`AGENT_API_TOKEN` завершится ошибкой. REST использует заголовок `X-Agent-Token`.
-WebSocket передаёт token первым JSON-сообщением после соединения, поэтому секрет не
-попадает в URL/access-log. Для внешней сети следует ставить TLS reverse proxy.
+Токен в интерфейсе вводить не нужно. При запуске, если активного входа ещё нет, агент
+печатает одноразовую ссылку вида `http://127.0.0.1:8080/#login=...` (на localhost она
+открывается в браузере автоматически). Код передаётся во fragment и не попадает в логи;
+после входа браузер получает `HttpOnly; SameSite=Strict` cookie, а мутирующие запросы
+дополнительно защищены CSRF-токеном и проверкой `Origin`.
+
+```bash
+uv run agent auth link        # новая ссылка (например, для другого устройства)
+uv run agent auth revoke-all  # выйти на всех устройствах
+```
+
+Все запросы проверяют точный `Host` (`AGENT_ALLOWED_HOSTS`) — это защищает от DNS
+rebinding. Для удалённого доступа поставьте TLS reverse proxy и задайте:
+
+```dotenv
+AGENT_PUBLIC_ORIGIN=https://agent.example.com
+AGENT_ALLOWED_HOSTS=["agent.example.com"]
+AGENT_TRUSTED_PROXY_IPS=["127.0.0.1"]
+```
+
+При HTTPS cookie получает префикс `__Host-` и флаг `Secure`. `AGENT_API_TOKEN` остаётся
+необязательным способом аутентификации для CLI и скриптов (`X-Agent-Token`). Для
+разработки фронтенда через Vite добавьте `AGENT_EXTRA_ORIGINS=["http://localhost:5173"]`.
 
 ## Локальный и распределённый runtime
 
@@ -151,10 +186,9 @@ Redis-режим намеренно откажется запускаться с
 
 ### Запуск через Docker Compose
 
-Укажите в `.env` LLM-настройки, непустой `AGENT_API_TOKEN` и желательно смените пароль:
+Укажите в `.env` LLM-настройки и желательно смените пароль:
 
 ```dotenv
-AGENT_API_TOKEN=replace-with-long-random-token
 AGENT_POSTGRES_PASSWORD=replace-me
 AGENT_REDIS_PASSWORD=replace-with-random-hex
 AGENT_PROJECTS_ROOT=/absolute/path/with/projects
@@ -208,6 +242,9 @@ uv run pytest
 uv run alembic check
 cd frontend && npm run typecheck && npm run build
 ```
+
+Тесты не читают `.env` и не трогают `data/agent.db`: `tests/conftest.py` задаёт
+`AGENT_ENV_FILE=` (пустое значение отключает dotenv) и временную SQLite-базу.
 
 ## Ресурсы
 

@@ -5,7 +5,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -33,6 +33,7 @@ class ToolCallStatus(enum.StrEnum):
     running = "running"
     completed = "completed"
     rejected = "rejected"
+    cancelled = "cancelled"
     error = "error"
 
 
@@ -40,6 +41,7 @@ class ApprovalStatus(enum.StrEnum):
     pending = "pending"
     approved = "approved"
     rejected = "rejected"
+    cancelled = "cancelled"
 
 
 class Base(DeclarativeBase):
@@ -59,10 +61,13 @@ class Project(Base):
 
 class Session(Base):
     __tablename__ = "sessions"
+    __table_args__ = (Index("ix_sessions_archived_updated_at", "archived", "updated_at"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="RESTRICT"))
-    parent_id: Mapped[str | None] = mapped_column(ForeignKey("sessions.id"), nullable=True)
+    parent_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sessions.id"), nullable=True, index=True
+    )
     mode: Mapped[str] = mapped_column(String(50), default="dev")
     llm_profile: Mapped[str] = mapped_column(String(100), default="default", index=True)
     title: Mapped[str] = mapped_column(String(300))
@@ -89,13 +94,20 @@ class Message(Base):
     __tablename__ = "messages"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"), index=True
+    )
     role: Mapped[str] = mapped_column(String(30))
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     tool_call_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     tool_calls: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     skipped: Mapped[bool] = mapped_column(Boolean, default=False)
+    # "normal", later "summary" and "interrupted". Only "normal" and "summary" reach the model.
+    kind: Mapped[str] = mapped_column(String(20), default="normal")
+    reasoning_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # User message: the requested level ("auto" or an effort). Assistant: the level sent.
+    reasoning_effort: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     session: Mapped[Session] = relationship(back_populates="messages")
@@ -105,7 +117,9 @@ class ToolCall(Base):
     __tablename__ = "tool_calls"
 
     id: Mapped[str] = mapped_column(String(200), primary_key=True)
-    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"), index=True
+    )
     name: Mapped[str] = mapped_column(String(100))
     arguments: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -129,7 +143,9 @@ class Approval(Base):
     tool_call_id: Mapped[str] = mapped_column(
         ForeignKey("tool_calls.id", ondelete="CASCADE"), unique=True
     )
-    status: Mapped[str] = mapped_column(String(30), default=ApprovalStatus.pending.value)
+    status: Mapped[str] = mapped_column(
+        String(30), default=ApprovalStatus.pending.value, index=True
+    )
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -137,24 +153,12 @@ class Approval(Base):
     tool_call: Mapped[ToolCall] = relationship(back_populates="approval")
 
 
-class Command(Base):
-    __tablename__ = "commands"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
-    type: Mapped[str] = mapped_column(String(50))
-    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    processed: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-
 class Event(Base):
     __tablename__ = "events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     session_id: Mapped[str | None] = mapped_column(
-        ForeignKey("sessions.id", ondelete="CASCADE"), nullable=True
+        ForeignKey("sessions.id", ondelete="CASCADE"), nullable=True, index=True
     )
     type: Mapped[str] = mapped_column(String(100))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -166,7 +170,7 @@ class OutboundAudit(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     session_id: Mapped[str | None] = mapped_column(
-        ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True, index=True
     )
     category: Mapped[str] = mapped_column(String(50))
     destination: Mapped[str] = mapped_column(String(2048))
@@ -194,3 +198,28 @@ class KnowledgeDocument(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class AuthSession(Base):
+    """Browser login. Only the SHA-256 of the cookie value is stored."""
+
+    __tablename__ = "auth_sessions"
+
+    id_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    csrf_token: Mapped[str] = mapped_column(String(64))
+    user_agent: Mapped[str] = mapped_column(String(512), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AuthBootstrapCode(Base):
+    """One-time login link code. Only the SHA-256 of the code is stored."""
+
+    __tablename__ = "auth_bootstrap_codes"
+
+    code_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

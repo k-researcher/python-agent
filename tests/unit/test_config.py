@@ -3,13 +3,39 @@ import pytest
 from agent.config import Settings
 
 
-def test_external_bind_requires_api_token() -> None:
-    with pytest.raises(RuntimeError, match="AGENT_API_TOKEN"):
-        Settings(host="0.0.0.0", api_token="").validate_runtime_security()
+def test_external_bind_requires_public_origin() -> None:
+    with pytest.raises(RuntimeError, match="AGENT_PUBLIC_ORIGIN"):
+        Settings(host="0.0.0.0", public_origin="").validate_runtime_security()
 
 
-def test_local_bind_does_not_require_api_token() -> None:
-    Settings(host="127.0.0.1", api_token="").validate_runtime_security()
+def test_remote_public_origin_must_be_https_and_allowed_host() -> None:
+    with pytest.raises(RuntimeError, match="https"):
+        Settings(
+            host="0.0.0.0", public_origin="http://agent.example", allowed_hosts=["agent.example"]
+        ).validate_runtime_security()
+    with pytest.raises(RuntimeError, match="ALLOWED_HOSTS"):
+        Settings(host="0.0.0.0", public_origin="https://agent.example").validate_runtime_security()
+    settings = Settings(
+        host="0.0.0.0",
+        public_origin="https://agent.example/",
+        allowed_hosts=["agent.example"],
+        extra_origins=[],
+    )
+    settings.validate_runtime_security()
+    assert settings.allowed_origins() == {"https://agent.example"}
+    assert settings.secure_cookies
+
+
+def test_local_bind_works_without_token_or_origin() -> None:
+    settings = Settings(host="127.0.0.1", port=8080, api_token="", public_origin="")
+    settings.validate_runtime_security()
+    assert "http://localhost:8080" in settings.allowed_origins()
+    assert not settings.secure_cookies
+
+
+def test_wildcard_hosts_are_rejected() -> None:
+    with pytest.raises(RuntimeError, match="exact host"):
+        Settings(allowed_hosts=["*"]).validate_runtime_security()
 
 
 def test_distributed_mode_requires_postgresql() -> None:

@@ -40,6 +40,10 @@ class Tool(ABC):
     network_capability: bool = False
     knowledge_capability: bool = False
 
+    def parameters(self, model_ids: list[str] | None = None) -> dict[str, Any]:
+        """JSON Schema sent to the model; override when it depends on live configuration."""
+        return self.input_schema
+
     @abstractmethod
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
