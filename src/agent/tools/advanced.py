@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import zipfile
 from pathlib import Path
@@ -319,9 +320,7 @@ class ExcelSheetsTool(Tool):
 
     @staticmethod
     def read_sheets(path: Path) -> dict[str, Any]:
-        workbook = load_workbook(
-            path, read_only=True, data_only=True, keep_links=False
-        )
+        workbook = load_workbook(path, read_only=True, data_only=True, keep_links=False)
         try:
             return {"sheets": workbook.sheetnames}
         finally:
@@ -352,9 +351,7 @@ class ExcelReadTool(ExcelSheetsTool):
 
     @staticmethod
     def read_range(path: Path, arguments: dict[str, Any]) -> dict[str, Any]:
-        workbook = load_workbook(
-            path, read_only=True, data_only=True, keep_links=False
-        )
+        workbook = load_workbook(path, read_only=True, data_only=True, keep_links=False)
         try:
             sheet_name = str(arguments["sheet"])
             if sheet_name not in workbook.sheetnames:
@@ -383,7 +380,9 @@ class RunAgentTool(Tool):
     description = "Create a bounded child agent session and optionally wait for its final response."
     risk_level = RiskLevel.network_access
     allowed_modes = frozenset({"dev"})
+
     def __init__(self, settings: Settings) -> None:
+        self.settings = settings
         self.input_schema = {
             "type": "object",
             "properties": {
@@ -392,13 +391,24 @@ class RunAgentTool(Tool):
                 "wait": {"type": "boolean", "default": True},
                 "llm_profile": {
                     "type": "string",
-                    "enum": sorted(settings.available_llm_profiles()),
-                    "description": "Optional child model profile; inherits parent when omitted.",
+                    "description": "Optional child model ID; inherits the parent's when omitted.",
                 },
             },
             "required": ["mode", "prompt"],
             "additionalProperties": False,
         }
+
+    def parameters(self, model_ids: list[str] | None = None) -> dict[str, Any]:
+        if model_ids is None:
+            from agent.model_registry import load_registry
+
+            try:
+                model_ids = load_registry(self.settings).ids()
+            except ValueError:
+                return self.input_schema
+        schema = copy.deepcopy(self.input_schema)
+        schema["properties"]["llm_profile"]["enum"] = sorted(model_ids)
+        return schema
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
         if context.spawn_child is None:

@@ -5,7 +5,9 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.config import Settings
+from agent.model_registry import effective_registry, select_model
 from agent.models import Message, Project, Session, SessionStatus
+from agent.reasoning import validate_effort
 
 
 async def create_session_record(
@@ -20,8 +22,10 @@ async def create_session_record(
     parent_id: str | None = None,
     configuration: dict[str, Any] | None = None,
 ) -> Session:
-    selected_profile = llm_profile or settings.default_llm_profile
-    settings.resolve_llm_profile(selected_profile)
+    model = select_model(await effective_registry(db, settings), llm_profile, role=mode)
+    selected_profile = model.id
+    configuration = dict(configuration or {})
+    validate_effort(model, configuration.get("reasoning_effort"))
     prompt_file = settings.prompts_dir / f"{mode}.md"
     if not prompt_file.is_file():
         raise ValueError(f"Prompt is missing for mode {mode}")
@@ -35,7 +39,7 @@ async def create_session_record(
         llm_profile=selected_profile,
         title=title or prompt.strip().replace("\n", " ")[:120],
         status=SessionStatus.pending.value,
-        configuration=configuration or {},
+        configuration=configuration,
     )
     db.add(session)
     await db.flush()

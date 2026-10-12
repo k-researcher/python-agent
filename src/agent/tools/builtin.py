@@ -3,17 +3,40 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import signal
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import regex
 
-from agent.security import PathGuard
+from agent.sandbox import SandboxUnavailableError
+from agent.sandbox import prepare as prepare_sandbox
+from agent.security import PathGuard, PathSecurityError
+
+if TYPE_CHECKING:
+    from agent.safe_fs import SafeProjectFS
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 
 MAX_TEXT_BYTES = 1_000_000
 MAX_COMMAND_OUTPUT = 100_000
+
+
+def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
+    """Kill the command and everything it spawned (it runs in its own session)."""
+    if os.name == "posix":
+        with suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+    elif process.returncode is None:
+        with suppress(ProcessLookupError):
+            process.kill()
+
+
+def _safe_fs(root: Path) -> SafeProjectFS:
+    # Imported lazily: agent.safe_fs imports agent.tools.base, which initialises this package.
+    from agent.safe_fs import SafeProjectFS
+
+    return SafeProjectFS(root)
 
 
 def _read_text(path: Path) -> str:
@@ -23,6 +46,22 @@ def _read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
         raise ToolError("File is not valid UTF-8 text") from exc
+
+
+def _truncate_utf8(content: str, max_bytes: int) -> str:
+    """Cut decoded text so its UTF-8 length fits max_bytes at a character boundary."""
+    if not content:
+        return content
+    encoded = content.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return content
+    end = max_bytes
+    while end > 0:
+        try:
+            return encoded[:end].decode("utf-8")
+        except UnicodeDecodeError:
+            end -= 1
+    return ""
 
 
 class ListDirTool(Tool):
@@ -112,9 +151,7 @@ class SearchFilesTool(Tool):
         matches: list[dict[str, Any]] = []
         candidates = [root] if root.is_file() else root.rglob("*")
         for path in candidates:
-            excluded = any(
-                part in {".git", ".venv", "node_modules"} for part in path.parts
-            )
+            excluded = any(part in {".git", ".venv", "node_modules"} for part in path.parts)
             if not path.is_file() or excluded:
                 continue
             try:
@@ -137,6 +174,102 @@ class SearchFilesTool(Tool):
         return {"matches": matches, "truncated": False}
 
 
+class GlobTool(Tool):
+    name = "glob"
+    description = "Find project files matching a glob pattern."
+    risk_level = RiskLevel.read_only
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string"},
+            "path": {"type": "string", "default": "."},
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200},
+        },
+        "required": ["pattern"],
+        "additionalProperties": False,
+    }
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        root = PathGuard(context.project_root).resolve(str(arguments.get("path", ".")))
+        return await asyncio.to_thread(
+            self._glob,
+            context.project_root,
+            root,
+            str(arguments["pattern"]),
+            min(1000, int(arguments.get("max_results", 200))),
+        )
+
+    @staticmethod
+    def _glob(project_root: Path, root: Path, pattern_value: str, limit: int) -> dict[str, Any]:
+        guard = PathGuard(project_root)
+        excluded = frozenset({".git", ".venv", "node_modules", "__pycache__"})
+        matches: list[str] = []
+        for path in root.glob(pattern_value):
+            if not path.is_file():
+                continue
+            try:
+                relative = path.relative_to(project_root)
+                guard.resolve(str(path))
+            except (PathSecurityError, OSError, ValueError):
+                continue
+            if any(part in excluded for part in relative.parts):
+                continue
+            matches.append(str(relative))
+        matches.sort()
+        return {"paths": matches[:limit], "truncated": len(matches) > limit}
+
+
+class ReadManyTool(Tool):
+    name = "read_many"
+    description = "Read several UTF-8 text files inside the selected project."
+    risk_level = RiskLevel.read_only
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 20,
+            },
+            "max_bytes_per_file": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200000,
+                "default": 50000,
+            },
+        },
+        "required": ["paths"],
+        "additionalProperties": False,
+    }
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        max_bytes = min(200000, max(1, int(arguments.get("max_bytes_per_file", 50000))))
+        paths = [str(value) for value in arguments["paths"]]
+        return await asyncio.to_thread(self._read_all, context.project_root, paths, max_bytes)
+
+    @staticmethod
+    def _read_all(project_root: Path, paths: list[str], max_bytes: int) -> dict[str, Any]:
+        guard = PathGuard(project_root)
+        fs = _safe_fs(project_root)
+        files: list[dict[str, Any]] = []
+        for value in paths:
+            relative = value
+            try:
+                path = guard.resolve(value)
+                relative = str(path.relative_to(project_root))
+                # SafeProjectFS re-validates no-follow, regular-file, size and UTF-8.
+                content = fs.read_text(value, max_bytes=MAX_TEXT_BYTES)
+            except (ToolError, OSError, RuntimeError, ValueError) as exc:
+                files.append({"path": relative, "error": str(exc)})
+                continue
+            truncated = len(content.encode("utf-8")) > max_bytes
+            if truncated:
+                content = _truncate_utf8(content, max_bytes)
+            files.append({"path": relative, "content": content, "truncated": truncated})
+        return {"files": files}
+
+
 class WriteFileTool(Tool):
     name = "write_file"
     description = "Create or overwrite an UTF-8 text file inside the selected project."
@@ -153,18 +286,9 @@ class WriteFileTool(Tool):
     }
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
-        guard = PathGuard(context.project_root)
-        raw = str(arguments["path"])
-        raw_path = Path(raw)
-        candidate = raw_path if raw_path.is_absolute() else context.project_root / raw_path
-        path = guard.resolve(raw, must_exist=candidate.exists())
         content = str(arguments["content"])
-        path.parent.mkdir(parents=False, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        return {
-            "path": str(path.relative_to(context.project_root)),
-            "bytes_written": len(content.encode()),
-        }
+        relative = _safe_fs(context.project_root).write_text(str(arguments["path"]), content)
+        return {"path": str(relative), "bytes_written": len(content.encode("utf-8"))}
 
 
 class EditFileTool(Tool):
@@ -185,19 +309,64 @@ class EditFileTool(Tool):
     }
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
-        path = PathGuard(context.project_root).resolve(str(arguments["path"]))
-        content = _read_text(path)
-        old = str(arguments["old_text"])
-        if not old or old not in content:
-            raise ToolError("old_text was not found")
-        count = content.count(old)
-        if count > 1 and not bool(arguments.get("replace_all", False)):
-            raise ToolError(f"old_text occurs {count} times; set replace_all=true")
-        replace_count = -1 if arguments.get("replace_all") else 1
-        updated = content.replace(old, str(arguments["new_text"]), replace_count)
-        path.write_text(updated, encoding="utf-8")
-        replacements = count if arguments.get("replace_all") else 1
-        return {"path": str(path.relative_to(context.project_root)), "replacements": replacements}
+        relative, replacements = _safe_fs(context.project_root).edit_text(
+            str(arguments["path"]),
+            str(arguments["old_text"]),
+            str(arguments["new_text"]),
+            replace_all=bool(arguments.get("replace_all", False)),
+        )
+        return {"path": str(relative), "replacements": replacements}
+
+
+def _apply_multi_edit(
+    root: Path, path_value: str, edits: list[dict[str, Any]]
+) -> tuple[Path, int, int]:
+    fs = _safe_fs(root)
+    applied = [
+        (str(edit["old_text"]), str(edit["new_text"]), bool(edit.get("replace_all", False)))
+        for edit in edits
+    ]
+    relative, replacements = fs.edit_many(path_value, applied)
+    return relative, len(applied), replacements
+
+
+class MultiEditTool(Tool):
+    name = "multi_edit"
+    description = "Apply a chain of text edits to one file atomically."
+    risk_level = RiskLevel.local_write
+    allowed_modes = frozenset({"dev"})
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "edits": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old_text": {"type": "string"},
+                        "new_text": {"type": "string"},
+                        "replace_all": {"type": "boolean", "default": False},
+                    },
+                    "required": ["old_text", "new_text"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["path", "edits"],
+        "additionalProperties": False,
+    }
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        relative, edits_applied, replacements = await asyncio.to_thread(
+            _apply_multi_edit,
+            context.project_root,
+            str(arguments["path"]),
+            arguments["edits"],
+        )
+        return {"path": str(relative), "edits_applied": edits_applied, "replacements": replacements}
 
 
 class RemoveFileTool(Tool):
@@ -213,12 +382,8 @@ class RemoveFileTool(Tool):
     }
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
-        path = PathGuard(context.project_root).resolve(str(arguments["path"]))
-        if not path.is_file():
-            raise ToolError("Only individual files can be removed")
-        relative = str(path.relative_to(context.project_root))
-        path.unlink()
-        return {"removed": relative}
+        relative = _safe_fs(context.project_root).remove_file(str(arguments["path"]))
+        return {"removed": str(relative)}
 
 
 class ShellTool(Tool):
@@ -244,6 +409,9 @@ class ShellTool(Tool):
             name: os.environ[name]
             for name in (
                 "PATH",
+                "HOME",
+                "USER",
+                "LOGNAME",
                 "LANG",
                 "LC_ALL",
                 "TERM",
@@ -256,12 +424,26 @@ class ShellTool(Tool):
             )
             if name in os.environ
         }
+        if context.sandbox is not None:
+            try:
+                sandboxed = prepare_sandbox(
+                    context.sandbox, context.project_root, context.session_id
+                )
+            except SandboxUnavailableError as exc:
+                raise ToolError(str(exc)) from exc
+            if sandboxed is not None:
+                prefix, overrides = sandboxed
+                command = [*prefix, *command]
+                safe_environment.update(overrides)
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=context.project_root,
+            # No inherited input: the command must not read the terminal of the agent.
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=safe_environment,
+            start_new_session=os.name == "posix",
         )
 
         async def read_stream(stream: asyncio.StreamReader | None) -> tuple[bytes, bool]:
@@ -275,9 +457,7 @@ class ShellTool(Tool):
                     collected.extend(chunk[:remaining])
                 if len(chunk) > remaining:
                     truncated = True
-                    if process.returncode is None:
-                        with suppress(ProcessLookupError):
-                            process.kill()
+                    _kill_process_tree(process)
             return bytes(collected), truncated
 
         try:
@@ -290,11 +470,15 @@ class ShellTool(Tool):
                 timeout=int(arguments.get("timeout_seconds", 60)),
             )
         except TimeoutError:
-            if process.returncode is None:
-                with suppress(ProcessLookupError):
-                    process.kill()
+            _kill_process_tree(process)
             await process.wait()
             raise ToolError("Command timed out") from None
+        except asyncio.CancelledError:
+            # Stop/shutdown cancels the task; the command must not outlive the session.
+            _kill_process_tree(process)
+            with suppress(Exception):
+                await asyncio.shield(process.wait())
+            raise
         stdout, stdout_truncated = stdout_result
         stderr, stderr_truncated = stderr_result
         return {
@@ -309,8 +493,11 @@ BUILTIN_TOOLS: tuple[Tool, ...] = (
     ListDirTool(),
     ReadFileTool(),
     SearchFilesTool(),
+    GlobTool(),
+    ReadManyTool(),
     WriteFileTool(),
     EditFileTool(),
+    MultiEditTool(),
     RemoveFileTool(),
     ShellTool(),
 )

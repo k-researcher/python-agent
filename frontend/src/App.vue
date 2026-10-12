@@ -2,8 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   api,
-  setApiToken,
-  websocketToken,
+  ApiError,
   type Approval,
   type ContextStats,
   type Message,
@@ -12,6 +11,7 @@ import {
   type PublicConfig,
   type Session,
 } from "./api";
+import { loginFromFragment, logout, refreshAuth } from "./auth";
 
 const projects = ref<Project[]>([]);
 const sessions = ref<Session[]>([]);
@@ -24,7 +24,8 @@ const config = ref<PublicConfig | null>(null);
 const selectedId = ref<string | null>(null);
 const connected = ref(false);
 const error = ref("");
-const token = ref("");
+const authenticated = ref<boolean | null>(null);
+const streaming = ref("");
 
 const projectName = ref("");
 const projectPath = ref("");
@@ -57,8 +58,22 @@ async function refresh(): Promise<void> {
     }
     if (selectedId.value) await refreshCurrent();
   } catch (cause) {
+    if (cause instanceof ApiError && cause.status === 401) {
+      signedOut();
+      return;
+    }
     error.value = cause instanceof Error ? cause.message : String(cause);
   }
+}
+
+function signedOut(): void {
+  authenticated.value = false;
+  socket?.close();
+}
+
+async function signOut(): Promise<void> {
+  await logout().catch(() => undefined);
+  signedOut();
 }
 
 async function refreshCurrent(): Promise<void> {
@@ -70,13 +85,6 @@ async function refreshCurrent(): Promise<void> {
     api.audit(selectedId.value),
     api.context(selectedId.value),
   ]);
-}
-
-async function applyToken(): Promise<void> {
-  setApiToken(token.value);
-  socket?.close();
-  await refresh();
-  connect();
 }
 
 async function selectSession(id: string): Promise<void> {
@@ -137,22 +145,40 @@ async function decide(item: Approval, decision: "approve" | "reject"): Promise<v
 function connect(): void {
   if (reconnectTimer) window.clearTimeout(reconnectTimer);
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const auth = websocketToken();
+  // The session cookie authenticates the handshake; no token is sent from JavaScript.
   socket = new WebSocket(`${protocol}//${location.host}/ws`);
-  socket.onopen = () => {
-    if (auth) socket?.send(JSON.stringify({ type: "auth", token: auth }));
-  };
   socket.onmessage = (event) => {
-    const message = JSON.parse(String(event.data)) as { type?: string };
+    const message = JSON.parse(String(event.data)) as {
+      type?: string;
+      ephemeral?: boolean;
+      session_id?: string;
+      payload?: { delta?: string };
+    };
+    // Streamed text: show it in place, do not reload the state for each fragment.
+    if (message.ephemeral) {
+      if (message.session_id !== selectedId.value) return;
+      if (message.type === "message.delta") streaming.value += message.payload?.delta ?? "";
+      if (message.type === "stream.reset") streaming.value = "";
+      return;
+    }
+    if (message.type === "message.created") streaming.value = "";
     if (message.type === "connected") {
       connected.value = true;
       reconnectAttempts = 0;
     }
     void refresh();
   };
-  socket.onclose = () => {
+  socket.onclose = async (event) => {
     connected.value = false;
-    if (disposed) return;
+    if (disposed || authenticated.value === false) return;
+    // A rejected handshake looks like a plain close; ask the server if the login is still valid.
+    if (event.code === 4401 || event.code === 1006 || event.code === 1008) {
+      const state = await refreshAuth().catch(() => ({ authenticated: false }));
+      if (!state.authenticated) {
+        signedOut();
+        return;
+      }
+    }
     const delay = Math.min(15_000, 1000 * 2 ** reconnectAttempts);
     reconnectAttempts += 1;
     reconnectTimer = window.setTimeout(connect, delay);
@@ -161,6 +187,14 @@ function connect(): void {
 
 onMounted(async () => {
   disposed = false;
+  try {
+    const state = (await loginFromFragment()) ?? (await refreshAuth());
+    authenticated.value = state.authenticated;
+  } catch (cause) {
+    authenticated.value = false;
+    error.value = cause instanceof Error ? cause.message : String(cause);
+  }
+  if (!authenticated.value) return;
   await refresh();
   connect();
 });
@@ -173,17 +207,19 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="layout">
+  <div v-if="authenticated === false" class="login-required">
+    <h1>Нужна ссылка для входа</h1>
+    <p>Откройте одноразовую ссылку из консоли агента или выпустите новую командой:</p>
+    <pre>uv run agent auth link</pre>
+    <p v-if="error" class="error">{{ error }}</p>
+  </div>
+  <div v-else-if="authenticated" class="layout">
     <aside>
       <div class="brand">
         <span>Python Agent</span>
         <i :class="connected ? 'online' : 'offline'" :title="connected ? 'WebSocket подключён' : 'WebSocket отключён'" />
+        <button class="link" type="button" @click="signOut">Выйти</button>
       </div>
-
-      <form @submit.prevent="applyToken">
-        <input v-model="token" type="password" autocomplete="off" placeholder="API token (если включён)" />
-        <button>Применить token</button>
-      </form>
 
       <small v-if="config">
         LLM: {{ config.llm_destination }} · сеть:
@@ -251,7 +287,7 @@ onUnmounted(() => {
             <h1>{{ current.title }}</h1>
             <span>{{ current.mode }} · {{ current.llm_profile }} · {{ current.status }}</span>
           </div>
-          <button v-if="['running', 'pending'].includes(current.status)" class="danger" @click="api.stop(current.id)">Остановить</button>
+          <button v-if="['running', 'pending', 'awaiting_confirmation'].includes(current.status)" class="danger" @click="api.stop(current.id)">Остановить</button>
         </header>
 
         <section v-if="contextStats" class="approvals">
@@ -289,6 +325,10 @@ onUnmounted(() => {
           <article v-for="message in messages.filter((item) => item.role !== 'system')" :key="message.id" :class="message.role">
             <b>{{ message.role }}</b>
             <pre>{{ message.content }}</pre>
+          </article>
+          <article v-if="streaming" class="assistant streaming">
+            <b>assistant</b>
+            <pre>{{ streaming }}</pre>
           </article>
         </section>
 

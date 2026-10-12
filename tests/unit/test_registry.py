@@ -29,7 +29,15 @@ def test_ask_definitions_are_read_only() -> None:
     registry = ToolRegistry()
     names = {item["function"]["name"] for item in registry.definitions("ask")}
 
-    assert {"list_dir", "read_file", "search_files", "excel_read", "excel_sheets"} == names
+    assert {
+        "list_dir",
+        "read_file",
+        "search_files",
+        "glob",
+        "read_many",
+        "excel_read",
+        "excel_sheets",
+    } == names
     assert all(registry.risk(name, "ask") is RiskLevel.read_only for name in names)
 
 

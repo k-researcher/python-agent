@@ -39,9 +39,7 @@ def test_allows_new_file_with_existing_parent(tmp_path: Path) -> None:
     assert resolved == tmp_path / "new.txt"
 
 
-@pytest.mark.parametrize(
-    "name", [".env", ".env.production", ".npmrc", "id_ed25519", "server.key"]
-)
+@pytest.mark.parametrize("name", [".env", ".env.production", ".npmrc", "id_ed25519", "server.key"])
 def test_blocks_secret_bearing_files(tmp_path: Path, name: str) -> None:
     secret = tmp_path / name
     secret.write_text("secret", encoding="utf-8")
@@ -55,3 +53,14 @@ def test_allows_environment_template(tmp_path: Path) -> None:
     template.write_text("KEY=", encoding="utf-8")
 
     assert PathGuard(tmp_path).resolve(".env.example") == template
+
+
+def test_rejects_dangling_symlink_pointing_outside(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside.txt"
+    (project / "out.txt").symlink_to(outside)
+
+    with pytest.raises(PathSecurityError):
+        PathGuard(project).resolve("out.txt", must_exist=False)
+    assert not outside.exists()

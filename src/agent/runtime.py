@@ -3,19 +3,27 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import uuid
 from contextlib import suppress
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
+from pydantic import ValidationError
+from sqlalchemy import or_, select, update
+from sqlalchemy.engine import CursorResult
+from sqlalchemy.orm import attributes, selectinload
 
+from agent.checkpoints import load_context_rows
 from agent.config import Settings
-from agent.context import ContextManager
+from agent.context_inference import ContextInference
+from agent.context_manager import ContextManager
 from agent.database import session_factory
 from agent.events import emit_event
 from agent.llm import LLMClient
+from agent.model_config import ModelConfigError, ResolvedModel, ResolvedModelRegistry
+from agent.model_registry import effective_registry, select_model
 from agent.models import (
     Approval,
     ApprovalStatus,
@@ -29,9 +37,13 @@ from agent.models import (
     utcnow,
 )
 from agent.queue import RedisTaskQueue
+from agent.reasoning import ReasoningDecision, decide
+from agent.sandbox import policy_from_settings
 from agent.session_service import create_session_record
 from agent.tools import ToolRegistry
-from agent.tools.base import ToolContext
+from agent.tools.base import ToolContext, ToolError
+
+logger = logging.getLogger(__name__)
 
 TERMINAL_STATUSES = {
     SessionStatus.completed.value,
@@ -44,13 +56,12 @@ class AgentSupervisor:
     def __init__(self, settings: Settings, registry: ToolRegistry | None = None) -> None:
         self.settings = settings
         self.registry = registry or ToolRegistry(settings=settings)
-        self.llm = LLMClient(settings, settings.default_llm_profile)
+        # Optional override for the default model's client (used by tests and fakes).
+        self.llm: LLMClient | None = None
         self._llm_clients: dict[str, LLMClient] = {}
-        self.context = ContextManager(
-            settings.context_window,
-            settings.context_reserved_tokens,
-            settings.max_tool_result_chars,
-        )
+        # Replaced clients can still serve a running request; close them at shutdown only.
+        self._retired_clients: list[LLMClient] = []
+        self._last_models: ResolvedModelRegistry | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._semaphore = asyncio.Semaphore(settings.max_parallel_sessions)
         self.task_queue = RedisTaskQueue(settings) if settings.execution_mode == "redis" else None
@@ -98,11 +109,53 @@ class AgentSupervisor:
             if session is not None:
                 session.status = SessionStatus.stopped.value
                 session.stop_requested = True
+                cancelled = await self._cancel_unfinished_tool_calls(db, session_id)
                 await db.commit()
                 await emit_event(db, "session.status", {"status": session.status}, session_id)
+                if cancelled:
+                    await emit_event(
+                        db, "approval.cancelled", {"tool_call_ids": cancelled}, session_id
+                    )
 
         for child_id in children:
             await self.stop(child_id)
+
+    @staticmethod
+    async def _cancel_unfinished_tool_calls(db: Any, session_id: str) -> list[str]:
+        """Withdraw queued and awaiting calls so nothing approved before Stop runs later."""
+        calls = (
+            await db.execute(
+                select(ToolCall)
+                .where(
+                    ToolCall.session_id == session_id,
+                    ToolCall.status.in_(
+                        {
+                            ToolCallStatus.pending.value,
+                            ToolCallStatus.awaiting_confirmation.value,
+                        }
+                    ),
+                )
+                .options(selectinload(ToolCall.approval))
+            )
+        ).scalars()
+        cancelled: list[str] = []
+        for call in calls:
+            if call.approval is not None and call.approval.status == ApprovalStatus.pending.value:
+                call.approval.status = ApprovalStatus.cancelled.value
+                call.approval.resolved_at = utcnow()
+                call.approval.comment = "Session was stopped"
+            call.status = ToolCallStatus.cancelled.value
+            call.result = {"success": False, "error": "Cancelled because the session was stopped"}
+            db.add(
+                Message(
+                    session_id=session_id,
+                    role="tool",
+                    tool_call_id=call.id,
+                    content=json.dumps(call.result, ensure_ascii=False),
+                )
+            )
+            cancelled.append(call.id)
+        return cancelled
 
     async def shutdown(self) -> None:
         tasks = [task for task in self._tasks.values() if not task.done()]
@@ -110,12 +163,13 @@ class AgentSupervisor:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        for client in [*self._llm_clients.values(), *self._retired_clients]:
+            if isinstance(client, LLMClient):
+                await client.aclose()
         if self.task_queue is not None:
             await self.task_queue.close()
 
-    async def resolve_approval(
-        self, approval_id: str, decision: str, comment: str | None
-    ) -> str:
+    async def resolve_approval(self, approval_id: str, decision: str, comment: str | None) -> str:
         async with session_factory() as db:
             query = (
                 select(Approval)
@@ -135,48 +189,101 @@ class AgentSupervisor:
 
             call = approval.tool_call
             session = call.session
-            approval.comment = comment
-            approval.resolved_at = utcnow()
+            if session.stop_requested or session.status == SessionStatus.stopped.value:
+                raise ValueError("Session is stopped; start it again before approving tools")
 
-            if decision == "approve":
-                approval.status = ApprovalStatus.approved.value
-                call.status = ToolCallStatus.pending.value
-            else:
-                approval.status = ApprovalStatus.rejected.value
-                call.status = ToolCallStatus.rejected.value
-                call.result = {"success": False, "error": comment or "Rejected by user"}
+            # Conditional writes: a concurrent Stop cancels the approval first and must win.
+            approved = decision == "approve"
+            claimed = cast(
+                CursorResult[Any],
+                await db.execute(
+                    update(Approval)
+                    .where(
+                        Approval.id == approval.id,
+                        Approval.status == ApprovalStatus.pending.value,
+                    )
+                    .values(
+                        status=(
+                            ApprovalStatus.approved.value
+                            if approved
+                            else ApprovalStatus.rejected.value
+                        ),
+                        comment=comment,
+                        resolved_at=utcnow(),
+                    )
+                    .execution_options(synchronize_session=False)
+                ),
+            )
+            if claimed.rowcount != 1:
+                await db.rollback()
+                raise ValueError("Approval is already resolved")
+            result = (
+                None if approved else {"success": False, "error": comment or "Rejected by user"}
+            )
+            await db.execute(
+                update(ToolCall)
+                .where(
+                    ToolCall.id == call.id,
+                    ToolCall.status == ToolCallStatus.awaiting_confirmation.value,
+                )
+                .values(
+                    status=(
+                        ToolCallStatus.pending.value if approved else ToolCallStatus.rejected.value
+                    ),
+                    result=result,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if result is not None:
                 db.add(
                     Message(
                         session_id=session.id,
                         role="tool",
                         tool_call_id=call.id,
-                        content=json.dumps(call.result, ensure_ascii=False),
+                        content=json.dumps(result, ensure_ascii=False),
                     )
                 )
             await db.commit()
 
             pending = (
                 await db.execute(
-                    select(Approval)
+                    select(Approval.id)
                     .join(ToolCall)
                     .where(
                         ToolCall.session_id == session.id,
                         Approval.status == ApprovalStatus.pending.value,
                     )
+                    .limit(1)
                 )
-            ).scalars().first()
-            if pending is None:
-                session.status = SessionStatus.pending.value
-                await db.commit()
-                await emit_event(db, "session.status", {"status": session.status}, session.id)
-                await self.start(session.id)
-            else:
+            ).scalar_one_or_none()
+            if pending is not None:
                 await emit_event(
                     db,
                     "approval.resolved",
                     {"approval_id": approval.id, "decision": decision},
                     session.id,
                 )
+                return session.id
+
+            resumed = cast(
+                CursorResult[Any],
+                await db.execute(
+                    update(Session)
+                    .where(
+                        Session.id == session.id,
+                        Session.stop_requested.is_(False),
+                        Session.status.not_in(TERMINAL_STATUSES),
+                    )
+                    .values(status=SessionStatus.pending.value)
+                    .execution_options(synchronize_session=False)
+                ),
+            )
+            await db.commit()
+            if resumed.rowcount == 1:
+                await emit_event(
+                    db, "session.status", {"status": SessionStatus.pending.value}, session.id
+                )
+                await self.start(session.id)
             return session.id
 
     async def _run_guarded(self, session_id: str) -> None:
@@ -202,7 +309,20 @@ class AgentSupervisor:
                     session_id,
                 )
 
+    async def _models(self, db: Any) -> ResolvedModelRegistry:
+        """Read the catalogue; keep the last valid one if the new one is invalid."""
+        try:
+            self._last_models = await effective_registry(db, self.settings)
+        except (ModelConfigError, ValidationError, ValueError):
+            if self._last_models is None:
+                raise
+            logger.exception("Model configuration is invalid; the last valid one stays in use")
+        return self._last_models
+
     async def _run(self, session_id: str) -> None:
+        # One catalogue snapshot for the whole execution: a YAML or UI change applies to the
+        # next execution, not between two steps of a running one.
+        models: ResolvedModelRegistry | None = None
         for _step in range(self.settings.max_inference_steps):
             async with session_factory() as db:
                 query = (
@@ -210,18 +330,35 @@ class AgentSupervisor:
                     .where(Session.id == session_id)
                     .options(
                         selectinload(Session.project),
-                        selectinload(Session.messages),
-                        selectinload(Session.tool_calls).selectinload(ToolCall.approval),
                     )
                 )
                 session = (await db.execute(query)).scalar_one_or_none()
                 if session is None or session.status in TERMINAL_STATUSES:
                     return
+                rows = await load_context_rows(db, session_id)
+                attributes.set_committed_value(session, "messages", rows)
+                unfinished = list(
+                    await db.scalars(
+                        select(ToolCall)
+                        .where(
+                            ToolCall.session_id == session_id,
+                            ToolCall.status.in_({"pending", "running", "awaiting_confirmation"}),
+                        )
+                        .options(selectinload(ToolCall.approval))
+                        .order_by(ToolCall.created_at, ToolCall.id)
+                    )
+                )
+                attributes.set_committed_value(session, "tool_calls", unfinished)
+                visible = [
+                    message
+                    for message in session.messages
+                    if message.kind == "normal" and not message.skipped
+                ]
                 if (
                     session.status == SessionStatus.running.value
-                    and session.messages
-                    and session.messages[-1].role == "assistant"
-                    and not session.messages[-1].tool_calls
+                    and visible
+                    and visible[-1].role == "assistant"
+                    and not visible[-1].tool_calls
                 ):
                     session.status = SessionStatus.completed.value
                     await db.commit()
@@ -237,77 +374,64 @@ class AgentSupervisor:
                         return
 
                 resume_state = await self._resume_tool_calls(db, session)
-                if resume_state == "waiting":
+                if resume_state in {"waiting", "stopped"}:
                     return
                 if resume_state == "processed":
                     continue
 
-                session.status = SessionStatus.running.value
-                session.error = None
-                session.stop_requested = False
+                # Conditional write: a Stop that landed after the SELECT above must win.
+                claimed = cast(
+                    CursorResult[Any],
+                    await db.execute(
+                        update(Session)
+                        .where(Session.id == session.id, Session.status.not_in(TERMINAL_STATUSES))
+                        .values(
+                            status=SessionStatus.running.value, error=None, stop_requested=False
+                        )
+                    ),
+                )
                 await db.commit()
+                if claimed.rowcount == 0:
+                    return
                 await emit_event(db, "session.status", {"status": session.status}, session.id)
 
-                prepared = self.context.prepare(session.messages)
-                if prepared.omitted_messages or prepared.truncated_tool_results:
-                    await emit_event(
-                        db,
-                        "context.compacted",
-                        {
-                            "approximate_tokens": prepared.approximate_tokens,
-                            "omitted_messages": prepared.omitted_messages,
-                            "truncated_tool_results": prepared.truncated_tool_results,
-                        },
-                        session.id,
-                    )
-                definitions = self.registry.definitions(session.mode)
-                audit_payload = json.dumps(
-                    {"messages": prepared.messages, "tools": definitions},
-                    ensure_ascii=False,
-                    default=str,
-                )
-                llm_client = self._llm_for(session.llm_profile)
-                destination = llm_client.endpoint
-                await self._audit_egress(
+                if models is None:
+                    models = await self._models(db)
+                model = select_model(models, session.llm_profile, strict=False)
+                definitions = self.registry.definitions(session.mode, model_ids=models.ids())
+                decisions = {
+                    candidate.id: self._reasoning_for(session, candidate)
+                    for candidate in models.models.values()
+                }
+                await db.commit()
+
+                def reasoning_for(
+                    candidate: ResolvedModel,
+                    snapshot: dict[str, ReasoningDecision] = decisions,
+                ) -> ReasoningDecision:
+                    return snapshot[candidate.id]
+
+                inference = ContextInference(
                     session.id,
-                    "llm",
-                    destination,
-                    f"chat:{session.llm_profile}",
-                    audit_payload,
-                    "started",
+                    self.settings.context_reserved_tokens,
+                    definitions,
+                    models,
+                    partial(self._llm_for, models),
+                    reasoning_for,
                 )
-                try:
-                    response = await llm_client.chat(prepared.messages, definitions)
-                except Exception as exc:
-                    await self._audit_egress(
-                        session.id,
-                        "llm",
-                        destination,
-                        f"chat:{session.llm_profile}",
-                        audit_payload,
-                        "error",
-                        str(exc),
-                    )
-                    raise
-                await self._audit_egress(
-                    session.id,
-                    "llm",
-                    destination,
-                    f"chat:{session.llm_profile}",
-                    audit_payload,
-                    "completed",
-                )
+                outcome = await inference.run(model)
+                response = outcome.response
+                reasoning_effort = outcome.reasoning.effective
                 await db.refresh(session, attribute_names=["status", "stop_requested"])
                 if session.stop_requested or session.status == SessionStatus.stopped.value:
                     return
 
-                normalized_calls: list[dict[str, Any]] = []
-                for call_index, raw_call in enumerate(response.tool_calls):
-                    normalized = dict(raw_call)
-                    external_id = str(raw_call.get("id") or f"generated-{call_index}")
-                    suffix = hashlib.sha256(external_id.encode()).hexdigest()[:16]
-                    normalized["id"] = f"{session.id}:{_step}:{call_index}:{suffix}"
-                    normalized_calls.append(normalized)
+                # Our own globally unique IDs: providers may omit or reuse theirs, and the
+                # step counter restarts whenever the loop resumes after an approval.
+                normalized_calls = [
+                    {**dict(raw_call), "id": f"call_{uuid.uuid4().hex}"}
+                    for raw_call in response.tool_calls
+                ]
 
                 assistant = Message(
                     session_id=session.id,
@@ -315,6 +439,8 @@ class AgentSupervisor:
                     content=response.content,
                     tool_calls=normalized_calls or None,
                     token_count=response.completion_tokens or None,
+                    reasoning_content=response.reasoning,
+                    reasoning_effort=reasoning_effort,
                 )
                 db.add(assistant)
                 await db.flush()
@@ -333,6 +459,7 @@ class AgentSupervisor:
                     return
 
                 requires_approval = False
+                truncated = response.finish_reason == "length"
                 for raw_call in normalized_calls:
                     function = raw_call.get("function", {})
                     name = str(function.get("name", ""))
@@ -343,8 +470,16 @@ class AgentSupervisor:
                     except (TypeError, ValueError, json.JSONDecodeError):
                         arguments = {"_invalid_arguments": function.get("arguments")}
 
-                    call_id = str(raw_call.get("id") or f"call-{assistant.id}-{name}")
+                    call_id = str(raw_call["id"])
                     try:
+                        if "_invalid_arguments" in arguments:
+                            raise ToolError(
+                                "Tool arguments are not valid JSON"
+                                + (" (the reply was cut off)" if truncated else "")
+                            )
+                        self.registry.validate(
+                            name, session.mode, arguments, model_ids=models.ids()
+                        )
                         risk = self.registry.risk(name, session.mode)
                         confirmation = self.registry.requires_confirmation(name, session.mode)
                     except Exception as exc:
@@ -420,6 +555,9 @@ class AgentSupervisor:
             }
         ]
         for call in unfinished:
+            await db.refresh(session, attribute_names=["status", "stop_requested"])
+            if session.stop_requested or session.status == SessionStatus.stopped.value:
+                return "stopped"
             if call.status == ToolCallStatus.running.value:
                 call.status = ToolCallStatus.error.value
                 call.result = {
@@ -446,7 +584,8 @@ class AgentSupervisor:
                 waiting = True
                 continue
             if approval is None or approval.status == ApprovalStatus.approved.value:
-                await self._execute_tool_call(db, session, call)
+                if not await self._execute_tool_call(db, session, call):
+                    return "stopped"
                 processed = True
 
         if waiting:
@@ -455,9 +594,39 @@ class AgentSupervisor:
             return "waiting"
         return "processed" if processed else "ready"
 
-    async def _execute_tool_call(self, db: Any, session: Session, call: ToolCall) -> None:
-        call.status = ToolCallStatus.running.value
+    async def _claim_tool_call(self, db: Any, call: ToolCall) -> bool:
+        """Mark a queued call as running unless Stop cancelled it or its session."""
+        stopped = (
+            select(Session.id)
+            .where(
+                Session.id == call.session_id,
+                or_(
+                    Session.stop_requested.is_(True),
+                    Session.status == SessionStatus.stopped.value,
+                ),
+            )
+            .exists()
+        )
+        claimed = cast(
+            CursorResult[Any],
+            await db.execute(
+                update(ToolCall)
+                .where(
+                    ToolCall.id == call.id,
+                    ToolCall.status == ToolCallStatus.pending.value,
+                    ~stopped,
+                )
+                .values(status=ToolCallStatus.running.value)
+                .execution_options(synchronize_session=False)
+            ),
+        )
         await db.commit()
+        await db.refresh(call, attribute_names=["status"])
+        return claimed.rowcount == 1
+
+    async def _execute_tool_call(self, db: Any, session: Session, call: ToolCall) -> bool:
+        if not await self._claim_tool_call(db, call):
+            return False
         depth = int((session.configuration or {}).get("depth", 0))
         context = ToolContext(
             session_id=session.id,
@@ -465,6 +634,7 @@ class AgentSupervisor:
             depth=depth,
             audit_egress=partial(self._audit_egress, session.id),
             spawn_child=partial(self._spawn_child, session),
+            sandbox=policy_from_settings(self.settings),
         )
         try:
             output = await self.registry.execute(
@@ -491,14 +661,50 @@ class AgentSupervisor:
             {"tool_call_id": call.id, "name": call.name, "status": call.status},
             session.id,
         )
+        return True
 
-    def _llm_for(self, profile_name: str) -> LLMClient:
-        if profile_name == self.settings.default_llm_profile:
+    @staticmethod
+    def _reasoning_for(session: Session, model: ResolvedModel) -> ReasoningDecision:
+        """Message override, then the session level, then "auto" or the model default."""
+        messages = [
+            message
+            for message in session.messages
+            if message.kind == "normal" and not message.skipped
+        ]
+        users = [message for message in messages if message.role == "user"]
+        recent_errors = 0
+        for message in reversed(messages):
+            if message.role != "tool":
+                if message.role == "assistant" and message.tool_calls:
+                    continue
+                break
+            if '"success": false' in (message.content or ""):
+                recent_errors += 1
+            else:
+                break
+        return decide(
+            model,
+            message_effort=users[-1].reasoning_effort if users else None,
+            session_effort=(session.configuration or {}).get("reasoning_effort"),
+            mode=session.mode,
+            task_chars=len(users[0].content or "") if users else 0,
+            recent_errors=recent_errors,
+        )
+
+    def context_for(self, model: ResolvedModel | None = None) -> ContextManager:
+        return ContextManager(self.settings.context_reserved_tokens)
+
+    def _llm_for(self, models: ResolvedModelRegistry, model: ResolvedModel) -> LLMClient:
+        if model.id == models.default_id and self.llm is not None:
             return self.llm
-        client = self._llm_clients.get(profile_name)
+        client = self._llm_clients.get(model.id)
+        if isinstance(client, LLMClient) and client.model != model:
+            # The catalogue changed (YAML edit or UI override): use a new client.
+            self._retired_clients.append(client)
+            client = None
         if client is None:
-            client = LLMClient(self.settings, profile_name)
-            self._llm_clients[profile_name] = client
+            client = LLMClient(model)
+            self._llm_clients[model.id] = client
         return client
 
     async def _audit_egress(
@@ -540,10 +746,10 @@ class AgentSupervisor:
             raise RuntimeError(f"Maximum child depth is {self.settings.max_child_depth}")
         if mode not in {"dev", "ask"}:
             raise ValueError(f"Unsupported child mode: {mode}")
-        selected_profile = llm_profile or parent.llm_profile
-        self.settings.resolve_llm_profile(selected_profile)
-
         async with session_factory() as db:
+            selected_profile = select_model(
+                await effective_registry(db, self.settings), llm_profile or parent.llm_profile
+            ).id
             project = await db.get(Project, parent.project_id)
             if project is None:
                 raise LookupError("Parent project not found")

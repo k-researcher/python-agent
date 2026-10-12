@@ -30,6 +30,7 @@ async def test_accepts_allowlisted_public_address(monkeypatch: pytest.MonkeyPatc
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
 
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    assert await validate_outbound_url(
-        "https://api.example.com/data", ["*.example.com"]
-    ) == "api.example.com"
+    assert (
+        await validate_outbound_url("https://api.example.com/data", ["*.example.com"])
+        == "api.example.com"
+    )

@@ -74,28 +74,38 @@ export interface Approval {
   comment: string | null;
 }
 
-let apiToken = "";
-
-export function setApiToken(value: string): void {
-  apiToken = value.trim();
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+  }
 }
 
-export function websocketToken(): string {
-  return apiToken;
+// The CSRF token lives only in memory; the session itself is an HttpOnly cookie.
+let csrfToken = "";
+
+export function setCsrfToken(value: string): void {
+  csrfToken = value;
 }
 
-async function request<T>(url: string, options?: RequestInit): Promise<T> {
+const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+export async function request<T>(url: string, options?: RequestInit): Promise<T> {
+  const method = (options?.method ?? "GET").toUpperCase();
   const response = await fetch(url, {
     ...options,
+    credentials: "same-origin",
     headers: {
       "Content-Type": "application/json",
-      ...(apiToken ? { "X-Agent-Token": apiToken } : {}),
+      ...(MUTATING.has(method) && csrfToken ? { "X-Agent-CSRF": csrfToken } : {}),
       ...(options?.headers ?? {}),
     },
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(body.detail ?? `HTTP ${response.status}`);
+    throw new ApiError(body.detail ?? `HTTP ${response.status}`, response.status);
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;

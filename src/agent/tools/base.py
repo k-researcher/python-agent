@@ -5,7 +5,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from agent.sandbox import SandboxPolicy
 
 
 class RiskLevel(enum.StrEnum):
@@ -29,6 +32,7 @@ class ToolContext:
     depth: int = 0
     audit_egress: AuditCallback | None = None
     spawn_child: SpawnChildCallback | None = None
+    sandbox: SandboxPolicy | None = None
 
 
 class Tool(ABC):
@@ -39,6 +43,10 @@ class Tool(ABC):
     allowed_modes: frozenset[str] = frozenset({"dev", "ask"})
     network_capability: bool = False
     knowledge_capability: bool = False
+
+    def parameters(self, model_ids: list[str] | None = None) -> dict[str, Any]:
+        """JSON Schema sent to the model; override when it depends on live configuration."""
+        return self.input_schema
 
     @abstractmethod
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:

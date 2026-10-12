@@ -22,6 +22,8 @@ dependencies = [
     "regex>=2024.11",
     "sqlalchemy>=2.0",
     "uvicorn[standard]>=0.32",
+    "pyyaml>=6.0",
+    "jsonschema>=4.23",
 ]
 
 [project.optional-dependencies]
@@ -31,12 +33,14 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "ruff>=0.8",
+    "types-jsonschema>=4.23",
     "types-openpyxl>=3.1",
+    "types-pyyaml>=6.0",
     "types-regex>=2024.11",
 ]
 
 [project.scripts]
-agent = "agent.main:run"
+agent = "agent.cli:main"
 agent-worker = "agent.worker:run"
 
 [tool.hatch.build.targets.wheel]
@@ -55,6 +59,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/agent/api.py" = ["B008"]
+"src/agent/auth_api.py" = ["B008"]
 
 [tool.mypy]
 python_version = "3.12"
