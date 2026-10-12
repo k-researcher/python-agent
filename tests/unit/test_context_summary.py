@@ -86,6 +86,27 @@ def test_build_request_two_messages_and_sections() -> None:
     assert "facts" in instruction.lower()
 
 
+def test_build_request_default_preserves_whole_large_records() -> None:
+    arguments = '{"content":"' + "whole block " * 9000 + '"}'
+    request = build_summary_request(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "large",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": arguments},
+                    }
+                ],
+            }
+        ],
+        None,
+    )
+    assert arguments in request[1]["content"]
+    assert "chars omitted" not in request[1]["content"]
+
+
 def test_build_request_serializes_tool_calls_and_excludes_reasoning() -> None:
     items = [
         {

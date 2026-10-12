@@ -216,7 +216,12 @@ def test_child_agent_and_outbound_audit(tmp_path: Path) -> None:
             assert child_messages[-1]["content"] == "Child result"
 
             audit = client.get(f"/api/sessions/{parent['id']}/outbound-audit").json()
-            assert {item["status"] for item in audit} >= {"started", "completed"}
+            llm_audit = [item for item in audit if item["category"] == "llm"]
+            assert len(llm_audit) == 2
+            assert len({item["id"] for item in llm_audit}) == 2
+            assert all(item["status"] == "completed" for item in llm_audit)
+            assert all(item["payload_bytes"] > 0 for item in llm_audit)
+            assert all(len(item["payload_sha256"]) == 64 for item in llm_audit)
             assert all("payload" not in item for item in audit)
     finally:
         supervisor.llm = original_llm

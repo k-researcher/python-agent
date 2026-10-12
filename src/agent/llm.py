@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -15,13 +15,49 @@ from agent.llm_errors import (
     classify_http_error,
 )
 from agent.model_config import SUPPORTED_TRANSPORTS, ResolvedModel
-from agent.reasoning import ReasoningDecision, wire_parameters
 from agent.redaction import redact
+from agent.wire import WireRequest, body_sha256, build_wire_request
 
 __all__ = ["LLMClient", "LLMError", "LLMResponse", "LLMTransientError", "redact"]
 
 # Receives ("content" | "reasoning", text) for each streamed fragment.
 DeltaCallback = Callable[[str, str], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptRecord:
+    """Audit one HTTP attempt inside a single send() call."""
+
+    attempt: int
+    status: Literal["started", "completed", "error"]
+    payload_bytes: int
+    payload_sha256: str
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    error_kind: str | None = None
+
+
+@dataclass(slots=True)
+class _AuditState:
+    """Per-send() holder for the first audit failure on an error attempt record."""
+
+    error: BaseException | None = None
+
+
+class _CallbackError(Exception):
+    """Marker: an exception raised by the ``on_delta`` callback.
+
+    The attempt is already audited as ``error``/``unknown``; the wrapper only keeps the
+    original object so the outer transport handlers never re-classify it as a provider
+    failure, and the request is never retried.
+    """
+
+    def __init__(self, original: BaseException) -> None:
+        super().__init__()
+        self.original = original
+
+
+AttemptCallback = Callable[[AttemptRecord], Awaitable[None]]
 
 
 class LLMError(RuntimeError):
@@ -95,26 +131,35 @@ class LLMClient:
             await self._http.aclose()
             self._http = None
 
-    def _payload(
+    async def send(
         self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        reasoning_effort: str | None,
-        max_tokens: int | None = None,
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "model": self.model.model,
-            "messages": messages,
-            "max_tokens": max_tokens or self.model.max_tokens,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-        effort = reasoning_effort or self.model.reasoning.default_effort
-        if effort in self.model.reasoning.allowed_efforts:
-            decision = ReasoningDecision(effort, effort, "message", "caller")
-            payload.update(wire_parameters(self.model, decision, payload["max_tokens"]))
-        return payload
+        request: WireRequest,
+        *,
+        on_delta: DeltaCallback | None = None,
+        on_attempt: AttemptCallback | None = None,
+    ) -> LLMResponse:
+        """Send one wire request and report each HTTP attempt to ``on_attempt``.
+
+        The exact ``request.body`` bytes are transmitted. Retry 429, 5xx and transport
+        errors, but never after the first streamed fragment has been delivered.
+        """
+        streaming = bool(request.payload.get("stream"))
+        if streaming and on_delta is None:
+            raise ValueError("on_delta is required when the request streams")
+        if self.model.kind not in SUPPORTED_TRANSPORTS:
+            raise LLMError(f"Provider type {self.model.kind} is not supported yet")
+        if not self.model.configured:
+            raise LLMError(f"Model {self.model.id} is not configured: API key is missing")
+
+        headers = {"Content-Type": "application/json"}
+        if self.model.api_key:
+            headers["Authorization"] = f"Bearer {self.model.api_key}"
+        sha256 = body_sha256(request)
+        state = _AuditState()
+        if streaming:
+            assert on_delta is not None
+            return await self._stream(state, headers, request, sha256, on_delta, on_attempt)
+        return await self._complete(state, headers, request, sha256, on_attempt)
 
     async def chat(
         self,
@@ -125,66 +170,180 @@ class LLMClient:
         max_tokens: int | None = None,
         on_delta: DeltaCallback | None = None,
     ) -> LLMResponse:
-        """Send one request. With ``on_delta`` the reply is streamed (SSE) and each text or
-        reasoning fragment goes to the callback; the return value is the same."""
-        if self.model.kind not in SUPPORTED_TRANSPORTS:
-            raise LLMError(f"Provider type {self.model.kind} is not supported yet")
-        if not self.model.configured:
-            raise LLMError(f"Model {self.model.id} is not configured: API key is missing")
+        """Build one wire request and send it. Stream when ``on_delta`` is set."""
+        request = build_wire_request(
+            self.model,
+            messages,
+            tools,
+            reasoning_effort=reasoning_effort,
+            max_tokens=max_tokens or self.model.max_tokens,
+            stream=on_delta is not None,
+        )
+        return await self.send(request, on_delta=on_delta)
 
-        headers = {"Content-Type": "application/json"}
-        if self.model.api_key:
-            headers["Authorization"] = f"Bearer {self.model.api_key}"
-        payload = self._payload(messages, tools, reasoning_effort, max_tokens)
-        if on_delta is not None:
-            return await self._stream(headers, payload, on_delta)
+    async def _complete(
+        self,
+        state: _AuditState,
+        headers: dict[str, str],
+        request: WireRequest,
+        sha256: str,
+        on_attempt: AttemptCallback | None,
+    ) -> LLMResponse:
+        """Send a non-streaming request. Retry 429 and 5xx with backoff."""
         client = self._client()
         retries = self.model.max_retries
-
         secrets = (self.model.api_key,)
+        payload_bytes = len(request.body)
         for attempt in range(retries + 1):
+            await self._emit_attempt(state, on_attempt, attempt, "started", payload_bytes, sha256)
             try:
-                response = await client.post(self.endpoint, headers=headers, json=payload)
+                response = await client.post(self.endpoint, headers=headers, content=request.body)
+            except asyncio.CancelledError:
+                await self._emit_attempt(
+                    state,
+                    on_attempt,
+                    attempt,
+                    "error",
+                    payload_bytes,
+                    sha256,
+                    error_kind="cancelled",
+                )
+                raise
+            except (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+            ) as exc:
+                info = _redacted(classify_exception(exc), secrets)
+                await self._emit_attempt(
+                    state,
+                    on_attempt,
+                    attempt,
+                    "error",
+                    payload_bytes,
+                    sha256,
+                    error_kind=info.kind,
+                )
+                if attempt >= retries:
+                    raise error_for(info, f"LLM network error: {info.message}") from exc
+                await asyncio.sleep(min(8.0, 2.0**attempt))
+                continue
+            except Exception as exc:
+                await self._emit_attempt(
+                    state,
+                    on_attempt,
+                    attempt,
+                    "error",
+                    payload_bytes,
+                    sha256,
+                    error_kind=classify_exception(exc).kind,
+                )
+                raise
+            try:
                 retryable = response.status_code == 429 or response.status_code >= 500
                 if retryable and attempt < retries:
+                    info = _redacted(
+                        classify_http_error(response.status_code, response.text), secrets
+                    )
+                    await self._emit_attempt(
+                        state,
+                        on_attempt,
+                        attempt,
+                        "error",
+                        payload_bytes,
+                        sha256,
+                        error_kind=info.kind,
+                    )
                     await asyncio.sleep(min(8.0, 2.0**attempt))
                     continue
                 response.raise_for_status()
-                return self._parse_response(response.json())
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                if attempt >= retries:
-                    info = _redacted(classify_exception(exc), secrets)
-                    raise error_for(info, f"LLM network error: {info.message}") from exc
-                await asyncio.sleep(min(8.0, 2.0**attempt))
+                parsed = self._parse_response(response.json())
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 info = _redacted(classify_http_error(status, exc.response.text), secrets)
+                await self._emit_attempt(
+                    state,
+                    on_attempt,
+                    attempt,
+                    "error",
+                    payload_bytes,
+                    sha256,
+                    error_kind=info.kind,
+                )
                 raise error_for(info, f"LLM returned HTTP {status}: {info.message}") from exc
             except (KeyError, TypeError, ValueError) as exc:
+                await self._emit_attempt(
+                    state,
+                    on_attempt,
+                    attempt,
+                    "error",
+                    payload_bytes,
+                    sha256,
+                    error_kind=LLMErrorKind.unknown,
+                )
                 raise LLMError("LLM returned an invalid response") from exc
-
+            except Exception:
+                await self._emit_attempt(
+                    state,
+                    on_attempt,
+                    attempt,
+                    "error",
+                    payload_bytes,
+                    sha256,
+                    error_kind=LLMErrorKind.unknown,
+                )
+                raise
+            await self._emit_attempt(
+                state,
+                on_attempt,
+                attempt,
+                "completed",
+                payload_bytes,
+                sha256,
+                prompt_tokens=parsed.prompt_tokens,
+                completion_tokens=parsed.completion_tokens,
+            )
+            if state.error is not None:
+                raise state.error
+            return parsed
         raise LLMTransientError("LLM request failed")
 
     async def _stream(
-        self, headers: dict[str, str], payload: dict[str, Any], on_delta: DeltaCallback
+        self,
+        state: _AuditState,
+        headers: dict[str, str],
+        request: WireRequest,
+        sha256: str,
+        on_delta: DeltaCallback,
+        on_attempt: AttemptCallback | None,
     ) -> LLMResponse:
         """Stream one request. A retry is possible only before the first received fragment."""
         from agent.sse import ChatStreamAccumulator, SSEDecoder
 
-        payload = {**payload, "stream": True, "stream_options": {"include_usage": True}}
         secrets = (self.model.api_key,)
         retries = self.model.max_retries
+        payload_bytes = len(request.body)
         for attempt in range(retries + 1):
             started = False
+            await self._emit_attempt(state, on_attempt, attempt, "started", payload_bytes, sha256)
             try:
                 async with self._client().stream(
-                    "POST", self.endpoint, headers=headers, json=payload
+                    "POST", self.endpoint, headers=headers, content=request.body
                 ) as response:
                     if response.status_code >= 400:
                         status = response.status_code
                         body = (await response.aread()).decode(errors="replace")
                         info = _redacted(classify_http_error(status, body), secrets)
                         if info.retryable and attempt < retries:
+                            await self._emit_attempt(
+                                state,
+                                on_attempt,
+                                attempt,
+                                "error",
+                                payload_bytes,
+                                sha256,
+                                error_kind=info.kind,
+                            )
                             await asyncio.sleep(min(8.0, 2.0**attempt))
                             continue
                         raise error_for(info, f"LLM returned HTTP {status}: {info.message}")
@@ -196,23 +355,135 @@ class LLMClient:
                                     started = True
                                 elif event.kind in {"content", "reasoning"} and event.text:
                                     started = True
-                                    await on_delta(event.kind, event.text)
+                                    try:
+                                        await on_delta(event.kind, event.text)
+                                    except asyncio.CancelledError:
+                                        raise
+                                    except BaseException as exc:
+                                        await self._emit_attempt(
+                                            state,
+                                            on_attempt,
+                                            attempt,
+                                            "error",
+                                            payload_bytes,
+                                            sha256,
+                                            error_kind=LLMErrorKind.unknown,
+                                        )
+                                        raise _CallbackError(exc) from exc
                     for data in decoder.close():
                         accumulator.add(data)
-                    return accumulator.result()
+                    result = accumulator.result()
+            except _CallbackError as exc:
+                raise exc.original from None
             except LLMError as exc:
                 # An error event inside the stream: keep its classification, add the state.
                 exc.started = exc.started or started
+                await self._emit_attempt(
+                    state,
+                    on_attempt,
+                    attempt,
+                    "error",
+                    payload_bytes,
+                    sha256,
+                    error_kind=exc.kind,
+                )
                 raise
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            except asyncio.CancelledError:
+                await self._emit_attempt(
+                    state,
+                    on_attempt,
+                    attempt,
+                    "error",
+                    payload_bytes,
+                    sha256,
+                    error_kind="cancelled",
+                )
+                raise
+            except (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+            ) as exc:
                 info = _redacted(classify_exception(exc), secrets)
+                await self._emit_attempt(
+                    state,
+                    on_attempt,
+                    attempt,
+                    "error",
+                    payload_bytes,
+                    sha256,
+                    error_kind=info.kind,
+                )
                 if started:
                     message = f"LLM stream was interrupted: {info.message}"
                     raise error_for(info, message, started=True) from exc
                 if attempt >= retries:
                     raise error_for(info, f"LLM network error: {info.message}") from exc
                 await asyncio.sleep(min(8.0, 2.0**attempt))
+            except Exception as exc:
+                await self._emit_attempt(
+                    state,
+                    on_attempt,
+                    attempt,
+                    "error",
+                    payload_bytes,
+                    sha256,
+                    error_kind=classify_exception(exc).kind,
+                )
+                raise
+            else:
+                await self._emit_attempt(
+                    state,
+                    on_attempt,
+                    attempt,
+                    "completed",
+                    payload_bytes,
+                    sha256,
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=result.completion_tokens,
+                )
+                if state.error is not None:
+                    raise state.error
+                return result
         raise LLMTransientError("LLM request failed")
+
+    async def _emit_attempt(
+        self,
+        state: _AuditState,
+        on_attempt: AttemptCallback | None,
+        attempt: int,
+        status: Literal["started", "completed", "error"],
+        payload_bytes: int,
+        sha256: str,
+        *,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        error_kind: str | None = None,
+    ) -> None:
+        """Notify the callback about one attempt event.
+
+        Errors from ``on_attempt`` propagate on the success path. On an error path the
+        LLM error wins, so a failing callback never hides it; the failure is kept and
+        re-raised once the request has otherwise succeeded.
+        """
+        if on_attempt is None:
+            return
+        record = AttemptRecord(
+            attempt=attempt,
+            status=status,
+            payload_bytes=payload_bytes,
+            payload_sha256=sha256,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            error_kind=error_kind,
+        )
+        try:
+            await on_attempt(record)
+        except Exception as exc:
+            if status != "error":
+                raise
+            if state.error is None:
+                state.error = exc
 
     @staticmethod
     def _parse_response(body: dict[str, Any]) -> LLMResponse:

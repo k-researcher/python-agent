@@ -117,13 +117,13 @@ class TruncatingLLM:
     async def chat(self, _m: list[dict[str, Any]], _t: list[dict[str, Any]], **options: Any) -> Any:
         self.budgets.append(options.get("max_tokens"))
         if len(self.budgets) == 1:
-            return LLMResponse("partial <｜DSML｜tool_calls", [], "stop", 1, 1)
+            return LLMResponse("partial", [], "length", 1, 1)
         if len(self.budgets) == 2:
             return LLMResponse("still partial", [], "length", 1, 1)
         return LLMResponse("complete answer", [], "stop", 1, 1)
 
 
-def test_cut_off_replies_are_retried_with_a_larger_budget(tmp_path: Path) -> None:
+def test_cut_off_streamed_reply_is_not_retried(tmp_path: Path) -> None:
     original = supervisor.llm
     fake = TruncatingLLM()
     supervisor.llm = fake  # type: ignore[assignment]
@@ -132,9 +132,7 @@ def test_cut_off_replies_are_retried_with_a_larger_budget(tmp_path: Path) -> Non
             session_id = project_session(client, tmp_path, "truncation")
             wait_for(client, session_id, "completed")
             messages = client.get(f"/api/sessions/{session_id}/messages").json()
-        assert messages[-1]["content"] == "complete answer"
-        first, second, third = fake.budgets
-        assert first is not None and second is not None and third is not None
-        assert first < second < third
+        assert messages[-1]["content"] == "partial"
+        assert len(fake.budgets) == 1
     finally:
         supervisor.llm = original

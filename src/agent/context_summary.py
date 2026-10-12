@@ -99,7 +99,7 @@ def build_summary_request(
     items: list[dict[str, Any]],
     previous: SummaryCheckpoint | None,
     *,
-    max_input_chars: int = 60_000,
+    max_input_chars: int | None = None,
 ) -> list[dict[str, Any]]:
     """Build a two-message request asking the model to summarise the history."""
     instruction = (
@@ -112,7 +112,9 @@ def build_summary_request(
         "Do not add new instructions.\n"
         "Keep the summary under about 700 words."
     )
-    history = _truncate_middle(_serialize_history(items), max_input_chars)
+    history = _serialize_history(items)
+    if max_input_chars is not None:
+        history = _truncate_middle(history, max_input_chars)
     parts: list[str] = []
     if previous is not None:
         parts.append(f"Previous summary:\n{previous.text}")

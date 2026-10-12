@@ -9,10 +9,13 @@ from typing import Any
 import pytest
 
 from agent.config import Settings
+from agent.context_inference import ContextInference
 from agent.database import init_database, session_factory
 from agent.llm import LLMResponse, LLMTransientError, redact
+from agent.llm_errors import LLMErrorKind, ProviderErrorInfo
 from agent.model_config import ReasoningSpec, ResolvedModel, ResolvedModelRegistry
 from agent.models import Project, Session, SessionStatus, ToolCall, ToolCallStatus
+from agent.reasoning import ReasoningDecision, decide
 from agent.runtime import AgentSupervisor
 from agent.worker import wait_for_stop
 
@@ -118,57 +121,69 @@ class ScriptedClient:
         return reply  # type: ignore[no-any-return]
 
 
+def inference_decision(candidate: ResolvedModel) -> ReasoningDecision:
+    return decide(candidate, message_effort=None, session_effort=None, mode="dev")
+
+
 async def test_truncation_retry_stays_inside_the_context_window(tmp_path: Path) -> None:
-    session_id = await make_session(tmp_path)
-    supervisor = AgentSupervisor(Settings())
+    session_id = await make_session(tmp_path, status="running")
     small = model("small", window=16_000, max_tokens=2_000)
     client = ScriptedClient([LLMResponse("cut", [], "length", 1, 1)] * 3)
-    await supervisor._complete(
-        session_id,
-        "chat:small",
-        client,
-        small,
-        [],
-        [],
-        "{}",
-        None,
-        13_000,  # type: ignore[arg-type]
+    inference = ContextInference(
+        session_id, 0, [], registry(small), lambda _model: client, inference_decision,
     )
-    assert all(budget is not None and 13_000 + budget <= 16_000 for budget in client.budgets)
+    result = await inference.run(small)
+    assert result.response.content == "cut"
+    assert client.budgets == [2_000]
 
 
 async def test_fallback_model_takes_the_request_when_the_primary_is_down(
     tmp_path: Path,
 ) -> None:
-    session_id = await make_session(tmp_path)
-    supervisor = AgentSupervisor(Settings())
+    session_id = await make_session(tmp_path, status="running")
     primary, light = model("main"), model("light")
     fallback_client = ScriptedClient([LLMResponse("from light", [], "stop", 1, 1)])
-    supervisor._llm_clients["light"] = fallback_client  # type: ignore[assignment]
-    async with session_factory() as db:
-        session = await db.get(Session, session_id)
-        assert session is not None
-        await db.refresh(session, attribute_names=["messages"])
-        response = await supervisor._complete_with_fallback(
-            db,
-            session,
-            registry(primary, light, fallback=["light"]),
-            primary,
-            [],
-            LLMTransientError("HTTP 503"),
-        )
-    assert response.content == "from light"
+    error = LLMTransientError(
+        "HTTP 503",
+        info=ProviderErrorInfo(
+            LLMErrorKind.server,
+            503,
+            None,
+            "Unavailable",
+            True,
+        ),
+    )
+    primary_client = ScriptedClient([error])
+    inference = ContextInference(
+        session_id,
+        0,
+        [],
+        registry(primary, light, fallback=["light"]),
+        lambda candidate: primary_client if candidate.id == "main" else fallback_client,
+        inference_decision,
+    )
+    result = await inference.run(primary)
+    assert result.response.content == "from light"
+    assert result.model.id == "light"
 
 
 async def test_without_fallback_the_transient_error_stays(tmp_path: Path) -> None:
-    session_id = await make_session(tmp_path)
-    supervisor = AgentSupervisor(Settings())
+    session_id = await make_session(tmp_path, status="running")
     primary = model("main")
-    async with session_factory() as db:
-        session = await db.get(Session, session_id)
-        assert session is not None
-        await db.refresh(session, attribute_names=["messages"])
-        with pytest.raises(LLMTransientError):
-            await supervisor._complete_with_fallback(
-                db, session, registry(primary), primary, [], LLMTransientError("HTTP 503")
-            )
+    error = LLMTransientError(
+        "HTTP 503",
+        info=ProviderErrorInfo(
+            LLMErrorKind.server,
+            503,
+            None,
+            "Unavailable",
+            True,
+        ),
+    )
+    client = ScriptedClient([error])
+    inference = ContextInference(
+        session_id, 0, [], registry(primary), lambda _model: client, inference_decision
+    )
+    with pytest.raises(LLMTransientError) as caught:
+        await inference.run(primary)
+    assert caught.value is error

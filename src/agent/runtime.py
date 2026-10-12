@@ -13,13 +13,15 @@ from typing import Any, cast
 from pydantic import ValidationError
 from sqlalchemy import or_, select, update
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import attributes, selectinload
 
+from agent.checkpoints import load_context_rows
 from agent.config import Settings
-from agent.context import ContextManager
+from agent.context_inference import ContextInference
+from agent.context_manager import ContextManager
 from agent.database import session_factory
-from agent.events import StreamPublisher, emit_event
-from agent.llm import LLMClient, LLMResponse, LLMTransientError
+from agent.events import emit_event
+from agent.llm import LLMClient
 from agent.model_config import ModelConfigError, ResolvedModel, ResolvedModelRegistry
 from agent.model_registry import effective_registry, select_model
 from agent.models import (
@@ -42,11 +44,6 @@ from agent.tools import ToolRegistry
 from agent.tools.base import ToolContext, ToolError
 
 logger = logging.getLogger(__name__)
-
-TRUNCATION_RETRIES = 2
-CONTEXT_SAFETY_TOKENS = 512
-# Raw DeepSeek tool-call markup that shows up in the text when the output budget runs out.
-LEAKED_TOOL_MARKUP = ("<｜DSML｜", "< | DSML |", "<｜tool▁calls▁begin｜>")
 
 TERMINAL_STATUSES = {
     SessionStatus.completed.value,
@@ -333,18 +330,35 @@ class AgentSupervisor:
                     .where(Session.id == session_id)
                     .options(
                         selectinload(Session.project),
-                        selectinload(Session.messages),
-                        selectinload(Session.tool_calls).selectinload(ToolCall.approval),
                     )
                 )
                 session = (await db.execute(query)).scalar_one_or_none()
                 if session is None or session.status in TERMINAL_STATUSES:
                     return
+                rows = await load_context_rows(db, session_id)
+                attributes.set_committed_value(session, "messages", rows)
+                unfinished = list(
+                    await db.scalars(
+                        select(ToolCall)
+                        .where(
+                            ToolCall.session_id == session_id,
+                            ToolCall.status.in_({"pending", "running", "awaiting_confirmation"}),
+                        )
+                        .options(selectinload(ToolCall.approval))
+                        .order_by(ToolCall.created_at, ToolCall.id)
+                    )
+                )
+                attributes.set_committed_value(session, "tool_calls", unfinished)
+                visible = [
+                    message
+                    for message in session.messages
+                    if message.kind == "normal" and not message.skipped
+                ]
                 if (
                     session.status == SessionStatus.running.value
-                    and session.messages
-                    and session.messages[-1].role == "assistant"
-                    and not session.messages[-1].tool_calls
+                    and visible
+                    and visible[-1].role == "assistant"
+                    and not visible[-1].tool_calls
                 ):
                     session.status = SessionStatus.completed.value
                     await db.commit()
@@ -384,45 +398,30 @@ class AgentSupervisor:
                 if models is None:
                     models = await self._models(db)
                 model = select_model(models, session.llm_profile, strict=False)
-                prepared = self.context_for(model).prepare(
-                    session.messages, reasoning_history=model.reasoning.history
-                )
-                if prepared.omitted_messages or prepared.truncated_tool_results:
-                    await emit_event(
-                        db,
-                        "context.compacted",
-                        {
-                            "approximate_tokens": prepared.approximate_tokens,
-                            "omitted_messages": prepared.omitted_messages,
-                            "truncated_tool_results": prepared.truncated_tool_results,
-                        },
-                        session.id,
-                    )
                 definitions = self.registry.definitions(session.mode, model_ids=models.ids())
-                audit_payload = json.dumps(
-                    {"messages": prepared.messages, "tools": definitions},
-                    ensure_ascii=False,
-                    default=str,
+                decisions = {
+                    candidate.id: self._reasoning_for(session, candidate)
+                    for candidate in models.models.values()
+                }
+                await db.commit()
+
+                def reasoning_for(
+                    candidate: ResolvedModel,
+                    snapshot: dict[str, ReasoningDecision] = decisions,
+                ) -> ReasoningDecision:
+                    return snapshot[candidate.id]
+
+                inference = ContextInference(
+                    session.id,
+                    self.settings.context_reserved_tokens,
+                    definitions,
+                    models,
+                    partial(self._llm_for, models),
+                    reasoning_for,
                 )
-                llm_client = self._llm_for(models, model)
-                decision = self._reasoning_for(session, model)
-                reasoning_effort = decision.effective
-                try:
-                    response = await self._complete(
-                        session.id,
-                        f"chat:{model.id}",
-                        llm_client,
-                        model,
-                        prepared.messages,
-                        definitions,
-                        audit_payload,
-                        reasoning_effort,
-                        prepared.approximate_tokens,
-                    )
-                except LLMTransientError as primary_error:
-                    response = await self._complete_with_fallback(
-                        db, session, models, model, definitions, primary_error
-                    )
+                outcome = await inference.run(model)
+                response = outcome.response
+                reasoning_effort = outcome.reasoning.effective
                 await db.refresh(session, attribute_names=["status", "stop_requested"])
                 if session.stop_requested or session.status == SessionStatus.stopped.value:
                     return
@@ -664,112 +663,17 @@ class AgentSupervisor:
         )
         return True
 
-    async def _complete(
-        self,
-        session_id: str,
-        operation: str,
-        llm_client: LLMClient,
-        model: ResolvedModel,
-        messages: list[dict[str, Any]],
-        definitions: list[dict[str, Any]],
-        audit_payload: str,
-        reasoning_effort: str | None,
-        input_tokens: int,
-    ) -> LLMResponse:
-        """Call the model, retrying with a larger output budget when the reply was cut off.
-
-        A reply is cut off when ``finish_reason`` is ``length`` or when DeepSeek leaks its raw
-        tool-call markup into the text. The budget grows by half per retry. It stays below a
-        quarter of the context window and below the space that the input leaves free. After
-        the last retry, the method returns the reply as it is.
-        """
-        max_tokens = model.max_tokens
-        free = model.context_window - input_tokens - CONTEXT_SAFETY_TOKENS
-        ceiling = max(model.max_tokens, min(model.context_window // 4, free))
-        destination = llm_client.endpoint
-        for attempt in range(TRUNCATION_RETRIES + 1):
-            await self._audit_egress(
-                session_id, "llm", destination, operation, audit_payload, "started"
-            )
-            publisher = StreamPublisher(session_id)
-            try:
-                response = await llm_client.chat(
-                    messages,
-                    definitions,
-                    reasoning_effort=reasoning_effort,
-                    max_tokens=max_tokens,
-                    on_delta=publisher.add,
-                )
-                await publisher.flush()
-            except Exception as exc:
-                await publisher.reset()
-                await self._audit_egress(
-                    session_id, "llm", destination, operation, audit_payload, "error", str(exc)
-                )
-                raise
-            await self._audit_egress(
-                session_id, "llm", destination, operation, audit_payload, "completed"
-            )
-            cut_off = response.finish_reason == "length" or any(
-                marker in (response.content or "") for marker in LEAKED_TOOL_MARKUP
-            )
-            if cut_off and attempt < TRUNCATION_RETRIES and max_tokens < ceiling:
-                await publisher.reset()
-            if not cut_off or attempt == TRUNCATION_RETRIES or max_tokens >= ceiling:
-                if cut_off and response.finish_reason != "length":
-                    response.finish_reason = "length"
-                return response
-            max_tokens = min(ceiling, int(max_tokens * 1.5))
-        raise AssertionError("unreachable")
-
-    async def _complete_with_fallback(
-        self,
-        db: Any,
-        session: Session,
-        models: ResolvedModelRegistry,
-        primary: ResolvedModel,
-        definitions: list[dict[str, Any]],
-        primary_error: LLMTransientError,
-    ) -> LLMResponse:
-        """Send the request to the routing fallback models when the primary one is down."""
-        for fallback_id in models.fallback:
-            fallback = models.models.get(fallback_id)
-            if fallback is None or fallback.id == primary.id or not fallback.configured:
-                continue
-            prepared = self.context_for(fallback).prepare(session.messages)
-            payload = json.dumps(
-                {"messages": prepared.messages, "tools": definitions},
-                ensure_ascii=False,
-                default=str,
-            )
-            await emit_event(
-                db,
-                "llm.fallback",
-                {"from": primary.id, "to": fallback.id, "reason": str(primary_error)[:500]},
-                session.id,
-            )
-            try:
-                return await self._complete(
-                    session.id,
-                    f"chat:{fallback.id}",
-                    self._llm_for(models, fallback),
-                    fallback,
-                    prepared.messages,
-                    definitions,
-                    payload,
-                    None,
-                    prepared.approximate_tokens,
-                )
-            except LLMTransientError as exc:
-                primary_error = exc
-        raise primary_error
-
     @staticmethod
     def _reasoning_for(session: Session, model: ResolvedModel) -> ReasoningDecision:
         """Message override, then the session level, then "auto" or the model default."""
-        users = [message for message in session.messages if message.role == "user"]
+        messages = [
+            message
+            for message in session.messages
+            if message.kind == "normal" and not message.skipped
+        ]
+        users = [message for message in messages if message.role == "user"]
         recent_errors = 0
-        for message in reversed(session.messages):
+        for message in reversed(messages):
             if message.role != "tool":
                 if message.role == "assistant" and message.tool_calls:
                     continue
@@ -787,13 +691,8 @@ class AgentSupervisor:
             recent_errors=recent_errors,
         )
 
-    def context_for(self, model: ResolvedModel) -> ContextManager:
-        """Context budget of the session's own model, keeping room for its reply."""
-        return ContextManager(
-            model.context_window,
-            max(self.settings.context_reserved_tokens, model.max_tokens),
-            self.settings.max_tool_result_chars,
-        )
+    def context_for(self, model: ResolvedModel | None = None) -> ContextManager:
+        return ContextManager(self.settings.context_reserved_tokens)
 
     def _llm_for(self, models: ResolvedModelRegistry, model: ResolvedModel) -> LLMClient:
         if model.id == models.default_id and self.llm is not None:

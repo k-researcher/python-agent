@@ -67,6 +67,10 @@ class MessageRead(BaseModel):
     kind: str
     reasoning_content: str | None
     reasoning_effort: str | None
+    covers_until: int | None
+    source_hash: str | None
+    summary_version: int | None
+    summary_model: str | None
     created_at: datetime
 
 

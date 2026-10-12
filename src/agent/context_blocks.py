@@ -79,6 +79,7 @@ def protected_blocks(
         len(blocks),
     )
     protected.update(range(first_other))
+    protected.update(index for index, block in enumerate(blocks) if block.kind == "system")
 
     user_indices = [index for index, block in enumerate(blocks) if block.kind == "user"]
     if user_indices:

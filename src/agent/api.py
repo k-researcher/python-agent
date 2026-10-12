@@ -7,10 +7,12 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import attributes, selectinload
 
 from agent.auth import check_request
+from agent.checkpoints import load_context_rows
 from agent.config import Settings, get_settings
+from agent.context_inference import ContextInference, ContextPreparationError, context_stats
 from agent.database import get_db, session_factory
 from agent.events import broker, emit_event
 from agent.model_registry import effective_registry, select_model
@@ -201,24 +203,33 @@ async def list_outbound_audit(
 
 
 @router.get("/sessions/{session_id}/context")
-async def session_context(session_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, int]:
+async def session_context(session_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, object]:
     session = (
-        await db.execute(
-            select(Session).where(Session.id == session_id).options(selectinload(Session.messages))
-        )
+        await db.execute(select(Session).where(Session.id == session_id))
     ).scalar_one_or_none()
     if session is None:
         raise HTTPException(404, "Session not found")
-    model = select_model(await effective_registry(db, settings), session.llm_profile, strict=False)
-    context = supervisor.context_for(model)
-    result = context.prepare(session.messages)
-    return {
-        "approximate_tokens": result.approximate_tokens,
-        "omitted_messages": result.omitted_messages,
-        "truncated_tool_results": result.truncated_tool_results,
-        "context_window": model.context_window,
-        "reserved_tokens": model.context_window - context.budget,
-    }
+    models = await effective_registry(db, settings)
+    model = select_model(models, session.llm_profile, strict=False)
+    attributes.set_committed_value(session, "messages", await load_context_rows(db, session_id))
+    decision = supervisor._reasoning_for(session, model)
+    definitions = supervisor.registry.definitions(session.mode, model_ids=models.ids())
+    await db.rollback()
+    inference = ContextInference(
+        session_id,
+        settings.context_reserved_tokens,
+        definitions,
+        models,
+        lambda candidate: supervisor._llm_for(models, candidate),
+        lambda _candidate: decision,
+    )
+    try:
+        result = await inference.prepare(model, decision, paid_summary=False)
+    except ContextPreparationError as error:
+        payload = context_stats(error.prepared, model)
+        payload.update(fits=False, error=error.reason, summary_calls=0)
+        return payload
+    return context_stats(result, model)
 
 
 @router.get("/sessions/{session_id}/messages", response_model=list[MessageRead])

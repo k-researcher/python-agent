@@ -148,7 +148,7 @@ def test_protected_incomplete_exchange() -> None:
     assert protected_blocks(items, blocks) == {0, 1, 2}
 
 
-def test_protected_late_system_is_not_included() -> None:
+def test_protected_late_system_stays_a_protected_boundary() -> None:
     items = [
         item("system", "rules"),
         item("user", "task"),
@@ -156,7 +156,7 @@ def test_protected_late_system_is_not_included() -> None:
         item("user", "more"),
     ]
     blocks = split_blocks(items)
-    assert protected_blocks(items, blocks) == {0, 1, 3}
+    assert protected_blocks(items, blocks) == {0, 1, 2, 3}
 
 
 def test_protected_top_up_from_history() -> None:
