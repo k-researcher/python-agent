@@ -4,14 +4,42 @@ import asyncio
 import os
 import re
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 from agent.sandbox import SandboxUnavailableError
 from agent.sandbox import prepare as prepare_sandbox
+from agent.security import is_sensitive_path
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 
 MAX_COMMAND_OUTPUT = 100_000
 REVISION_PATTERN = re.compile(r"^[A-Za-z0-9._/~^@{}-]{1,100}$")
+SECRET_ERROR = "Access to secret-bearing files is blocked"
+
+# Pathspec excludes for secret-bearing files (first layer, case-insensitive). The output
+# filter below is the exact second layer: it applies is_sensitive_path to every file header,
+# for example to ".env.local", which a glob cannot separate from ".env.example".
+_SENSITIVE_EXCLUDES = tuple(
+    f":(exclude,glob,icase){pattern}"
+    for pattern in (
+        "**/.env",
+        "**/.npmrc",
+        "**/.pypirc",
+        "**/.netrc",
+        "**/credentials",
+        "**/credentials/**",
+        "**/credentials.json",
+        "**/id_rsa",
+        "**/id_dsa",
+        "**/id_ecdsa",
+        "**/id_ed25519",
+        "**/*.key",
+        "**/*.p12",
+        "**/*.pfx",
+    )
+)
+
+_SKIPPED_SENSITIVE = "[skipped: sensitive file]"
 
 # Env vars used to build commands; added so the environment is predictable.
 _GIT_ENV = (
@@ -136,6 +164,57 @@ async def _run_git(context: ToolContext, args: list[str], timeout: int = 60) -> 
     }
 
 
+def _check_sensitive(value: str) -> None:
+    """Raise ToolError when the path names a secret-bearing file."""
+    if is_sensitive_path(Path(value)):
+        raise ToolError(SECRET_ERROR)
+
+
+_DIFF_HEADERS = ("diff --git ", "diff --cc ", "diff --combined ")
+
+
+def _filter_diff_output(output: str) -> str:
+    """Replace diff sections of sensitive files with a skip marker.
+
+    A section starts at a "diff --git" header or, for a merge commit, at a combined
+    "diff --cc" or "diff --combined" header.
+    """
+    lines = output.splitlines()
+    if not lines:
+        return output
+    result: list[str] = []
+    in_sensitive = False
+    for line in lines:
+        if line.startswith(_DIFF_HEADERS):
+            in_sensitive = _diff_header_is_sensitive(line)
+            if in_sensitive:
+                result.append(_SKIPPED_SENSITIVE)
+                continue
+        if not in_sensitive:
+            result.append(line)
+    return "\n".join(result) + ("\n" if output.endswith("\n") else "")
+
+
+def _diff_header_is_sensitive(header: str) -> bool:
+    """Tell whether a diff header names a sensitive file.
+
+    A header that cannot be parsed counts as sensitive: the section is hidden, not shown.
+    """
+    for prefix in ("diff --cc ", "diff --combined "):
+        if header.startswith(prefix):
+            path = header[len(prefix) :]
+            if path.startswith('"'):
+                return True  # A C-quoted name: do not guess, hide the section.
+            return is_sensitive_path(Path(path))
+    rest = header[len("diff --git ") :]
+    if '"' in rest:
+        return True  # A C-quoted name: do not guess, hide the section.
+    match = re.match(r"^a/(.*) b/(.*)$", rest)
+    if not match:
+        return True
+    return is_sensitive_path(Path(match.group(1))) or is_sensitive_path(Path(match.group(2)))
+
+
 def parse_status(stdout: str) -> dict[str, Any]:
     """Parse `git status --porcelain=v1 --branch` text into files and branch."""
     lines = stdout.splitlines()
@@ -153,7 +232,7 @@ def parse_status(stdout: str) -> dict[str, Any]:
         else:
             branch = first.split("...", 1)[0].split(" ", 1)[0]
 
-    files: list[dict[str, str]] = []
+    files: list[dict[str, str | bool]] = []
     for line in lines[1:]:
         if not line or line.startswith("##"):
             continue
@@ -161,7 +240,14 @@ def parse_status(stdout: str) -> dict[str, Any]:
         path = line[3:]
         if " -> " in path:
             path = path.split(" -> ", 1)[1]
-        files.append({"path": path, "index": code[0], "worktree": code[1]})
+        files.append(
+            {
+                "path": path,
+                "index": code[0],
+                "worktree": code[1],
+                "sensitive": is_sensitive_path(Path(path)),
+            }
+        )
     return {"branch": branch, "files": files}
 
 
@@ -212,12 +298,10 @@ class GitDiffTool(Tool):
         args = ["diff", f"-U{context_lines}", "--no-color", "--no-ext-diff", "--no-textconv"]
         if staged:
             args.append("--cached")
-        if paths:
-            args.append("--")
-            args.extend(_validate_paths(paths))
+        args.extend(_pathspec(paths))
 
         result = await _run_git(context, args)
-        return {"diff": result["stdout"], "truncated": result["truncated"]}
+        return {"diff": _filter_diff_output(result["stdout"]), "truncated": result["truncated"]}
 
 
 def _validate_paths(paths: list[str]) -> list[str]:
@@ -231,8 +315,14 @@ def _validate_paths(paths: list[str]) -> list[str]:
         parts = normalized.removesuffix("/").split("/")
         if any(part in ("", "..") for part in parts):
             raise ToolError(f"Invalid path: {value!r}")
+        _check_sensitive(value)
         validated.append(value)
     return validated
+
+
+def _pathspec(paths: list[str]) -> list[str]:
+    """Return the arguments after `--`: the paths (or the whole tree) and the secret excludes."""
+    return ["--", *(_validate_paths(paths) if paths else ["."]), *_SENSITIVE_EXCLUDES]
 
 
 class GitLogTool(Tool):
@@ -314,10 +404,9 @@ class GitShowTool(Tool):
         args = ["show", "--no-color", "--no-ext-diff", "--no-textconv"]
         if stat_only:
             args.append("--stat")
-        args.append(revision)
-        if path is not None:
-            args.append("--")
-            args.extend(_validate_paths([path]))
+        # Peel to a commit: a blob or tree revision would print raw file content.
+        args.append(f"{revision}^{{commit}}")
+        args.extend(_pathspec([path] if path is not None else []))
 
         result = await _run_git(context, args)
-        return {"output": result["stdout"], "truncated": result["truncated"]}
+        return {"output": _filter_diff_output(result["stdout"]), "truncated": result["truncated"]}

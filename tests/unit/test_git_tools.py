@@ -17,6 +17,7 @@ from agent.tools.git_tools import (
     GitLogTool,
     GitShowTool,
     GitStatusTool,
+    _filter_diff_output,
     _run_git,
     _validate_paths,
     parse_status,
@@ -127,10 +128,10 @@ def test_parse_status_entries(various_status_text: str) -> None:
 
     assert result["branch"] == "feature"
     assert result["files"] == [
-        {"path": "a.txt", "index": "M", "worktree": " "},
-        {"path": "b.txt", "index": " ", "worktree": "M"},
-        {"path": "new.py", "index": "?", "worktree": "?"},
-        {"path": "renamed.py", "index": "R", "worktree": " "},
+        {"path": "a.txt", "index": "M", "worktree": " ", "sensitive": False},
+        {"path": "b.txt", "index": " ", "worktree": "M", "sensitive": False},
+        {"path": "new.py", "index": "?", "worktree": "?", "sensitive": False},
+        {"path": "renamed.py", "index": "R", "worktree": " ", "sensitive": False},
     ]
 
 
@@ -486,3 +487,120 @@ def test_directory_path_with_trailing_slash_is_valid() -> None:
     assert _validate_paths(["src/"]) == ["src/"]
     with pytest.raises(ToolError):
         _validate_paths(["src//x"])
+
+
+SECRET = "TOKEN-must-not-leak"
+
+
+@pytest.fixture
+def secret_repo(repo: Path) -> Path:
+    """Commit secret-bearing files next to normal ones, then change all of them."""
+    files = {
+        ".env": SECRET,
+        ".env.local": SECRET,
+        "Config/.ENV": SECRET,
+        "keys/id_ed25519": SECRET,
+        "certs/server.KEY": SECRET,
+        "credentials/token.txt": SECRET,
+        ".env.example": "EXAMPLE=1",
+    }
+    for name, value in files.items():
+        write(repo, name, f"{value}\n")
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-m", "add config", "--no-gpg-sign")
+    for name, value in files.items():
+        write(repo, name, f"{value} changed\n")
+    write(repo, "a.txt", "alpha changed\n")
+    return repo
+
+
+async def test_diff_without_paths_hides_secret_files(secret_repo: Path) -> None:
+    result = await GitDiffTool().execute(git_context(secret_repo), {})
+    assert SECRET not in result["diff"]
+    assert "EXAMPLE=1 changed" in result["diff"]  # .env.example stays visible
+    assert "alpha changed" in result["diff"]
+
+
+async def test_show_without_path_hides_secret_files(secret_repo: Path) -> None:
+    result = await GitShowTool().execute(git_context(secret_repo), {"revision": "HEAD"})
+    assert SECRET not in result["output"]
+    assert "EXAMPLE=1" in result["output"]
+
+
+@pytest.mark.parametrize(
+    "path", [".env", ".env.local", "Config/.ENV", "keys/id_ed25519", "certs/server.KEY"]
+)
+async def test_explicit_secret_path_is_refused(secret_repo: Path, path: str) -> None:
+    context = git_context(secret_repo)
+    with pytest.raises(ToolError, match="secret-bearing"):
+        await GitDiffTool().execute(context, {"paths": [path]})
+    with pytest.raises(ToolError, match="secret-bearing"):
+        await GitShowTool().execute(context, {"revision": "HEAD", "path": path})
+    with pytest.raises(ToolError, match="secret-bearing"):
+        await GitLogTool().execute(context, {"path": path})
+
+
+async def test_directory_path_hides_secret_files_inside(secret_repo: Path) -> None:
+    result = await GitDiffTool().execute(git_context(secret_repo), {"paths": ["keys/"]})
+    assert SECRET not in result["diff"]
+
+
+async def test_revision_with_path_suffix_is_refused(secret_repo: Path) -> None:
+    with pytest.raises(ToolError, match="Invalid revision"):
+        await GitShowTool().execute(git_context(secret_repo), {"revision": "HEAD:.env"})
+
+
+async def test_status_marks_secret_files(secret_repo: Path) -> None:
+    result = await GitStatusTool().execute(git_context(secret_repo), {})
+    marks = {item["path"]: item["sensitive"] for item in result["files"]}
+    assert marks[".env"] is True
+    assert marks["keys/id_ed25519"] is True
+    assert marks[".env.example"] is False
+    assert marks["a.txt"] is False
+
+
+def test_filter_keeps_normal_sections_and_trailing_newline() -> None:
+    output = "diff --git a/.env b/.env\n+SECRET\ndiff --git a/a.txt b/a.txt\n+ok\n"
+    assert _filter_diff_output(output) == (
+        "[skipped: sensitive file]\ndiff --git a/a.txt b/a.txt\n+ok\n"
+    )
+
+
+async def test_show_merge_commit_hides_secret_combined_diff(repo: Path) -> None:
+    # A conflict resolution in a merge commit is shown as a combined "diff --cc" section.
+    write(repo, ".env.local", "SECRETV=base\n")
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-m", "base", "--no-gpg-sign")
+    run_git(repo, "checkout", "-q", "-b", "side")
+    write(repo, ".env.local", "SECRETV=side\n")
+    run_git(repo, "commit", "-am", "side", "--no-gpg-sign")
+    run_git(repo, "checkout", "-q", "main")
+    write(repo, ".env.local", "SECRETV=main\n")
+    run_git(repo, "commit", "-am", "main", "--no-gpg-sign")
+    subprocess.run(["git", "merge", "-q", "side"], cwd=repo, capture_output=True)
+    write(repo, ".env.local", f"SECRETV={SECRET}\n")
+    run_git(repo, "add", ".env.local")
+    run_git(repo, "commit", "-m", "merge", "--no-gpg-sign")
+
+    result = await GitShowTool().execute(git_context(repo), {"revision": "HEAD"})
+
+    assert SECRET not in result["output"]
+    assert "[skipped: sensitive file]" in result["output"]
+
+
+async def test_show_blob_revision_is_refused(secret_repo: Path) -> None:
+    blob = run_git(secret_repo, "rev-parse", "HEAD:.env").stdout.strip()
+    with pytest.raises(ToolError):
+        await GitShowTool().execute(git_context(secret_repo), {"revision": blob})
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        'diff --git "a/odd\\"name" "b/odd\\"name"',
+        'diff --cc "odd\\tname"',
+        "diff --git broken header",
+    ],
+)
+def test_unparsed_header_is_hidden(header: str) -> None:
+    assert _filter_diff_output(f"{header}\n+value\n") == "[skipped: sensitive file]\n"
