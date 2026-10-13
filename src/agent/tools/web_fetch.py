@@ -14,7 +14,7 @@ import httpx
 
 from agent.config import Settings
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
-from agent.tools.network import validate_outbound_url
+from agent.tools.network import pinned_client, validate_outbound_url
 
 MAX_REDIRECTS = 5
 USER_AGENT = "python-agent/0.1"
@@ -334,8 +334,9 @@ class WebFetchTool(Tool):
     def _get_client(self) -> httpx.AsyncClient:
         if self._client_factory is not None:
             return self._client_factory()
-        # Redirects are followed manually: each target must pass validate_outbound_url.
-        return httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+        # Redirects are followed manually: each target must pass validate_outbound_url, and
+        # the pinned transport checks the address again at connect time.
+        return pinned_client(self.settings.network_allowlist)
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
         url = str(arguments["url"])
