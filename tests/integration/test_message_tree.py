@@ -27,7 +27,7 @@ from typing import Any
 import pytest
 from sqlalchemy import func, select, update
 
-from agent.checkpoints import save_checkpoint
+from agent.checkpoints import save_checkpoint, stored_source_hash
 from agent.config import get_settings
 from agent.context_projection import (
     HistorySnapshot,
@@ -959,3 +959,56 @@ async def test_regenerate_validates_effort_against_fresh_profile(
     async with session_factory() as db:
         status = await db.scalar(select(Session.status).where(Session.id == session_id))
     assert status == SessionStatus.completed.value
+
+
+async def test_runtime_history_uses_checkpoint_only_on_its_branch(tmp_path: Path) -> None:
+    # The runtime path (context_state.load_history): a summary replaces the rows it covers
+    # while its boundary is active; after an edit hides that branch, the full active history
+    # loads instead, and switching back makes the summary usable again.
+    from agent.context_state import load_history
+
+    session_id = await new_session(tmp_path)
+    async with session_factory() as db:
+        system = await append_message(db, session_id, role="system", content="s")
+        u1 = await append_message(db, session_id, role="user", content="u1")
+        a1 = await append_message(db, session_id, role="assistant", content="a1")
+        u2 = await append_message(db, session_id, role="user", content="u2")
+        a2 = await append_message(db, session_id, role="assistant", content="a2")
+        await db.commit()
+        ids = {"s": system.id, "u1": u1.id, "a1": a1.id, "u2": u2.id, "a2": a2.id}
+    async with session_factory() as db:
+        stored = await stored_source_hash(db, session_id, ids["a1"])
+        checkpoint = SummaryCheckpoint("summary of u1/a1", ids["a1"], stored, SUMMARY_VERSION)
+        await save_checkpoint(db, session_id, checkpoint, None)
+        await db.commit()
+
+    def visible(history: Any) -> list[str]:
+        return [message.content for message in history.snapshot.messages]
+
+    async with session_factory() as db:
+        history = await load_history(db, session_id)
+    assert history.snapshot.checkpoint is not None
+    assert history.snapshot.checkpoint.covers_until == ids["a1"]
+    assert visible(history) == ["s", "u1", "u2", "a2"]  # a1 is replaced by the summary
+
+    async with session_factory() as db:
+        await edit_message(db, session_id, ids["u1"], "u1 edited")
+        await db.commit()
+    async with session_factory() as db:
+        history = await load_history(db, session_id)
+    assert history.snapshot.checkpoint is None
+    assert visible(history) == ["s", "u1 edited"]  # full active chain, nothing lost
+
+    async with session_factory() as db:
+        # The run that the edit started has finished.
+        await db.execute(
+            update(Session)
+            .where(Session.id == session_id)
+            .values(status=SessionStatus.completed.value)
+        )
+        await switch_branch(db, session_id, ids["a2"])
+        await db.commit()
+    async with session_factory() as db:
+        history = await load_history(db, session_id)
+    assert history.snapshot.checkpoint is not None
+    assert visible(history) == ["s", "u1", "u2", "a2"]

@@ -33,7 +33,13 @@ def _router_installed() -> bool:
 @contextmanager
 def tree_client() -> Iterator[TestClient]:
     if not _router_installed():
+        before = len(app.router.routes)
         app.include_router(router)
+        # Put the tree routes first: with a built frontend, the SPA GET fallback is already
+        # registered and would answer GET /siblings with 404.
+        added = app.router.routes[before:]
+        del app.router.routes[before:]
+        app.router.routes[:0] = added
     with authed_client() as client:
         yield client
 

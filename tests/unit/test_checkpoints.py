@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from pathlib import Path
 from typing import Any
 
@@ -16,10 +17,17 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from agent.checkpoints import CheckpointError, load_context_rows, save_checkpoint
+from agent.checkpoints import (
+    CheckpointError,
+    load_context_rows,
+    save_checkpoint,
+    stored_source_hash,
+)
 from agent.context_summary import SUMMARY_VERSION, SummaryCheckpoint
 from agent.database import configure_sqlite_connection, engine, init_database, session_factory
 from agent.models import Base, Message, Project, Session
+
+_HEX64_TEST = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def _hash(value: str) -> str:
@@ -57,8 +65,13 @@ async def _save(
     *,
     model_id: str | None,
 ) -> int:
-    checkpoint = SummaryCheckpoint(text=text, covers_until=covers_until, source_hash=source_hash)
     async with session_factory() as db:
+        if _HEX64_TEST.fullmatch(source_hash):
+            # Store the real hash of the covered rows, as persist_checkpoint does.
+            source_hash = await stored_source_hash(db, session_id, covers_until)
+        checkpoint = SummaryCheckpoint(
+            text=text, covers_until=covers_until, source_hash=source_hash
+        )
         return await save_checkpoint(db, session_id, checkpoint, model_id)
 
 
@@ -70,9 +83,16 @@ async def add_summary(
     *,
     version: int = SUMMARY_VERSION,
     skipped: bool = False,
+    exact_hash: bool = False,
 ) -> Message:
-    """Insert a raw summary row directly, bypassing save-time validation."""
+    """Insert a raw summary row directly, bypassing save-time validation.
+
+    A well-formed hash is replaced with the real stored hash of the covered rows, so the
+    row is usable unless another check rejects it. Pass ``exact_hash=True`` to keep it.
+    """
     async with session_factory() as db:
+        if not exact_hash and _HEX64_TEST.fullmatch(source_hash):
+            source_hash = await stored_source_hash(db, session_id, covers_until)
         message = Message(
             session_id=session_id,
             role="user",
@@ -176,11 +196,46 @@ async def test_equal_coverage_keeps_latest_checkpoint(tmp_path: Path) -> None:
         {"role": "user", "content": "task", "kind": "normal"},
     )
     first_id = await _save(session_id, "one", head[-1].id, _hash("one"), model_id="main")
-    second_id = await _save(session_id, "two", head[-1].id, _hash("two"), model_id="main")
-    assert second_id != first_id
+    # A later row with the same coverage but a hash of other history is not usable.
+    stale = await add_summary(session_id, "two", head[-1].id, _hash("two"), exact_hash=True)
+    assert stale.id > first_id
     async with session_factory() as db:
         rows = await load_context_rows(db, session_id)
-    assert [row.id for row in rows] == [head[0].id, head[1].id, second_id]
+    assert [row.id for row in rows] == [head[0].id, head[1].id, first_id]
+
+
+async def test_summary_with_mismatched_hash_is_not_used(tmp_path: Path) -> None:
+    session_id = await make_session(tmp_path)
+    head = await add_messages(
+        session_id,
+        {"role": "system", "content": "sys", "kind": "normal"},
+        {"role": "user", "content": "task", "kind": "normal"},
+        {"role": "assistant", "content": "a", "kind": "normal"},
+    )
+    await add_summary(session_id, "other history", head[-1].id, "0" * 64, exact_hash=True)
+    async with session_factory() as db:
+        rows = await load_context_rows(db, session_id)
+    assert [row.id for row in rows] == [m.id for m in head]  # full history, no summary
+
+
+async def test_changed_covered_row_invalidates_summary(tmp_path: Path) -> None:
+    session_id = await make_session(tmp_path)
+    head = await add_messages(
+        session_id,
+        {"role": "system", "content": "sys", "kind": "normal"},
+        {"role": "user", "content": "task", "kind": "normal"},
+        {"role": "assistant", "content": "a", "kind": "normal"},
+    )
+    summary_id = await _save(session_id, "s", head[-1].id, _hash("s"), model_id="main")
+    async with session_factory() as db:
+        assert summary_id in [row.id for row in await load_context_rows(db, session_id)]
+        row = await db.get(Message, head[2].id)
+        assert row is not None
+        row.content = "changed outside the agent"
+        await db.commit()
+    async with session_factory() as db:
+        rows = await load_context_rows(db, session_id)
+    assert [row.id for row in rows] == [m.id for m in head]
 
 
 async def test_duplicate_checkpoint_reuses_existing_row(tmp_path: Path) -> None:
@@ -431,11 +486,11 @@ async def test_non_existent_coverage_falls_back_to_full_history(tmp_path: Path) 
         {"role": "assistant", "content": "a", "kind": "normal"},
     )
     # The only checkpoint covers an id that does not exist in this session, so it
-    # is unusable and the raw history (including the stored summary row) returns.
-    bad = await add_summary(session_id, "lost", 99999, _hash("lost"))
+    # is unusable: the raw history returns without the unusable summary row.
+    await add_summary(session_id, "lost", 99999, _hash("lost"))
     async with session_factory() as db:
         rows = await load_context_rows(db, session_id)
-    assert [row.id for row in rows] == [*[m.id for m in head], bad.id]
+    assert [row.id for row in rows] == [m.id for m in head]
 
 
 async def test_skipped_summary_is_not_selected(tmp_path: Path) -> None:
@@ -447,13 +502,11 @@ async def test_skipped_summary_is_not_selected(tmp_path: Path) -> None:
         {"role": "assistant", "content": "a", "kind": "normal"},
         {"role": "user", "content": "more", "kind": "normal"},
     )
-    hidden = await add_summary(
-        session_id, "hidden summary", head[-1].id, _hash("hidden"), skipped=True
-    )
+    await add_summary(session_id, "hidden summary", head[-1].id, _hash("hidden"), skipped=True)
     async with session_factory() as db:
         rows = await load_context_rows(db, session_id)
-    # The hidden summary is not usable: raw history (including the hidden row) returns.
-    assert [row.id for row in rows] == [*[m.id for m in head], hidden.id]
+    # The hidden summary is not usable: raw history returns without it.
+    assert [row.id for row in rows] == [m.id for m in head]
 
 
 async def test_summary_covers_skipped_row_is_not_selected(tmp_path: Path) -> None:
@@ -470,11 +523,11 @@ async def test_summary_covers_skipped_row_is_not_selected(tmp_path: Path) -> Non
         assert row is not None
         row.skipped = True
         await db.commit()
-    bad = await add_summary(session_id, "covers skipped", head[2].id, _hash("bad"))
+    await add_summary(session_id, "covers skipped", head[2].id, _hash("bad"))
     async with session_factory() as db:
         rows = await load_context_rows(db, session_id)
-    # The only summary targets a hidden row → unusable; all rows are returned.
-    assert [row.id for row in rows] == [*[m.id for m in head], bad.id]
+    # The only summary targets a hidden row → unusable; all source rows return without it.
+    assert [row.id for row in rows] == [m.id for m in head]
 
 
 async def test_summary_covers_skipped_row_falls_to_valid(tmp_path: Path) -> None:
@@ -543,7 +596,9 @@ async def test_valid_summary_still_selected(tmp_path: Path) -> None:
         session_id, "visible summary", head[-1].id, _hash("visible"), model_id="main"
     )
     # A hidden summary with the same coverage but a later id must not win.
-    await add_summary(session_id, "hidden duplicate", head[-1].id, _hash("hidden"), skipped=True)
+    await add_summary(
+        session_id, "hidden duplicate", head[-1].id, _hash("hidden"), skipped=True, exact_hash=True
+    )
     async with session_factory() as db:
         rows = await load_context_rows(db, session_id)
     assert [row.id for row in rows] == [head[0].id, head[1].id, checkpoint_id]
@@ -702,7 +757,7 @@ async def test_concurrent_load_returns_stable_projection(tmp_path: Path) -> None
                 kind="summary",
                 content="sum",
                 covers_until=covered_id,
-                source_hash=_hash("cl"),
+                source_hash=await stored_source_hash(db, session.id, covered_id),
                 summary_version=SUMMARY_VERSION,
             )
             db.add(checkpoint)
