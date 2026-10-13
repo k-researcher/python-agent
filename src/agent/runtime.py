@@ -39,17 +39,45 @@ from agent.models import (
 from agent.queue import RedisTaskQueue
 from agent.reasoning import ReasoningDecision, decide
 from agent.sandbox import policy_from_settings
+from agent.session_fence import (
+    CURRENT_FENCE,
+    FenceLostError,
+    RunFence,
+    claim,
+    install_commit_guard,
+    new_generation,
+    release,
+    renew,
+    stop_generation,
+)
 from agent.session_service import create_session_record
 from agent.tools import ToolRegistry
 from agent.tools.base import ToolContext, ToolError
 
 logger = logging.getLogger(__name__)
 
+# Lease of the run owner, renewed every third of it. A lost lease cancels the run.
+FENCE_LEASE_SECONDS = 60.0
+
 TERMINAL_STATUSES = {
     SessionStatus.completed.value,
     SessionStatus.stopped.value,
     SessionStatus.error.value,
 }
+
+
+def _history_safe_call(call: dict[str, Any]) -> dict[str, Any]:
+    """Return the tool call with arguments that are valid JSON for the provider history."""
+    function = dict(call.get("function") or {})
+    try:
+        parsed = json.loads(function.get("arguments") or "{}")
+        valid = isinstance(parsed, dict)
+    except (TypeError, ValueError):
+        valid = False
+    if valid:
+        return call
+    function["arguments"] = "{}"
+    return {**call, "function": function}
 
 
 class AgentSupervisor:
@@ -65,14 +93,21 @@ class AgentSupervisor:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._semaphore = asyncio.Semaphore(settings.max_parallel_sessions)
         self.task_queue = RedisTaskQueue(settings) if settings.execution_mode == "redis" else None
+        install_commit_guard()
 
-    async def start(self, session_id: str) -> bool:
+    async def start(self, session_id: str, *, new_run: bool = True) -> bool:
+        """Schedule the session. A new run starts a new generation; a resume continues it."""
+        if self.task_queue is None:
+            task = self._tasks.get(session_id)
+            if task is not None and not task.done():
+                return False
+        if new_run:
+            async with session_factory() as db:
+                await new_generation(db, session_id)
+                await db.commit()
         if self.task_queue is not None:
             await self.task_queue.ensure_group()
             return await self.task_queue.enqueue(session_id)
-        task = self._tasks.get(session_id)
-        if task is not None and not task.done():
-            return False
         self._tasks[session_id] = asyncio.create_task(
             self._run_guarded(session_id), name=f"agent-session-{session_id}"
         )
@@ -108,7 +143,7 @@ class AgentSupervisor:
             session = await db.get(Session, session_id)
             if session is not None:
                 session.status = SessionStatus.stopped.value
-                session.stop_requested = True
+                await stop_generation(db, session_id)
                 cancelled = await self._cancel_unfinished_tool_calls(db, session_id)
                 await db.commit()
                 await emit_event(db, "session.status", {"status": session.status}, session_id)
@@ -283,17 +318,52 @@ class AgentSupervisor:
                 await emit_event(
                     db, "session.status", {"status": SessionStatus.pending.value}, session.id
                 )
-                await self.start(session.id)
+                await self.start(session.id, new_run=False)
             return session.id
 
     async def _run_guarded(self, session_id: str) -> None:
         async with self._semaphore:
+            async with session_factory() as db:
+                fence = await claim(db, session_id, lease_seconds=FENCE_LEASE_SECONDS)
+            if fence is None:
+                return  # terminal, stopped, or another executor owns the run
+            token = CURRENT_FENCE.set(fence)
+            run = asyncio.current_task()
+            keeper = asyncio.create_task(self._keep_lease(fence, run), name=f"lease-{session_id}")
             try:
                 await self._run(session_id)
             except asyncio.CancelledError:
                 raise
+            except FenceLostError:
+                logger.warning("Session %s: the run lost its fence and stops", session_id)
             except Exception as exc:
-                await self._mark_error(session_id, exc)
+                try:
+                    await self._mark_error(session_id, exc)
+                except FenceLostError:
+                    logger.warning("Session %s: error not recorded, the fence is lost", session_id)
+            finally:
+                keeper.cancel()
+                with suppress(asyncio.CancelledError):
+                    await keeper
+                CURRENT_FENCE.reset(token)
+                async with session_factory() as db:
+                    await release(db, fence)
+
+    async def _keep_lease(self, fence: RunFence, run: asyncio.Task[Any] | None) -> None:
+        """Renew the lease; cancel the run when the lease is lost (fail closed)."""
+        while True:
+            await asyncio.sleep(FENCE_LEASE_SECONDS / 3)
+            try:
+                async with session_factory() as db:
+                    db.sync_session.info["fence_exempt"] = True
+                    renewed = await renew(db, fence, lease_seconds=FENCE_LEASE_SECONDS)
+            except Exception:
+                logger.exception("Session %s: lease renewal failed", fence.session_id)
+                renewed = False
+            if not renewed:
+                if run is not None:
+                    run.cancel()
+                return
 
     async def _mark_error(self, session_id: str, exc: Exception) -> None:
         async with session_factory() as db:
@@ -385,9 +455,7 @@ class AgentSupervisor:
                     await db.execute(
                         update(Session)
                         .where(Session.id == session.id, Session.status.not_in(TERMINAL_STATUSES))
-                        .values(
-                            status=SessionStatus.running.value, error=None, stop_requested=False
-                        )
+                        .values(status=SessionStatus.running.value, error=None)
                     ),
                 )
                 await db.commit()
@@ -432,12 +500,36 @@ class AgentSupervisor:
                     {**dict(raw_call), "id": f"call_{uuid.uuid4().hex}"}
                     for raw_call in response.tool_calls
                 ]
+                if response.finish_reason == "length":
+                    # The output limit cut the reply. It is not a result: keep the partial text
+                    # for diagnosis (kind "interrupted" never reaches the model), run no tool
+                    # call from it, and stop with advice. No hidden second request.
+                    db.add(
+                        Message(
+                            session_id=session.id,
+                            role="assistant",
+                            kind="interrupted",
+                            content=response.content,
+                            tool_calls=[_history_safe_call(c) for c in normalized_calls] or None,
+                            token_count=response.completion_tokens or None,
+                            reasoning_content=response.reasoning,
+                            reasoning_effort=reasoning_effort,
+                        )
+                    )
+                    await db.commit()
+                    raise ToolError(
+                        "The model reply was cut off by the output limit, so it was not used "
+                        "and no tool ran. Ask for smaller steps, for example write a large "
+                        "file in parts."
+                    )
 
                 assistant = Message(
                     session_id=session.id,
                     role="assistant",
                     content=response.content,
-                    tool_calls=normalized_calls or None,
+                    # The provider rejects a history with invalid JSON arguments, so the stored
+                    # copy carries "{}" for them; the tool result reports the real problem.
+                    tool_calls=[_history_safe_call(call) for call in normalized_calls] or None,
                     token_count=response.completion_tokens or None,
                     reasoning_content=response.reasoning,
                     reasoning_effort=reasoning_effort,
