@@ -130,7 +130,12 @@ async def test_truncation_retry_stays_inside_the_context_window(tmp_path: Path) 
     small = model("small", window=16_000, max_tokens=2_000)
     client = ScriptedClient([LLMResponse("cut", [], "length", 1, 1)] * 3)
     inference = ContextInference(
-        session_id, 0, [], registry(small), lambda _model: client, inference_decision,
+        session_id,
+        0,
+        [],
+        registry(small),
+        lambda _model: client,
+        inference_decision,
     )
     result = await inference.run(small)
     assert result.response.content == "cut"
