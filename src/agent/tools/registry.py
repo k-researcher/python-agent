@@ -8,7 +8,10 @@ from agent.config import Settings
 from agent.tools.advanced import advanced_tools
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 from agent.tools.builtin import BUILTIN_TOOLS
+from agent.tools.git_tools import GitDiffTool, GitLogTool, GitShowTool, GitStatusTool
 from agent.tools.knowledge import knowledge_tools
+from agent.tools.patch_tools import ApplyPatchTool, EditByLinesTool
+from agent.tools.web_fetch import WebFetchTool
 
 
 class ToolRegistry:
@@ -21,7 +24,14 @@ class ToolRegistry:
         if tools is None:
             tools = (
                 *BUILTIN_TOOLS,
+                ApplyPatchTool(),
+                EditByLinesTool(),
+                GitStatusTool(),
+                GitDiffTool(),
+                GitLogTool(),
+                GitShowTool(),
                 *advanced_tools(self.settings),
+                WebFetchTool(self.settings),
                 *knowledge_tools(self.settings),
             )
         self._tools = {tool.name: tool for tool in tools}

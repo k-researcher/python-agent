@@ -35,6 +35,10 @@ def test_ask_definitions_are_read_only() -> None:
         "search_files",
         "glob",
         "read_many",
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_show",
         "excel_read",
         "excel_sheets",
     } == names

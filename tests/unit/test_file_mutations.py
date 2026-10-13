@@ -612,3 +612,92 @@ def test_edit_many_detects_conflict_when_file_removed(
 
     assert not target.exists()
     assert not list(project.iterdir())
+
+
+def test_replace_if_unchanged_replaces_matching_content(
+    project: Path, filesystem: SafeProjectFS
+) -> None:
+    (project / "notes.txt").write_text("old", encoding="utf-8")
+
+    assert filesystem.replace_if_unchanged("notes.txt", "old", "new") == Path("notes.txt")
+    assert (project / "notes.txt").read_text(encoding="utf-8") == "new"
+
+
+def test_replace_if_unchanged_conflict_on_mismatch(
+    project: Path, filesystem: SafeProjectFS
+) -> None:
+    (project / "notes.txt").write_text("old", encoding="utf-8")
+    (project / "other.txt").write_text("x", encoding="utf-8")
+
+    with pytest.raises(ToolError, match="conflict"):
+        filesystem.replace_if_unchanged("notes.txt", "different", "new")
+
+    # Nothing written; content unchanged.
+    assert (project / "notes.txt").read_text(encoding="utf-8") == "old"
+    assert sorted(item.name for item in project.iterdir()) == ["notes.txt", "other.txt"]
+
+
+def test_replace_if_unchanged_handles_empty_expected(
+    project: Path, filesystem: SafeProjectFS
+) -> None:
+    (project / "empty.txt").touch()
+
+    assert filesystem.replace_if_unchanged("empty.txt", "", "hello\n") == Path("empty.txt")
+    assert (project / "empty.txt").read_text(encoding="utf-8") == "hello\n"
+
+
+def test_replace_if_unchanged_detects_change_between_read_and_write(
+    project: Path, filesystem: SafeProjectFS, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = project / "notes.txt"
+    target.write_text("old", encoding="utf-8")
+    real_file_stat = SafeProjectFS._file_stat
+    calls = {"count": 0}
+
+    def change_before_replace(
+        self: SafeProjectFS, name: str, parent_fd: int
+    ) -> os.stat_result | None:
+        calls["count"] += 1
+        if calls["count"] == 2:
+            target.write_text("concurrent update", encoding="utf-8")
+        return real_file_stat(self, name, parent_fd)
+
+    monkeypatch.setattr(SafeProjectFS, "_file_stat", change_before_replace)
+
+    with pytest.raises(ToolError, match="conflict"):
+        filesystem.replace_if_unchanged("notes.txt", "old", "new")
+
+    assert target.read_text(encoding="utf-8") == "concurrent update"
+    assert sorted(item.name for item in project.iterdir()) == ["notes.txt"]
+
+
+def test_exists_returns_true_for_existing_file(project: Path, filesystem: SafeProjectFS) -> None:
+    (project / "notes.txt").write_text("old", encoding="utf-8")
+
+    assert filesystem.exists("notes.txt")
+
+
+def test_exists_returns_false_for_missing_file(project: Path, filesystem: SafeProjectFS) -> None:
+    assert not filesystem.exists("missing.txt")
+
+
+def test_exists_returns_false_for_missing_parent_dir(
+    project: Path, filesystem: SafeProjectFS
+) -> None:
+    assert not filesystem.exists("nested/deeper/missing.txt")
+
+
+def test_exists_returns_true_for_symlink_target_and_refuses_symlink(
+    project: Path, filesystem: SafeProjectFS
+) -> None:
+    (project / "target.txt").write_text("data", encoding="utf-8")
+    (project / "link.txt").symlink_to(project / "target.txt")
+
+    # A real file exists.
+    assert filesystem.exists("target.txt")
+    # A dangling path does not exist.
+    assert not filesystem.exists("none.txt")
+    # A symlink is treated as not existing at the safe layer (or raises a
+    # security error); either way it is not a usable regular file.
+    with pytest.raises(PathSecurityError, match="Symlink"):
+        filesystem.exists("link.txt")

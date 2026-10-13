@@ -96,6 +96,35 @@ class SafeProjectFS:
             self._sync_directory(parent_fd)
         return relative
 
+    def exists(self, path: str) -> bool:
+        """Return whether the file exists without following symlinks.
+
+        Returns ``False`` when the file or any parent directory is missing or
+        cannot be safely opened.
+        """
+        relative = self._relative_path(path)
+        try:
+            with self._parent(relative) as (parent_fd, name):
+                return self._file_stat(name, parent_fd) is not None
+        except ToolError:
+            return False
+
+    def replace_if_unchanged(self, path: str, expected: str, new: str) -> Path:
+        """Atomically replace the file content only if it equals ``expected``.
+
+        Reads the file once and compares it to ``expected``; raises
+        :class:`ToolError` (\"File changed (conflict)\") on mismatch. Writes via
+        :meth:`_replace_text` with ``check_conflict=True`` to guard against a
+        concurrent change between the read and the replace.
+        """
+        relative = self._relative_path(path)
+        with self._parent(relative) as (parent_fd, name):
+            content, existing = self._read_regular(name, parent_fd, _MAX_EDIT_BYTES)
+            if content != expected:
+                raise ToolError("File changed (conflict)")
+            self._replace_text(name, parent_fd, new, existing, check_conflict=True)
+        return relative
+
     def _relative_path(self, value: str) -> Path:
         if "\0" in value:
             raise PathSecurityError("NUL is not allowed in file paths")
