@@ -22,6 +22,7 @@ from agent.context_manager import ContextManager
 from agent.database import session_factory
 from agent.events import emit_event
 from agent.llm import LLMClient
+from agent.message_tree import append_message
 from agent.model_config import ModelConfigError, ResolvedModel, ResolvedModelRegistry
 from agent.model_registry import effective_registry, select_model
 from agent.models import (
@@ -181,13 +182,12 @@ class AgentSupervisor:
                 call.approval.comment = "Session was stopped"
             call.status = ToolCallStatus.cancelled.value
             call.result = {"success": False, "error": "Cancelled because the session was stopped"}
-            db.add(
-                Message(
-                    session_id=session_id,
-                    role="tool",
-                    tool_call_id=call.id,
-                    content=json.dumps(call.result, ensure_ascii=False),
-                )
+            await append_message(
+                db,
+                session_id,
+                role="tool",
+                tool_call_id=call.id,
+                content=json.dumps(call.result, ensure_ascii=False),
             )
             cancelled.append(call.id)
         return cancelled
@@ -270,13 +270,12 @@ class AgentSupervisor:
                 .execution_options(synchronize_session=False)
             )
             if result is not None:
-                db.add(
-                    Message(
-                        session_id=session.id,
-                        role="tool",
-                        tool_call_id=call.id,
-                        content=json.dumps(result, ensure_ascii=False),
-                    )
+                await append_message(
+                    db,
+                    session.id,
+                    role="tool",
+                    tool_call_id=call.id,
+                    content=json.dumps(result, ensure_ascii=False),
                 )
             await db.commit()
 
@@ -523,8 +522,9 @@ class AgentSupervisor:
                         "file in parts."
                     )
 
-                assistant = Message(
-                    session_id=session.id,
+                assistant = await append_message(
+                    db,
+                    session.id,
                     role="assistant",
                     content=response.content,
                     # The provider rejects a history with invalid JSON arguments, so the stored
@@ -534,8 +534,6 @@ class AgentSupervisor:
                     reasoning_content=response.reasoning,
                     reasoning_effort=reasoning_effort,
                 )
-                db.add(assistant)
-                await db.flush()
 
                 if not normalized_calls:
                     await db.commit()
@@ -585,13 +583,12 @@ class AgentSupervisor:
                             result={"success": False, "error": str(exc)},
                         )
                         db.add(call)
-                        db.add(
-                            Message(
-                                session_id=session.id,
-                                role="tool",
-                                tool_call_id=call_id,
-                                content=json.dumps(call.result, ensure_ascii=False),
-                            )
+                        await append_message(
+                            db,
+                            session.id,
+                            role="tool",
+                            tool_call_id=call_id,
+                            content=json.dumps(call.result, ensure_ascii=False),
                         )
                         continue
 
@@ -659,13 +656,12 @@ class AgentSupervisor:
                         "to avoid repeating a possible side effect"
                     ),
                 }
-                db.add(
-                    Message(
-                        session_id=session.id,
-                        role="tool",
-                        tool_call_id=call.id,
-                        content=json.dumps(call.result, ensure_ascii=False),
-                    )
+                await append_message(
+                    db,
+                    session.id,
+                    role="tool",
+                    tool_call_id=call.id,
+                    content=json.dumps(call.result, ensure_ascii=False),
                 )
                 await db.commit()
                 processed = True
@@ -738,13 +734,12 @@ class AgentSupervisor:
             result = {"success": False, "error": str(exc)}
             call.status = ToolCallStatus.error.value
         call.result = result
-        db.add(
-            Message(
-                session_id=session.id,
-                role="tool",
-                tool_call_id=call.id,
-                content=json.dumps(result, ensure_ascii=False),
-            )
+        await append_message(
+            db,
+            session.id,
+            role="tool",
+            tool_call_id=call.id,
+            content=json.dumps(result, ensure_ascii=False),
         )
         await db.commit()
         await emit_event(

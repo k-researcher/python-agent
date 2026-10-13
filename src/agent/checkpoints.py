@@ -127,11 +127,14 @@ async def _best_checkpoint(db: AsyncSession, session_id: str) -> Message | None:
 async def _is_usable_checkpoint(db: AsyncSession, session_id: str, message: Message) -> bool:
     """Return True when a stored checkpoint row carries well-formed metadata.
 
-    Rejects whitespace-only text, non-hex or wrong-length source hashes and
-    coverage that does not point to a real source (non-summary) message of the
-    same session. The covered message must be older than the checkpoint row: a
-    checkpoint is always saved after the messages that it covers.
+    Rejects skipped/hidden summary rows, whitespace-only text, non-hex or
+    wrong-length source hashes and coverage that does not point to an active
+    (kind == "normal", skipped == False) source message of the same session.
+    The covered message must be older than the checkpoint row: a checkpoint is
+    always saved after the messages that it covers.
     """
+    if message.skipped:
+        return False
     if not message.content or not message.content.strip():
         return False
     if not message.source_hash or not _HEX64.fullmatch(message.source_hash):
@@ -142,7 +145,8 @@ async def _is_usable_checkpoint(db: AsyncSession, session_id: str, message: Mess
         select(Message.id).where(
             Message.id == message.covers_until,
             Message.session_id == session_id,
-            Message.kind != "summary",
+            Message.kind == "normal",
+            Message.skipped.is_(False),
         )
     )
     return covered is not None and covered < message.id

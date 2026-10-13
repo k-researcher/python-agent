@@ -69,6 +69,7 @@ async def add_summary(
     source_hash: str,
     *,
     version: int = SUMMARY_VERSION,
+    skipped: bool = False,
 ) -> Message:
     """Insert a raw summary row directly, bypassing save-time validation."""
     async with session_factory() as db:
@@ -80,6 +81,7 @@ async def add_summary(
             covers_until=covers_until,
             source_hash=source_hash,
             summary_version=version,
+            skipped=skipped,
         )
         db.add(message)
         await db.commit()
@@ -434,6 +436,117 @@ async def test_non_existent_coverage_falls_back_to_full_history(tmp_path: Path) 
     async with session_factory() as db:
         rows = await load_context_rows(db, session_id)
     assert [row.id for row in rows] == [*[m.id for m in head], bad.id]
+
+
+async def test_skipped_summary_is_not_selected(tmp_path: Path) -> None:
+    session_id = await make_session(tmp_path)
+    head = await add_messages(
+        session_id,
+        {"role": "system", "content": "sys", "kind": "normal"},
+        {"role": "user", "content": "task", "kind": "normal"},
+        {"role": "assistant", "content": "a", "kind": "normal"},
+        {"role": "user", "content": "more", "kind": "normal"},
+    )
+    hidden = await add_summary(
+        session_id, "hidden summary", head[-1].id, _hash("hidden"), skipped=True
+    )
+    async with session_factory() as db:
+        rows = await load_context_rows(db, session_id)
+    # The hidden summary is not usable: raw history (including the hidden row) returns.
+    assert [row.id for row in rows] == [*[m.id for m in head], hidden.id]
+
+
+async def test_summary_covers_skipped_row_is_not_selected(tmp_path: Path) -> None:
+    session_id = await make_session(tmp_path)
+    head = await add_messages(
+        session_id,
+        {"role": "system", "content": "sys", "kind": "normal"},
+        {"role": "user", "content": "task", "kind": "normal"},
+        {"role": "assistant", "content": "a", "kind": "normal"},
+        {"role": "user", "content": "more", "kind": "normal"},
+    )
+    async with session_factory() as db:
+        row = await db.get(Message, head[2].id)
+        assert row is not None
+        row.skipped = True
+        await db.commit()
+    bad = await add_summary(session_id, "covers skipped", head[2].id, _hash("bad"))
+    async with session_factory() as db:
+        rows = await load_context_rows(db, session_id)
+    # The only summary targets a hidden row → unusable; all rows are returned.
+    assert [row.id for row in rows] == [*[m.id for m in head], bad.id]
+
+
+async def test_summary_covers_skipped_row_falls_to_valid(tmp_path: Path) -> None:
+    session_id = await make_session(tmp_path)
+    head = await add_messages(
+        session_id,
+        {"role": "system", "content": "sys", "kind": "normal"},
+        {"role": "user", "content": "task", "kind": "normal"},
+        {"role": "assistant", "content": "a", "kind": "normal"},
+        {"role": "user", "content": "more", "kind": "normal"},
+    )
+    async with session_factory() as db:
+        row = await db.get(Message, head[2].id)
+        assert row is not None
+        row.skipped = True
+        await db.commit()
+    valid_id = await _save(session_id, "valid", head[1].id, _hash("valid"), model_id=None)
+    # The larger-coverage candidate covers a hidden row → skipped; valid wins.
+    await add_summary(session_id, "covers skipped", head[2].id, _hash("bad"))
+    async with session_factory() as db:
+        rows = await load_context_rows(db, session_id)
+    assert [row.id for row in rows] == [
+        head[0].id,
+        head[1].id,
+        valid_id,
+        head[2].id,
+        head[3].id,
+    ]
+
+
+async def test_best_summary_skipped_falls_to_second(tmp_path: Path) -> None:
+    session_id = await make_session(tmp_path)
+    head = await add_messages(
+        session_id,
+        {"role": "system", "content": "sys", "kind": "normal"},
+        {"role": "user", "content": "task", "kind": "normal"},
+        {"role": "assistant", "content": "a", "kind": "normal"},
+        {"role": "user", "content": "more", "kind": "normal"},
+    )
+    small_id = await _save(session_id, "small", head[1].id, _hash("small"), model_id=None)
+    # The larger-coverage candidate is hidden → not chosen.
+    hidden_id = await add_summary(
+        session_id, "hidden large", head[-1].id, _hash("hidden"), skipped=True
+    )
+    async with session_factory() as db:
+        rows = await load_context_rows(db, session_id)
+    assert hidden_id not in [row.id for row in rows]
+    assert [row.id for row in rows] == [
+        head[0].id,
+        head[1].id,
+        small_id,
+        head[2].id,
+        head[3].id,
+    ]
+
+
+async def test_valid_summary_still_selected(tmp_path: Path) -> None:
+    session_id = await make_session(tmp_path)
+    head = await add_messages(
+        session_id,
+        {"role": "system", "content": "sys", "kind": "normal"},
+        {"role": "user", "content": "task", "kind": "normal"},
+        {"role": "assistant", "content": "a", "kind": "normal"},
+    )
+    checkpoint_id = await _save(
+        session_id, "visible summary", head[-1].id, _hash("visible"), model_id="main"
+    )
+    # A hidden summary with the same coverage but a later id must not win.
+    await add_summary(session_id, "hidden duplicate", head[-1].id, _hash("hidden"), skipped=True)
+    async with session_factory() as db:
+        rows = await load_context_rows(db, session_id)
+    assert [row.id for row in rows] == [head[0].id, head[1].id, checkpoint_id]
 
 
 async def test_covers_until_referencing_summary_raises(tmp_path: Path) -> None:

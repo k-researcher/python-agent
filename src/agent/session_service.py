@@ -5,8 +5,9 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.config import Settings
+from agent.message_tree import append_message
 from agent.model_registry import effective_registry, select_model
-from agent.models import Message, Project, Session, SessionStatus
+from agent.models import Project, Session, SessionStatus
 from agent.reasoning import validate_effort
 
 
@@ -43,12 +44,9 @@ async def create_session_record(
     )
     db.add(session)
     await db.flush()
-    db.add_all(
-        [
-            Message(session_id=session.id, role="system", content=system_prompt),
-            Message(session_id=session.id, role="user", content=prompt),
-        ]
-    )
+    # Explicit parents: the system prompt is the root, the task is its child.
+    await append_message(db, session.id, role="system", content=system_prompt)
+    await append_message(db, session.id, role="user", content=prompt)
     await db.commit()
     await db.refresh(session)
     return session
