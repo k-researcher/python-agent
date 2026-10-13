@@ -18,6 +18,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -28,6 +29,10 @@ def new_id() -> str:
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+BOOTSTRAP_USER_ID = "00000000-0000-0000-0000-000000000001"
+DEFAULT_WORKSPACE_ID = "00000000-0000-0000-0000-000000000002"
 
 
 class SessionStatus(enum.StrEnum):
@@ -61,12 +66,66 @@ class Base(DeclarativeBase):
     pass
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    display_name: Mapped[str] = mapped_column(String(200))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_operator: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Workspace(Base):
+    __tablename__ = "workspaces"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class WorkspaceMembership(Base):
+    __tablename__ = "workspace_memberships"
+    __table_args__ = (
+        PrimaryKeyConstraint("workspace_id", "user_id", name="pk_workspace_memberships"),
+        CheckConstraint(
+            "role IN ('owner', 'admin', 'member', 'viewer')",
+            name="ck_workspace_memberships_role",
+        ),
+        Index(
+            "uq_workspace_memberships_active_owner",
+            "workspace_id",
+            unique=True,
+            sqlite_where=text("role = 'owner' AND revoked_at IS NULL"),
+            postgresql_where=text("role = 'owner' AND revoked_at IS NULL"),
+        ),
+    )
+
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "workspaces.id", ondelete="CASCADE", name="fk_workspace_memberships_workspace_id"
+        )
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE", name="fk_workspace_memberships_user_id")
+    )
+    role: Mapped[str] = mapped_column(String(20))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Project(Base):
     __tablename__ = "projects"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     name: Mapped[str] = mapped_column(String(200))
     root_path: Mapped[str] = mapped_column(String(4096), unique=True)
+    workspace_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="RESTRICT", name="fk_projects_workspace_id"),
+        nullable=True,
+        index=True,
+        default=None,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     sessions: Mapped[list[Session]] = relationship(back_populates="project")
@@ -78,6 +137,12 @@ class Session(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="RESTRICT"))
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT", name="fk_sessions_created_by_user_id"),
+        nullable=True,
+        index=True,
+        default=None,
+    )
     parent_id: Mapped[str | None] = mapped_column(
         ForeignKey("sessions.id"), nullable=True, index=True
     )
@@ -88,6 +153,10 @@ class Session(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     archived: Mapped[bool] = mapped_column(Boolean, default=False)
     stop_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    run_generation: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    owner_epoch: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    owner_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     configuration: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -124,6 +193,7 @@ class Message(Base):
             name="uq_messages_summary_checkpoint",
         ),
         Index("ix_messages_session_id_id", "session_id", "id"),
+        Index("ix_messages_session_parent_id", "session_id", "parent_id"),
         Index("ix_messages_session_kind_coverage", "session_id", "kind", "covers_until", "id"),
     )
 
@@ -132,6 +202,10 @@ class Message(Base):
         ForeignKey("sessions.id", ondelete="CASCADE"), index=True
     )
     role: Mapped[str] = mapped_column(String(30))
+    parent_id: Mapped[int | None] = mapped_column(
+        ForeignKey("messages.id", name="fk_messages_parent_id_messages", ondelete="SET NULL"),
+        nullable=True,
+    )
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     tool_call_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     tool_calls: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
@@ -280,6 +354,12 @@ class AuthSession(Base):
     __tablename__ = "auth_sessions"
 
     id_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT", name="fk_auth_sessions_user_id"),
+        nullable=True,
+        index=True,
+        default=None,
+    )
     csrf_token: Mapped[str] = mapped_column(String(64))
     user_agent: Mapped[str] = mapped_column(String(512), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -294,6 +374,12 @@ class AuthBootstrapCode(Base):
     __tablename__ = "auth_bootstrap_codes"
 
     code_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT", name="fk_auth_bootstrap_codes_user_id"),
+        nullable=True,
+        index=True,
+        default=None,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
