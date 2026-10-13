@@ -20,7 +20,7 @@ import random
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -871,3 +871,91 @@ async def test_edit_skipped_message_is_rejected(tmp_path: Path) -> None:
             await edit_message(db, session_id, u1_id, "no")
         assert exc.value.status == 409
         await db.rollback()
+
+
+async def _two_turn_session(tmp_path: Path, **lease: Any) -> tuple[str, int, int]:
+    """Return a session with user + assistant rows and the given owner/lease values."""
+    session_id = await new_session(tmp_path)
+    async with session_factory() as db:
+        user = await append_message(db, session_id, role="user", content="u1")
+        assistant = await append_message(db, session_id, role="assistant", content="a1")
+        await db.execute(update(Session).where(Session.id == session_id).values(**lease))
+        await db.commit()
+        return session_id, user.id, assistant.id
+
+
+async def _state(session_id: str) -> tuple[int, int, int]:
+    async with session_factory() as db:
+        generation = await db.scalar(select(Session.run_generation).where(Session.id == session_id))
+        sessions = await db.scalar(select(func.count()).select_from(Session))
+        messages = await db.scalar(select(func.count()).select_from(Message))
+        return int(generation or 0), int(sessions or 0), int(messages or 0)
+
+
+@pytest.mark.parametrize("operation", ["edit", "regenerate", "switch"])
+async def test_expired_lease_on_cached_session_allows_tree_change(
+    tmp_path: Path, operation: str
+) -> None:
+    expired = datetime.now(UTC) - timedelta(minutes=5)
+    session_id, user_id, assistant_id = await _two_turn_session(
+        tmp_path, owner_token="stale-owner", lease_until=expired
+    )
+    async with session_factory() as db:
+        cached = await db.get(Session, session_id)  # SQLite returns a naive datetime here
+        assert cached is not None and cached.lease_until is not None
+        if operation == "edit":
+            await edit_message(db, session_id, user_id, "u2")
+        elif operation == "regenerate":
+            await regenerate(db, session_id, assistant_id)
+        else:
+            await switch_branch(db, session_id, assistant_id)
+        await db.commit()
+        assert cached.owner_token is None  # the cached row is refreshed after the claim
+    generation, _sessions, _messages = await _state(session_id)
+    assert generation == 1
+
+
+@pytest.mark.parametrize("operation", ["edit", "fork"])
+async def test_unknown_lease_keeps_session_busy(tmp_path: Path, operation: str) -> None:
+    # An owner without a lease end is not proven gone: refuse and change nothing.
+    session_id, user_id, assistant_id = await _two_turn_session(
+        tmp_path, owner_token="unknown-owner", lease_until=None
+    )
+    before = await _state(session_id)
+    async with session_factory() as db:
+        with pytest.raises(TreeError) as error:
+            if operation == "edit":
+                await edit_message(db, session_id, user_id, "u2")
+            else:
+                await fork(db, session_id, assistant_id, title="copy")
+        assert error.value.status == 409
+        await db.rollback()
+    assert await _state(session_id) == before
+
+
+async def test_regenerate_validates_effort_against_fresh_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    models_file = tmp_path / "models.yaml"
+    models_file.write_text(_MODELS_WITH_EFFORT, encoding="utf-8")
+    monkeypatch.setattr(get_settings(), "models_file", models_file, raising=False)
+    session_id, _user_id, assistant_id = await _two_turn_session(tmp_path, llm_profile="smart")
+    before = await _state(session_id)
+    rows_before = [(row.id, row.skipped) for row in await read_rows(session_id)]
+    async with session_factory() as db:
+        cached = await db.get(Session, session_id)
+        assert cached is not None and cached.llm_profile == "smart"
+        # Another writer changes the profile to a model without reasoning control.
+        async with session_factory() as other:
+            await other.execute(
+                update(Session).where(Session.id == session_id).values(llm_profile="basic")
+            )
+            await other.commit()
+        with pytest.raises(ValueError):
+            await regenerate(db, session_id, assistant_id, reasoning_effort="medium")
+        await db.rollback()
+    assert await _state(session_id) == before
+    assert [(row.id, row.skipped) for row in await read_rows(session_id)] == rows_before
+    async with session_factory() as db:
+        status = await db.scalar(select(Session.status).where(Session.id == session_id))
+    assert status == SessionStatus.completed.value

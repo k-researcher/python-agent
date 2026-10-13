@@ -127,15 +127,28 @@ async def _claim_idle(db: AsyncSession, session_id: str, *, start_run: bool) -> 
         .where(
             Session.id == session_id,
             Session.status.in_(IDLE_STATUSES),
-            sa.or_(Session.owner_token.is_(None), Session.lease_until < datetime.now(UTC)),
+            # Free: no owner, or an owner whose lease is known and expired. An owner with an
+            # unknown (NULL) lease is not proven gone, so the session stays busy.
+            sa.or_(
+                Session.owner_token.is_(None),
+                sa.and_(
+                    Session.lease_until.is_not(None),
+                    Session.lease_until < datetime.now(UTC),
+                ),
+            ),
         )
-        .values(**values),
+        .values(**values)
+        # The database evaluates the condition. The ORM must not evaluate it in Python on a
+        # cached row: SQLite gives naive datetimes, and the comparison would fail.
+        .execution_options(synchronize_session=False),
     )
     if claimed != 1:
         exists = await db.scalar(sa.select(Session.id).where(Session.id == session_id))
         if exists is None:
             raise TreeError("Session not found", 404)
         raise TreeError("The session is busy; wait until it finishes or stop it", 409)
+    # Refresh a cached Session row: the update above did not synchronize it.
+    await db.get(Session, session_id, populate_existing=True)
 
 
 async def _active_message(db: AsyncSession, session_id: str, message_id: int) -> Message:
@@ -234,12 +247,16 @@ async def regenerate(
 
     The turn restarts from the nearest user ancestor: a copy of that user row is added next to it,
     so the old answer stays available as a sibling branch. Overrides apply to the new run. The
-    requested model profile and reasoning effort are validated up front, the same way
-    ``add_message`` does, so an invalid choice raises ``ValueError`` before the tree changes or a
-    run starts.
+    requested model profile and reasoning effort are validated the same way ``add_message`` does,
+    against the session state read after the claim; an invalid choice raises ``ValueError``
+    before the tree changes, and the caller rolls back the claim, so no run starts.
     """
     settings = get_settings()
-    session = await db.get(Session, session_id)
+    # Claim first, then validate against the state read after the claim, in the same
+    # transaction: a cached Session may carry an old model profile. The caller rolls back
+    # the claim when validation fails.
+    await _claim_idle(db, session_id, start_run=True)
+    session = await db.get(Session, session_id, populate_existing=True)
     if session is None:
         raise TreeError("Session not found", 404)
     models = await effective_registry(db, settings)
@@ -249,7 +266,6 @@ async def regenerate(
         model = select_model(models, session.llm_profile, strict=False)
     if reasoning_effort is not None:
         validate_effort(model, reasoning_effort)
-    await _claim_idle(db, session_id, start_run=True)
     target = await _active_message(db, session_id, message_id)
     if target.role != "assistant":
         raise TreeError("Only an assistant message can be regenerated", 409)
@@ -348,8 +364,9 @@ async def fork(
     lease = state.lease_until
     if lease is not None and lease.tzinfo is None:
         lease = lease.replace(tzinfo=UTC)
-    lease_alive = state.owner_token is not None and lease is not None and lease >= datetime.now(UTC)
-    if state.status not in IDLE_STATUSES or lease_alive:
+    # An owner with an unknown (NULL) lease is not proven gone: treat it as alive.
+    owner_alive = state.owner_token is not None and (lease is None or lease >= datetime.now(UTC))
+    if state.status not in IDLE_STATUSES or owner_alive:
         raise TreeError("The session is busy; wait until it finishes or stop it", 409)
     source = await db.get(Session, session_id, populate_existing=True)
     if source is None:
