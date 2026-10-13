@@ -72,23 +72,33 @@ async def _rowcount(db: AsyncSession, statement: sa.Executable) -> int:
 
 
 async def claim(
-    db: AsyncSession, session_id: str, *, lease_seconds: float, now: datetime | None = None
+    db: AsyncSession,
+    session_id: str,
+    *,
+    lease_seconds: float,
+    now: datetime | None = None,
+    expected_generation: int | None = None,
 ) -> RunFence | None:
     """Take the session run for this executor and commit; return None when it is not free.
 
     The run is free when the session is not terminal, no Stop is pending, and no owner
     holds an unexpired lease. The claim increments the owner epoch but keeps the generation.
+    With ``expected_generation``, the claim also requires that generation, in the same
+    conditional update: a run scheduled for an older generation cannot take a newer one.
     """
     moment = now or _now()
     token = str(uuid.uuid4())
+    conditions = [
+        _sessions.c.id == session_id,
+        _sessions.c.status.not_in(TERMINAL_STATUSES),
+        _sessions.c.stop_requested.is_(False),
+        sa.or_(_sessions.c.owner_token.is_(None), _sessions.c.lease_until < moment),
+    ]
+    if expected_generation is not None:
+        conditions.append(_sessions.c.run_generation == expected_generation)
     statement = (
         sa.update(_sessions)
-        .where(
-            _sessions.c.id == session_id,
-            _sessions.c.status.not_in(TERMINAL_STATUSES),
-            _sessions.c.stop_requested.is_(False),
-            sa.or_(_sessions.c.owner_token.is_(None), _sessions.c.lease_until < moment),
-        )
+        .where(*conditions)
         .values(
             owner_epoch=_sessions.c.owner_epoch + 1,
             owner_token=token,

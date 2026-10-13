@@ -92,30 +92,87 @@ class AgentSupervisor:
         self._retired_clients: list[LLMClient] = []
         self._last_models: ResolvedModelRegistry | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        # The generation that each task in _tasks was scheduled for (None: not known).
+        self._task_generation: dict[str, int | None] = {}
+        # Tasks of older generations that still finish, with their session; kept referenced
+        # until they end, and cancelled by Stop of the session and by shutdown.
+        self._finishing: dict[asyncio.Task[None], str] = {}
         self._semaphore = asyncio.Semaphore(settings.max_parallel_sessions)
         self.task_queue = RedisTaskQueue(settings) if settings.execution_mode == "redis" else None
         install_commit_guard()
 
-    async def start(self, session_id: str, *, new_run: bool = True) -> bool:
-        """Schedule the session. A new run starts a new generation; a resume continues it."""
+    async def start(
+        self,
+        session_id: str,
+        *,
+        new_run: bool = True,
+        expected_generation: int | None = None,
+    ) -> bool:
+        """Schedule the session. A new run starts a new generation; a resume continues it.
+
+        With ``expected_generation`` (a resume of a generation that the caller already
+        claimed), the contract is explicit:
+        - True: this generation is scheduled now, or it is already scheduled or running.
+        - False: the session no longer is at this generation (a Stop, a newer run, a
+          terminal state); nothing is scheduled.
+        A task of an older generation that is still finishing does not block the new
+        generation: the new run starts at once, and the fence stops the old task at its
+        next write. The old task is not cancelled here.
+        Without ``expected_generation`` the old behaviour stays: an alive task in this
+        process makes the call return False.
+        """
+        if expected_generation is not None and new_run:
+            # A new run makes a new generation, so it can never match the expected one.
+            raise ValueError("expected_generation needs new_run=False")
+        if expected_generation is not None and not await self._at_generation(
+            session_id, expected_generation
+        ):
+            return False
         if self.task_queue is None:
             task = self._tasks.get(session_id)
             if task is not None and not task.done():
-                return False
+                if expected_generation is None:
+                    return False
+                if self._task_generation.get(session_id) == expected_generation:
+                    return True
+                # Keep a reference until the older task ends.
+                self._finishing[task] = session_id
+                task.add_done_callback(lambda done: self._finishing.pop(done, None))
         if new_run:
             async with session_factory() as db:
                 await new_generation(db, session_id)
                 await db.commit()
         if self.task_queue is not None:
             await self.task_queue.ensure_group()
-            return await self.task_queue.enqueue(session_id)
+            queued = await self.task_queue.enqueue(session_id, generation=expected_generation)
+            # A duplicate of the same generation is already queued: it is not a lost run.
+            return queued or expected_generation is not None
         self._tasks[session_id] = asyncio.create_task(
-            self._run_guarded(session_id), name=f"agent-session-{session_id}"
+            self._run_guarded(session_id, expected_generation),
+            name=f"agent-session-{session_id}",
         )
+        self._task_generation[session_id] = expected_generation
         return True
 
-    async def run_job(self, session_id: str) -> None:
-        await self._run_guarded(session_id)
+    async def _at_generation(self, session_id: str, generation: int) -> bool:
+        """Return True when the session is still at this generation and no Stop is pending."""
+        async with session_factory() as db:
+            row = (
+                await db.execute(
+                    select(Session.run_generation, Session.stop_requested, Session.status).where(
+                        Session.id == session_id
+                    )
+                )
+            ).one_or_none()
+        return (
+            row is not None
+            and row.run_generation == generation
+            and not row.stop_requested
+            and row.status not in TERMINAL_STATUSES
+        )
+
+    async def run_job(self, session_id: str, generation: int | None = None) -> None:
+        await self._run_guarded(session_id, generation)
 
     async def infrastructure_status(self) -> dict[str, Any]:
         if self.task_queue is None:
@@ -124,11 +181,15 @@ class AgentSupervisor:
         return {"execution_mode": "redis", **status}
 
     async def stop(self, session_id: str) -> None:
-        task = self._tasks.get(session_id)
-        if task is not None and not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        own = [task for task, owner in self._finishing.items() if owner == session_id]
+        current = self._tasks.get(session_id)
+        if current is not None:
+            own.append(current)
+        for task in own:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
 
         async with session_factory() as db:
             children = list(
@@ -193,7 +254,7 @@ class AgentSupervisor:
         return cancelled
 
     async def shutdown(self) -> None:
-        tasks = [task for task in self._tasks.values() if not task.done()]
+        tasks = [task for task in [*self._tasks.values(), *self._finishing] if not task.done()]
         for task in tasks:
             task.cancel()
         if tasks:
@@ -320,10 +381,15 @@ class AgentSupervisor:
                 await self.start(session.id, new_run=False)
             return session.id
 
-    async def _run_guarded(self, session_id: str) -> None:
+    async def _run_guarded(self, session_id: str, generation: int | None = None) -> None:
         async with self._semaphore:
             async with session_factory() as db:
-                fence = await claim(db, session_id, lease_seconds=FENCE_LEASE_SECONDS)
+                fence = await claim(
+                    db,
+                    session_id,
+                    lease_seconds=FENCE_LEASE_SECONDS,
+                    expected_generation=generation,
+                )
             if fence is None:
                 return  # terminal, stopped, or another executor owns the run
             token = CURRENT_FENCE.set(fence)
