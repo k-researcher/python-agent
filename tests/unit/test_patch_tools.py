@@ -532,3 +532,254 @@ async def test_edit_by_lines_toctou_conflict(
         )
     # The externally-changed content must be left untouched.
     assert target.read_text() == "one\nTWO\nCHANGED\n"
+
+
+async def test_apply_patch_modify_between_passes_conflicts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file changed between pass one and pass two must not be overwritten."""
+    target = tmp_path / "hello.txt"
+    target.write_text("hello\nworld\n")
+    real_replace = SafeProjectFS.replace_if_unchanged
+    changed = {"flag": False}
+
+    def change_before_replace(self: SafeProjectFS, path: str, expected: str, new: str) -> Path:
+        if not changed["flag"] and path == "hello.txt":
+            changed["flag"] = True
+            # Simulate an external edit after pass one read the file.
+            target.write_text("hello\nWORLD-CHANGED\n")
+        return real_replace(self, path, expected, new)
+
+    monkeypatch.setattr(SafeProjectFS, "replace_if_unchanged", change_before_replace)
+
+    with pytest.raises(ToolError, match="conflict"):
+        await ApplyPatchTool().execute(_context(tmp_path), {"patch": _modify_diff()})
+    # The external content must be preserved, not overwritten by the patch.
+    assert target.read_text() == "hello\nWORLD-CHANGED\n"
+
+
+async def test_apply_patch_create_between_passes_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file created between pass one and pass two must not be overwritten."""
+    real_create = SafeProjectFS.create_text_exclusive
+
+    def create_after_check(self: SafeProjectFS, path: str, content: str) -> Path:
+        # Simulate a concurrent file appearing after pass one checked it.
+        (tmp_path / "new.txt").write_text("someone else\n")
+        return real_create(self, path, content)
+
+    monkeypatch.setattr(SafeProjectFS, "create_text_exclusive", create_after_check)
+
+    with pytest.raises(ToolError, match="already exists"):
+        await ApplyPatchTool().execute(_context(tmp_path), {"patch": _create_diff()})
+    # The foreign file must remain untouched.
+    assert (tmp_path / "new.txt").read_text() == "someone else\n"
+
+
+async def test_apply_patch_second_file_failure_restores_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write failure on the second file must roll back the first file."""
+    (tmp_path / "first.txt").write_text("one\n")
+    (tmp_path / "second.txt").write_text("two\n")
+    patch = (
+        "--- a/first.txt\n+++ b/first.txt\n@@ -1 +1 @@\n-one\n+ONE\n"
+        "--- a/second.txt\n+++ b/second.txt\n@@ -1 +1 @@\n-two\n+TWO\n"
+    )
+    real_replace = SafeProjectFS.replace_if_unchanged
+    calls = {"count": 0}
+
+    def fail_on_second(self: SafeProjectFS, path: str, expected: str, new: str) -> Path:
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise ToolError("injected write failure")
+        return real_replace(self, path, expected, new)
+
+    monkeypatch.setattr(SafeProjectFS, "replace_if_unchanged", fail_on_second)
+
+    with pytest.raises(ToolError, match="injected write failure"):
+        await ApplyPatchTool().execute(_context(tmp_path), {"patch": patch})
+    # The first file must be rolled back to its original content.
+    assert (tmp_path / "first.txt").read_text() == "one\n"
+    assert (tmp_path / "second.txt").read_text() == "two\n"
+
+
+async def test_apply_patch_deleted_file_restored_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file deleted in pass two must be restored when a later file fails."""
+    (tmp_path / "old.txt").write_text("gone1\ngone2\n")
+    (tmp_path / "second.txt").write_text("two\n")
+    patch = (
+        "--- a/old.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-gone1\n-gone2\n"
+        "--- a/second.txt\n+++ b/second.txt\n@@ -1 +1 @@\n-two\n+TWO\n"
+    )
+    real_replace = SafeProjectFS.replace_if_unchanged
+
+    def fail_on_second(self: SafeProjectFS, path: str, expected: str, new: str) -> Path:
+        if path == "second.txt":
+            raise ToolError("injected write failure")
+        return real_replace(self, path, expected, new)
+
+    monkeypatch.setattr(SafeProjectFS, "replace_if_unchanged", fail_on_second)
+
+    with pytest.raises(ToolError, match="injected write failure"):
+        await ApplyPatchTool().execute(_context(tmp_path), {"patch": patch})
+    # The deleted file must be recreated with its original content.
+    assert (tmp_path / "old.txt").read_text() == "gone1\ngone2\n"
+    assert (tmp_path / "second.txt").read_text() == "two\n"
+
+
+async def test_apply_patch_created_file_removed_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file created in pass two must be removed when a later file fails."""
+    (tmp_path / "second.txt").write_text("two\n")
+    patch = (
+        "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,1 @@\n+content\n"
+        "--- a/second.txt\n+++ b/second.txt\n@@ -1 +1 @@\n-two\n+TWO\n"
+    )
+    real_replace = SafeProjectFS.replace_if_unchanged
+
+    def fail_on_second(self: SafeProjectFS, path: str, expected: str, new: str) -> Path:
+        if path == "second.txt":
+            raise ToolError("injected write failure")
+        return real_replace(self, path, expected, new)
+
+    monkeypatch.setattr(SafeProjectFS, "replace_if_unchanged", fail_on_second)
+
+    with pytest.raises(ToolError, match="injected write failure"):
+        await ApplyPatchTool().execute(_context(tmp_path), {"patch": patch})
+    # The created file must be removed during rollback.
+    assert not (tmp_path / "new.txt").exists()
+    assert (tmp_path / "second.txt").read_text() == "two\n"
+
+
+async def test_apply_patch_rollback_failure_lists_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rollback failure must report which files remain changed."""
+    (tmp_path / "first.txt").write_text("one\n")
+    (tmp_path / "second.txt").write_text("two\n")
+    patch = (
+        "--- a/first.txt\n+++ b/first.txt\n@@ -1 +1 @@\n-one\n+ONE\n"
+        "--- a/second.txt\n+++ b/second.txt\n@@ -1 +1 @@\n-two\n+TWO\n"
+    )
+    real_replace = SafeProjectFS.replace_if_unchanged
+    calls = {"count": 0}
+
+    def fail_and_break_rollback(self: SafeProjectFS, path: str, expected: str, new: str) -> Path:
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise ToolError("injected write failure")
+        if calls["count"] == 3:
+            # Rollback of the first file itself fails.
+            raise ToolError("injected rollback failure")
+        return real_replace(self, path, expected, new)
+
+    monkeypatch.setattr(SafeProjectFS, "replace_if_unchanged", fail_and_break_rollback)
+
+    with pytest.raises(ToolError, match="Rollback failed for files"):
+        await ApplyPatchTool().execute(_context(tmp_path), {"patch": patch})
+    # The first file remains changed because the rollback failed.
+    assert (tmp_path / "first.txt").read_text() == "ONE\n"
+
+
+async def test_apply_patch_cyrillic_size_limit_counts_bytes(tmp_path: Path) -> None:
+    """The patch size limit must count UTF-8 bytes, not characters."""
+    cyrillic_excess = "я" * 100_001  # 100_001 chars = 200_002 bytes (2 bytes per char).
+    with pytest.raises(ToolError, match="bytes"):
+        await ApplyPatchTool().execute(_context(tmp_path), {"patch": cyrillic_excess})
+
+    # Exactly 100_000 Cyrillic chars = 200_000 bytes, within the limit.
+    cyrillic_boundary = "я" * 100_000
+    with pytest.raises(ToolError, match="Malformed patch"):
+        await ApplyPatchTool().execute(_context(tmp_path), {"patch": cyrillic_boundary})
+
+
+async def test_apply_patch_symlink_between_passes_triggers_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A symlink planted during pass two must roll back earlier files (defect D1)."""
+    outside = tmp_path / "victim.txt"
+    outside.write_text("secret\n")
+    (tmp_path / "first.txt").write_text("one\n")
+    (tmp_path / "second.txt").write_text("two\n")
+    patch = (
+        "--- a/first.txt\n+++ b/first.txt\n@@ -1 +1 @@\n-one\n+ONE\n"
+        "--- a/second.txt\n+++ b/second.txt\n@@ -1 +1 @@\n-two\n+TWO\n"
+    )
+    real_replace = SafeProjectFS.replace_if_unchanged
+    calls = {"count": 0}
+
+    def plant_symlink(self: SafeProjectFS, path: str, expected: str, new: str) -> Path:
+        calls["count"] += 1
+        if calls["count"] == 2:
+            # Replace the second file with a symlink between passes.
+            (tmp_path / "second.txt").unlink()
+            (tmp_path / "second.txt").symlink_to(outside)
+        return real_replace(self, path, expected, new)
+
+    monkeypatch.setattr(SafeProjectFS, "replace_if_unchanged", plant_symlink)
+
+    with pytest.raises(ToolError):
+        await ApplyPatchTool().execute(_context(tmp_path), {"patch": patch})
+    # The first file must be rolled back even though the second error is a
+    # PathSecurityError, not a ToolError.
+    assert (tmp_path / "first.txt").read_text() == "one\n"
+    assert (tmp_path / "second.txt").is_symlink()
+    assert outside.read_text() == "secret\n"
+
+
+async def test_apply_patch_rollback_does_not_overwrite_recreated_deleted_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rollback must not overwrite a deleted file recreated by another party (defect D2)."""
+    (tmp_path / "old.txt").write_text("gone1\ngone2\n")
+    (tmp_path / "second.txt").write_text("two\n")
+    patch = (
+        "--- a/old.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-gone1\n-gone2\n"
+        "--- a/second.txt\n+++ b/second.txt\n@@ -1 +1 @@\n-two\n+TWO\n"
+    )
+    real_replace = SafeProjectFS.replace_if_unchanged
+
+    def recreate_before_fail(self: SafeProjectFS, path: str, expected: str, new: str) -> Path:
+        if path == "second.txt":
+            # The deleted file is recreated with foreign content before rollback.
+            (tmp_path / "old.txt").write_text("someone else\n")
+            raise ToolError("injected write failure")
+        return real_replace(self, path, expected, new)
+
+    monkeypatch.setattr(SafeProjectFS, "replace_if_unchanged", recreate_before_fail)
+
+    with pytest.raises(ToolError, match="Rollback failed for files"):
+        await ApplyPatchTool().execute(_context(tmp_path), {"patch": patch})
+    # The foreign content must be preserved, not overwritten by rollback.
+    assert (tmp_path / "old.txt").read_text() == "someone else\n"
+
+
+async def test_apply_patch_rollback_does_not_delete_replaced_created_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rollback must not delete a created file replaced by another party (defect D3)."""
+    (tmp_path / "second.txt").write_text("two\n")
+    patch = (
+        "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,1 @@\n+content\n"
+        "--- a/second.txt\n+++ b/second.txt\n@@ -1 +1 @@\n-two\n+TWO\n"
+    )
+    real_replace = SafeProjectFS.replace_if_unchanged
+
+    def replace_before_fail(self: SafeProjectFS, path: str, expected: str, new: str) -> Path:
+        if path == "second.txt":
+            # The created file is replaced with foreign content before rollback.
+            (tmp_path / "new.txt").write_text("someone else\n")
+            raise ToolError("injected write failure")
+        return real_replace(self, path, expected, new)
+
+    monkeypatch.setattr(SafeProjectFS, "replace_if_unchanged", replace_before_fail)
+
+    with pytest.raises(ToolError, match="Rollback failed for files"):
+        await ApplyPatchTool().execute(_context(tmp_path), {"patch": patch})
+    # The foreign file must be preserved, not deleted by rollback.
+    assert (tmp_path / "new.txt").read_text() == "someone else\n"

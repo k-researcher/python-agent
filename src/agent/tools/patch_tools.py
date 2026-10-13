@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -205,6 +206,42 @@ def _try_read(fs: SafeProjectFS, path: str) -> str | None:
         raise
 
 
+def _rollback(fs: SafeProjectFS, applied: list[tuple[str, str, str | None, str | None]]) -> None:
+    """Restore files changed by a failed patch application.
+
+    Iterates the applied changes in reverse order. Each restore reverts a
+    modify only if the file still holds our new content, removes a created
+    file only if its content is still ours, and recreates a deleted file
+    only if the file is still absent. Raises :class:`ToolError` with the
+    list of files that could not be restored safely.
+    """
+    from agent.safe_fs import MissingFileError
+
+    failed: list[str] = []
+    for path, action, old_content, new_content in reversed(applied):
+        try:
+            if action == "modify":
+                if old_content is None:
+                    raise ToolError(f"{path}: modify has no original content")
+                if new_content is None:
+                    raise ToolError(f"{path}: modify has no new content")
+                fs.replace_if_unchanged(path, new_content, old_content)
+            elif action == "create":
+                if new_content is None:
+                    raise ToolError(f"{path}: create has no new content")
+                # An absent file means the create is already undone.
+                with suppress(MissingFileError):
+                    fs.remove_if_unchanged(path, new_content)
+            else:
+                if old_content is None:
+                    raise ToolError(f"{path}: delete has no original content")
+                fs.create_text_exclusive(path, old_content)
+        except (ToolError, PathSecurityError):
+            failed.append(path)
+    if failed:
+        raise ToolError("Rollback failed for files: " + ", ".join(failed))
+
+
 class ApplyPatchTool(Tool):
     name = "apply_patch"
     description = "Apply a unified diff to project files atomically."
@@ -221,8 +258,8 @@ class ApplyPatchTool(Tool):
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
         patch = str(arguments["patch"])
-        if len(patch) > _MAX_PATCH_BYTES:
-            raise ToolError(f"Patch exceeds {_MAX_PATCH_BYTES} characters")
+        if len(patch.encode("utf-8")) > _MAX_PATCH_BYTES:
+            raise ToolError(f"Patch exceeds {_MAX_PATCH_BYTES} bytes")
         patches = parse_unified_diff(patch)
         try:
             return await asyncio.to_thread(self._apply, context.project_root, patches)
@@ -234,20 +271,23 @@ class ApplyPatchTool(Tool):
         fs = _safe_fs(root)
         # Pass one: read everything and apply all hunks in memory. Any failure
         # raises before a single file is touched.
-        planned: list[tuple[str, str, str | None, int]] = []
+        planned: list[tuple[str, str, str | None, str | None, int]] = []
         for patch in patches:
             if patch.old_path is None:
                 action = "create"
                 new_path = patch.new_path
-                assert new_path is not None
+                if new_path is None:
+                    raise ToolError("Creation patch has no target path")
                 path = _validate_path(new_path)
                 if _try_read(fs, path) is not None:
                     raise ToolError(f"{path}: file already exists")
                 new_content = apply_hunks("", patch.hunks, path=path)
+                planned.append((path, action, new_content, None, len(patch.hunks)))
             elif patch.new_path is None:
                 action = "delete"
                 old_path = patch.old_path
-                assert old_path is not None
+                if old_path is None:
+                    raise ToolError("Deletion patch has no source path")
                 path = _validate_path(old_path)
                 existing = _try_read(fs, path)
                 if existing is None:
@@ -255,26 +295,44 @@ class ApplyPatchTool(Tool):
                 content = apply_hunks(existing, patch.hunks, path=path)
                 if content != "":
                     raise ToolError(f"{path}: deletion did not empty the file")
-                new_content = None
+                planned.append((path, action, None, existing, len(patch.hunks)))
             else:
                 action = "modify"
                 new_path = patch.new_path
-                assert new_path is not None
+                if new_path is None:
+                    raise ToolError("Modification patch has no target path")
                 path = _validate_path(new_path)
                 existing = _try_read(fs, path)
                 if existing is None:
                     raise ToolError(f"{path}: file does not exist")
                 new_content = apply_hunks(existing, patch.hunks, path=path)
-            planned.append((path, action, new_content, len(patch.hunks)))
-        # Pass two: write everything out.
-        for path, action, new_content, _count in planned:
-            if action == "delete":
-                fs.remove_file(path)
-            else:
-                assert new_content is not None
-                fs.write_text(path, new_content)
+                planned.append((path, action, new_content, existing, len(patch.hunks)))
+        # Pass two: write everything out. Each operation re-checks that the
+        # file is unchanged since pass one. A failure on any file triggers a
+        # rollback of the files already changed in this pass.
+        applied: list[tuple[str, str, str | None, str | None]] = []
+        try:
+            for item_path, item_action, item_new, item_old, _count in planned:
+                if item_action == "modify":
+                    if item_new is None:
+                        raise ToolError(f"{item_path}: modify action has no new content")
+                    if item_old is None:
+                        raise ToolError(f"{item_path}: modify action has no original content")
+                    fs.replace_if_unchanged(item_path, item_old, item_new)
+                elif item_action == "create":
+                    if item_new is None:
+                        raise ToolError(f"{item_path}: create action has no content")
+                    fs.create_text_exclusive(item_path, item_new)
+                else:
+                    if item_old is None:
+                        raise ToolError(f"{item_path}: delete action has no original content")
+                    fs.remove_if_unchanged(item_path, item_old)
+                applied.append((item_path, item_action, item_old, item_new))
+        except (ToolError, PathSecurityError):
+            _rollback(fs, applied)
+            raise
         return {
-            "files": [{"path": item[0], "action": item[1], "hunks": item[3]} for item in planned]
+            "files": [{"path": item[0], "action": item[1], "hunks": item[4]} for item in planned]
         }
 
 

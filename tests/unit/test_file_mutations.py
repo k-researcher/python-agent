@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.safe_fs import SafeProjectFS
+from agent.safe_fs import MissingFileError, SafeProjectFS
 from agent.security import PathSecurityError
 from agent.tools.base import ToolError
 
@@ -701,3 +701,77 @@ def test_exists_returns_true_for_symlink_target_and_refuses_symlink(
     # security error); either way it is not a usable regular file.
     with pytest.raises(PathSecurityError, match="Symlink"):
         filesystem.exists("link.txt")
+
+
+def test_create_text_exclusive_creates_new_file(project: Path, filesystem: SafeProjectFS) -> None:
+    assert filesystem.create_text_exclusive("new.txt", "hello\n") == Path("new.txt")
+    assert (project / "new.txt").read_text(encoding="utf-8") == "hello\n"
+
+
+def test_create_text_exclusive_refuses_existing_file(
+    project: Path, filesystem: SafeProjectFS
+) -> None:
+    (project / "notes.txt").write_text("old", encoding="utf-8")
+
+    with pytest.raises(ToolError, match="already exists"):
+        filesystem.create_text_exclusive("notes.txt", "new")
+
+    # The existing file must be untouched.
+    assert (project / "notes.txt").read_text(encoding="utf-8") == "old"
+
+
+def test_create_text_exclusive_creates_parents(project: Path, filesystem: SafeProjectFS) -> None:
+    relative = filesystem.create_text_exclusive("dir/nested/file.txt", "content\n")
+    assert relative == Path("dir/nested/file.txt")
+    assert (project / "dir/nested/file.txt").read_text(encoding="utf-8") == "content\n"
+
+
+def test_create_text_exclusive_refuses_symlink_target(
+    project: Path, filesystem: SafeProjectFS
+) -> None:
+    (project / "target.txt").write_text("old", encoding="utf-8")
+    (project / "link.txt").symlink_to(project / "target.txt")
+
+    with pytest.raises(PathSecurityError, match="Symlink"):
+        filesystem.create_text_exclusive("link.txt", "new")
+
+    assert (project / "link.txt").is_symlink()
+    assert (project / "target.txt").read_text(encoding="utf-8") == "old"
+
+
+def test_remove_if_unchanged_removes_matching_content(
+    project: Path, filesystem: SafeProjectFS
+) -> None:
+    (project / "notes.txt").write_text("old", encoding="utf-8")
+
+    assert filesystem.remove_if_unchanged("notes.txt", "old") == Path("notes.txt")
+    assert not (project / "notes.txt").exists()
+
+
+def test_remove_if_unchanged_conflict_on_mismatch(project: Path, filesystem: SafeProjectFS) -> None:
+    (project / "notes.txt").write_text("old", encoding="utf-8")
+
+    with pytest.raises(ToolError, match="conflict"):
+        filesystem.remove_if_unchanged("notes.txt", "different")
+
+    assert (project / "notes.txt").read_text(encoding="utf-8") == "old"
+
+
+def test_remove_if_unchanged_refuses_missing_file(project: Path, filesystem: SafeProjectFS) -> None:
+    with pytest.raises(ToolError, match="does not exist"):
+        filesystem.remove_if_unchanged("missing.txt", "old")
+
+
+def test_exclusive_create_leaves_no_temporary_file(
+    project: Path, filesystem: SafeProjectFS
+) -> None:
+    filesystem.create_text_exclusive("dir/new.txt", "hello\n")
+    assert (project / "dir" / "new.txt").read_text() == "hello\n"
+    assert sorted(path.name for path in (project / "dir").iterdir()) == ["new.txt"]
+    assert (project / "dir" / "new.txt").stat().st_nlink == 1
+
+
+def test_missing_file_error_is_a_tool_error(filesystem: SafeProjectFS) -> None:
+    with pytest.raises(MissingFileError, match="File does not exist"):
+        filesystem.remove_file("absent.txt")
+    assert issubclass(MissingFileError, ToolError)
