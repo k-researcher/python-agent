@@ -18,6 +18,7 @@ from agent.auth_api import router as auth_router
 from agent.config import get_settings
 from agent.database import init_database, session_factory
 from agent.events import broker
+from agent.frontend import frontend_response
 from agent.settings_api import router as settings_router
 
 settings = get_settings()
@@ -84,19 +85,7 @@ if settings.frontend_dist.is_dir():
 
     @app.get("/{path:path}", include_in_schema=False, response_model=None)
     async def frontend(path: str) -> FileResponse | JSONResponse:
-        if path:
-            try:
-                frontend_root = settings.frontend_dist.resolve(strict=True)
-                candidate = (frontend_root / path).resolve(strict=True)
-                candidate.relative_to(frontend_root)
-            except (OSError, ValueError):
-                return JSONResponse({"detail": "Not found"}, status_code=404)
-            if candidate.is_file():
-                return FileResponse(candidate)
-        index = settings.frontend_dist / "index.html"
-        if index.is_file():
-            return FileResponse(index)
-        return JSONResponse({"status": "frontend is not built"}, status_code=404)
+        return frontend_response(settings.frontend_dist, path)
 else:
 
     @app.get("/", include_in_schema=False)
