@@ -8,6 +8,7 @@ from agent.config import Settings
 from agent.tools.advanced import advanced_tools
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 from agent.tools.builtin import BUILTIN_TOOLS
+from agent.tools.check_tools import RunChecksTool
 from agent.tools.git_tools import GitDiffTool, GitLogTool, GitShowTool, GitStatusTool
 from agent.tools.knowledge import knowledge_tools
 from agent.tools.patch_tools import ApplyPatchTool, EditByLinesTool
@@ -30,6 +31,7 @@ class ToolRegistry:
                 GitDiffTool(),
                 GitLogTool(),
                 GitShowTool(),
+                RunChecksTool(),
                 *advanced_tools(self.settings),
                 WebFetchTool(self.settings),
                 *knowledge_tools(self.settings),

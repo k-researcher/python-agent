@@ -45,6 +45,15 @@ def test_ask_definitions_are_read_only() -> None:
     assert all(registry.risk(name, "ask") is RiskLevel.read_only for name in names)
 
 
+def test_run_checks_is_a_dev_tool_that_needs_approval() -> None:
+    registry = ToolRegistry()
+    assert "run_checks" in {item["function"]["name"] for item in registry.definitions("dev")}
+    assert registry.risk("run_checks", "dev") is RiskLevel.process_execution
+    assert registry.requires_confirmation("run_checks", "dev") is True
+    with pytest.raises(ToolError):
+        registry.get("run_checks", "ask")
+
+
 def test_disabled_capabilities_are_not_exposed_to_model() -> None:
     settings = Settings(allow_network_tools=False, knowledge_base_enabled=False)
     registry = ToolRegistry(settings=settings)
