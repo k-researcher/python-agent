@@ -8,18 +8,23 @@ declare the database dependency.
 
 Each tree operation runs in one transaction and is committed before a new run is
 scheduled, so an executor never observes a partial tree. On any error the transaction
-is rolled back before the exception propagates.
+is rolled back before the exception propagates. Edit and regenerate claim a new run
+generation in that transaction and, after the commit, dispatch exactly that generation
+with the same contract as sending a message: a refused or failed dispatch marks only
+that pending generation as an error, keeps the saved rows and asks the client to retry
+Start, not the tree operation.
 """
 
 from __future__ import annotations
 
 from typing import Annotated
 
+import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent.api import supervisor
+from agent.api import _dispatch_session_run
 from agent.database import get_db
 from agent.message_tree import (
     TreeError,
@@ -33,6 +38,15 @@ from agent.models import Message, Session
 from agent.schemas import MessageRead, SessionRead
 
 router = APIRouter(prefix="/api")
+
+
+async def _claimed_generation(db: AsyncSession, session_id: str) -> int:
+    """Read the run generation that the tree operation claimed, in its own transaction."""
+    generation = await db.scalar(sa.select(Session.run_generation).where(Session.id == session_id))
+    if generation is None:
+        raise TreeError("Session not found", 404)
+    return int(generation)
+
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 
@@ -76,19 +90,20 @@ async def edit_message_endpoint(
     message_id: int,
     payload: EditRequest,
     db: DbSession,
-) -> Message:
+) -> MessageRead:
     try:
         message = await edit_message(db, session_id, message_id, payload.content)
+        generation = await _claimed_generation(db, session_id)
+        response = MessageRead.model_validate(message)
         await db.commit()
-        await db.refresh(message)
     except TreeError as exc:
         await db.rollback()
         raise _http_error(exc) from exc
     except Exception:
         await db.rollback()
         raise
-    await supervisor.start(session_id, new_run=False)
-    return message
+    await _dispatch_session_run(db, session_id, generation)
+    return response
 
 
 @router.post(
@@ -101,7 +116,7 @@ async def regenerate_endpoint(
     message_id: int,
     payload: RegenerateRequest,
     db: DbSession,
-) -> Message:
+) -> MessageRead:
     try:
         message = await regenerate(
             db,
@@ -110,8 +125,9 @@ async def regenerate_endpoint(
             llm_profile=payload.llm_profile,
             reasoning_effort=payload.reasoning_effort,
         )
+        generation = await _claimed_generation(db, session_id)
+        response = MessageRead.model_validate(message)
         await db.commit()
-        await db.refresh(message)
     except TreeError as exc:
         await db.rollback()
         raise _http_error(exc) from exc
@@ -121,8 +137,8 @@ async def regenerate_endpoint(
     except Exception:
         await db.rollback()
         raise
-    await supervisor.start(session_id, new_run=False)
-    return message
+    await _dispatch_session_run(db, session_id, generation)
+    return response
 
 
 @router.post("/sessions/{session_id}/branch", response_model=list[MessageRead])

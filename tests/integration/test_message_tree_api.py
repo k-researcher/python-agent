@@ -14,12 +14,23 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+import pytest
+import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
 from agent.api import supervisor
+from agent.database import init_database, session_factory
 from agent.llm import LLMResponse
 from agent.main import app
-from agent.message_tree_api import router
+from agent.message_tree import append_message
+from agent.message_tree_api import (
+    EditRequest,
+    RegenerateRequest,
+    edit_message_endpoint,
+    regenerate_endpoint,
+    router,
+)
+from agent.models import Message, Project, Session, SessionStatus
 from tests.integration.helpers import authed_client
 
 
@@ -608,5 +619,249 @@ def test_concurrent_edits_create_one_version(tmp_path: Path) -> None:
             after = client.get(f"/api/sessions/{session_id}/messages").json()
             active_users = [m for m in after if m["role"] == "user" and not m["skipped"]]
             assert len(active_users) == 1
+    finally:
+        supervisor.llm = original
+
+
+def _messages(client: TestClient, session_id: str) -> list[dict[str, Any]]:
+    return client.get(f"/api/sessions/{session_id}/messages").json()
+
+
+def test_refused_dispatch_keeps_the_edit_and_asks_for_start(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    original = supervisor.llm
+    supervisor.llm = EchoLLM()  # type: ignore[assignment]
+    try:
+        with tree_client() as client:
+            session_id = setup_completed(client, tmp_path, "refused")
+            user_id = int(user_messages(client, session_id)[0]["id"])
+
+            async def refuse(*_args: Any, **_kwargs: Any) -> bool:
+                return False
+
+            with monkeypatch.context() as patch:
+                patch.setattr(supervisor, "start", refuse)
+                response = client.post(
+                    f"/api/sessions/{session_id}/messages/{user_id}/edit",
+                    json={"content": "kept edit"},
+                )
+            assert response.status_code == 503
+            assert "retry Start" in response.json()["detail"]
+            session = client.get(f"/api/sessions/{session_id}").json()
+            assert session["status"] == "error"
+            active = [m for m in _messages(client, session_id) if not m["skipped"]]
+            assert any(m["content"] == "kept edit" for m in active)  # the edit is saved
+            # Start runs the saved edit; the edit itself is not repeated.
+            assert client.post(f"/api/sessions/{session_id}/start").status_code == 202
+            wait_for(client, session_id, "completed")
+            edits = [m for m in _messages(client, session_id) if m["content"] == "kept edit"]
+            assert len(edits) == 1
+    finally:
+        supervisor.llm = original
+
+
+def test_failed_dispatch_of_regenerate_returns_503(tmp_path: Path, monkeypatch: Any) -> None:
+    original = supervisor.llm
+    supervisor.llm = EchoLLM()  # type: ignore[assignment]
+    try:
+        with tree_client() as client:
+            session_id = setup_completed(client, tmp_path, "failed")
+            assistant = active_assistant(client, session_id)
+
+            async def fail(*_args: Any, **_kwargs: Any) -> bool:
+                raise RuntimeError("queue is down")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(supervisor, "start", fail)
+                response = client.post(
+                    f"/api/sessions/{session_id}/messages/{assistant['id']}/regenerate",
+                    json={},
+                )
+            assert response.status_code == 503
+            assert client.get(f"/api/sessions/{session_id}").json()["status"] == "error"
+    finally:
+        supervisor.llm = original
+
+
+def test_stop_before_dispatch_is_not_overwritten(tmp_path: Path, monkeypatch: Any) -> None:
+    original = supervisor.llm
+    supervisor.llm = EchoLLM()  # type: ignore[assignment]
+    try:
+        with tree_client() as client:
+            session_id = setup_completed(client, tmp_path, "stopped")
+            user_id = int(user_messages(client, session_id)[0]["id"])
+            real_stop = supervisor.stop
+
+            async def stop_then_refuse(target: str, **_kwargs: Any) -> bool:
+                await real_stop(target)  # a Stop wins the race before the dispatch
+                return False
+
+            with monkeypatch.context() as patch:
+                patch.setattr(supervisor, "start", stop_then_refuse)
+                response = client.post(
+                    f"/api/sessions/{session_id}/messages/{user_id}/edit",
+                    json={"content": "edit before stop"},
+                )
+            assert response.status_code == 201
+            session = client.get(f"/api/sessions/{session_id}").json()
+            assert session["status"] == "stopped"
+            assert not session.get("error")
+    finally:
+        supervisor.llm = original
+
+
+async def _db_generation(session_id: str) -> int:
+    async with session_factory() as db:
+        value = await db.scalar(sa.select(Session.run_generation).where(Session.id == session_id))
+    return int(value or 0)
+
+
+def test_edit_and_regenerate_dispatch_the_exact_claimed_generation(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    original = supervisor.llm
+    supervisor.llm = EchoLLM()  # type: ignore[assignment]
+    try:
+        with tree_client() as client:
+            session_id = setup_completed(client, tmp_path, "exact")
+            calls: list[tuple[bool, int | None, int]] = []
+            real_start = supervisor.start
+
+            async def record(target: str, **kwargs: Any) -> bool:
+                generation = await _db_generation(target)
+                calls.append(
+                    (kwargs.get("new_run", True), kwargs.get("expected_generation"), generation)
+                )
+                return await real_start(target, **kwargs)
+
+            user_id = int(user_messages(client, session_id)[0]["id"])
+            with monkeypatch.context() as patch:
+                patch.setattr(supervisor, "start", record)
+                assert (
+                    client.post(
+                        f"/api/sessions/{session_id}/messages/{user_id}/edit",
+                        json={"content": "e1"},
+                    ).status_code
+                    == 201
+                )
+                wait_for(client, session_id, "completed")
+                assistant = active_assistant(client, session_id)
+                assert (
+                    client.post(
+                        f"/api/sessions/{session_id}/messages/{assistant['id']}/regenerate", json={}
+                    ).status_code
+                    == 201
+                )
+                wait_for(client, session_id, "completed")
+            # Each call continues (new_run=False) exactly the generation that is current in the DB.
+            assert [(new_run, expected == current) for new_run, expected, current in calls] == [
+                (False, True),
+                (False, True),
+            ]
+            assert calls[1][1] == calls[0][1] + 1
+    finally:
+        supervisor.llm = original
+
+
+@pytest.mark.parametrize("operation", ["edit", "regenerate"])
+async def test_real_cancellation_during_dispatch_keeps_the_new_row(
+    tmp_path: Path, monkeypatch: Any, operation: str
+) -> None:
+    # A real task waits inside start; cancelling it must keep the committed row and mark
+    # only that pending generation as an error.
+    await init_database(recover_running=False)
+    async with session_factory() as db:
+        project = Project(name="cancel-" + operation, root_path=str(tmp_path / operation))
+        db.add(project)
+        await db.flush()
+        session = Session(
+            project_id=project.id,
+            title="cancel",
+            status=SessionStatus.completed.value,
+            configuration={},
+        )
+        db.add(session)
+        await db.flush()
+        session_id = session.id
+        user = await append_message(db, session_id, role="user", content="question")
+        assistant = await append_message(db, session_id, role="assistant", content="answer")
+        await db.commit()
+        user_id, assistant_id = user.id, assistant.id
+
+    reached = asyncio.Event()
+
+    async def wait_forever(*_args: Any, **_kwargs: Any) -> bool:
+        reached.set()
+        await asyncio.Event().wait()
+        return True
+
+    monkeypatch.setattr(supervisor, "start", wait_forever)
+
+    async def call() -> Any:
+        async with session_factory() as db:
+            if operation == "edit":
+                return await edit_message_endpoint(
+                    session_id, user_id, EditRequest(content="kept after cancel"), db
+                )
+            return await regenerate_endpoint(session_id, assistant_id, RegenerateRequest(), db)
+
+    task = asyncio.create_task(call())
+    await asyncio.wait_for(reached.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    async with session_factory() as db:
+        status = await db.scalar(sa.select(Session.status).where(Session.id == session_id))
+        active = list(
+            await db.scalars(
+                sa.select(Message.content).where(
+                    Message.session_id == session_id, Message.skipped.is_(False)
+                )
+            )
+        )
+    assert status == SessionStatus.error.value
+    expected = "kept after cancel" if operation == "edit" else "question"
+    assert active.count(expected) == 1  # the new row of the tree operation is kept
+
+
+def test_newer_generation_before_dispatch_is_not_started_or_overwritten(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    original = supervisor.llm
+    supervisor.llm = EchoLLM()  # type: ignore[assignment]
+    try:
+        with tree_client() as client:
+            session_id = setup_completed(client, tmp_path, "newer")
+            user_id = int(user_messages(client, session_id)[0]["id"])
+            real_start = supervisor.start
+            seen: list[int | None] = []
+
+            async def newer_run_first(target: str, **kwargs: Any) -> bool:
+                seen.append(kwargs.get("expected_generation"))
+                # Another request takes the session to a newer generation in between.
+                async with session_factory() as db:
+                    await db.execute(
+                        sa.update(Session)
+                        .where(Session.id == target)
+                        .values(run_generation=Session.run_generation + 1)
+                    )
+                    await db.commit()
+                return await real_start(target, **kwargs)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(supervisor, "start", newer_run_first)
+                response = client.post(
+                    f"/api/sessions/{session_id}/messages/{user_id}/edit",
+                    json={"content": "old request"},
+                )
+            assert response.status_code == 201  # nothing scheduled, nothing overwritten
+            session = client.get(f"/api/sessions/{session_id}").json()
+            assert client.portal is not None
+            assert client.portal.call(_db_generation, session_id) == seen[0] + 1
+            assert session["status"] == "pending"  # the newer generation keeps its state
+            assert not session.get("error")
+            assert session_id not in supervisor._tasks or supervisor._tasks[session_id].done()
     finally:
         supervisor.llm = original
