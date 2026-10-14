@@ -19,6 +19,7 @@ from agent.config import get_settings
 from agent.database import init_database, session_factory
 from agent.events import broker
 from agent.frontend import frontend_response
+from agent.message_tree_api import router as message_tree_router
 from agent.settings_api import router as settings_router
 
 settings = get_settings()
@@ -75,6 +76,7 @@ async def browser_auth(request: Request, call_next: RequestResponseEndpoint) -> 
 app.include_router(auth_router)
 app.include_router(settings_router)
 app.include_router(router)
+app.include_router(message_tree_router)
 app.add_api_websocket_route("/ws", websocket_endpoint)
 
 
