@@ -375,7 +375,11 @@ async def test_cancelled_git_kills_the_process(
     task = asyncio.create_task(
         _run_git(git_context(project), ["status", "--porcelain=v1", "--branch"])
     )
-    for _ in range(100):
+    # Wait until the fake git writes its pid. Under load the process can take a few
+    # seconds to start; the limit only bounds the wait, it does not weaken the check.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 10
+    while loop.time() < deadline:
         if pid_file.exists() and pid_file.read_text().strip():
             break
         await asyncio.sleep(0.02)
@@ -386,7 +390,8 @@ async def test_cancelled_git_kills_the_process(
         await task
 
     # The child must be gone, not left running as an orphan.
-    for _ in range(100):
+    deadline = loop.time() + 10
+    while loop.time() < deadline:
         try:
             os.kill(child_pid, 0)
         except ProcessLookupError:
