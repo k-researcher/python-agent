@@ -68,7 +68,7 @@ def test_example_loads_and_resolves_secrets() -> None:
     assert model.kind == "openai"
     assert model.api_key == _SECRET
     assert model.configured
-    assert model.context_window == 131070
+    assert model.context_window == 256000
     assert model.max_tokens == 16000
     assert model.timeout_seconds == 120
     assert model.max_retries == 3
