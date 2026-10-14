@@ -47,6 +47,6 @@ default model.
   must be the same on all hosts.
 - A provider without a key does not stop the startup. It shows as "not configured".
 - An invalid override gives HTTP 422. The server does not save it.
-- `agent config check --strict` validates the YAML file without the database.
+- `pyagent config check --strict` validates the YAML file without the database.
 - The adapters for `anthropic` and `openai_responses` are a later step. Until then, routing
   to these kinds is rejected.

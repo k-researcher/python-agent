@@ -17,7 +17,7 @@ local API and approve shell commands. Remote access is a requirement.
    `AGENT_ALLOWED_HOSTS`. Wildcards are not permitted.
 2. A browser logs in with a one-time link. At startup, if no session is active, the server
    writes the link to the console. On localhost, the server also opens the link in the
-   browser. The command `agent auth link` makes a new link.
+   browser. The command `pyagent auth link` makes a new link.
 3. The login code is in the URL fragment (`#login=...`). Thus proxies and access logs do not
    get it. The UI removes the fragment and sends the code in a POST request.
 4. The server makes a session and sets an `HttpOnly; SameSite=Strict; Path=/` cookie. On

@@ -39,7 +39,7 @@ cd python-agent
 uv sync --extra dev
 cp .env.example .env
 cd frontend && npm install && npm run build && cd ..
-uv run agent
+uv run pyagent
 ```
 
 Перед запуском заполните ключ провайдера в `.env` и опишите модели в
@@ -48,7 +48,7 @@ uv run agent
 ```bash
 cp config/models.example.yaml config/models.yaml
 echo 'AGENT_LLM_API_KEY=...' >> .env
-uv run agent config check --strict
+uv run pyagent config check --strict
 ```
 
 ### Модели и провайдеры
@@ -150,8 +150,8 @@ AGENT_KNOWLEDGE_BASE_EMBEDDING_MODEL=embedding-model
 дополнительно защищены CSRF-токеном и проверкой `Origin`.
 
 ```bash
-uv run agent auth link        # новая ссылка (например, для другого устройства)
-uv run agent auth revoke-all  # выйти на всех устройствах
+uv run pyagent auth link        # новая ссылка (например, для другого устройства)
+uv run pyagent auth revoke-all  # выйти на всех устройствах
 ```
 
 Все запросы проверяют точный `Host` (`AGENT_ALLOWED_HOSTS`) — это защищает от DNS

@@ -30,4 +30,4 @@ RUN groupadd --gid 10001 agent && \
 
 EXPOSE 8080
 USER agent
-CMD [".venv/bin/agent"]
+CMD [".venv/bin/pyagent"]
