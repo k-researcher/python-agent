@@ -9,7 +9,6 @@ from typing import Any
 from urllib.parse import quote_plus
 
 import asyncssh
-import httpx
 from openpyxl import load_workbook
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
@@ -18,7 +17,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from agent.config import Settings
 from agent.security import PathGuard
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
-from agent.tools.network import validate_outbound_url
+from agent.tools.network import pinned_client, validate_outbound_url
 
 MAX_WORKBOOK_BYTES = 50_000_000
 MAX_WORKBOOK_UNCOMPRESSED_BYTES = 200_000_000
@@ -87,7 +86,7 @@ class HttpTool(Tool):
         collected = bytearray()
         try:
             async with (
-                httpx.AsyncClient(timeout=30, follow_redirects=False) as client,
+                pinned_client(self.settings.network_allowlist) as client,
                 client.stream(method, url, **request_kwargs) as response,
             ):
                 async for chunk in response.aiter_bytes():

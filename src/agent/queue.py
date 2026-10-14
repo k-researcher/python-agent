@@ -14,6 +14,17 @@ from agent.config import Settings
 class QueueMessage:
     message_id: str
     session_id: str
+    generation: int | None = None
+
+
+_ENQUEUE_SCRIPT = """
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return 0
+end
+redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', unpack(ARGV, 3))
+redis.call('SET', KEYS[1], '1', 'EX', ARGV[1])
+return 1
+"""
 
 
 class RedisTaskQueue:
@@ -39,22 +50,30 @@ class RedisTaskQueue:
             if "BUSYGROUP" not in str(exc):
                 raise
 
-    async def enqueue(self, session_id: str) -> bool:
-        dedupe_key = f"{self.stream}:queued:{session_id}"
-        inserted = await self.client.set(dedupe_key, "1", ex=300, nx=True)
-        if not inserted:
-            return False
-        try:
-            await self.client.xadd(
-                self.stream,
-                {"session_id": session_id},
-                maxlen=100_000,
-                approximate=True,
-            )
-        except Exception:
-            await self.client.delete(dedupe_key)
-            raise
-        return True
+    def _dedupe_key(self, session_id: str, generation: int | None) -> str:
+        """One queued marker per session, or per session generation when it is known.
+
+        A marker per generation keeps a job of a new generation from being dropped as a
+        duplicate of a job of an older generation that is still queued or running.
+        """
+        key = f"{self.stream}:queued:{session_id}"
+        return key if generation is None else f"{key}:g{generation}"
+
+    async def enqueue(self, session_id: str, *, generation: int | None = None) -> bool:
+        """Add a job unless the marker exists; return False for a duplicate.
+
+        One Lua script checks the marker, adds the stream entry and only then sets the
+        marker. The script runs without interleaving, and a failed XADD sets no marker, so
+        an existing marker always means that the job entry exists.
+        """
+        dedupe_key = self._dedupe_key(session_id, generation)
+        fields: list[str] = ["session_id", session_id]
+        if generation is not None:
+            fields += ["generation", str(generation)]
+        inserted = await self.client.eval(
+            _ENQUEUE_SCRIPT, 2, dedupe_key, self.stream, "300", "100000", *fields
+        )
+        return bool(inserted)
 
     async def read(self, consumer: str, count: int, block_ms: int = 5000) -> list[QueueMessage]:
         rows = await self.client.xreadgroup(
@@ -86,13 +105,17 @@ class RedisTaskQueue:
             for message_id, fields in entries:
                 session_id = fields.get("session_id")
                 if session_id:
-                    messages.append(QueueMessage(str(message_id), str(session_id)))
+                    raw = fields.get("generation")
+                    generation = int(raw) if raw is not None and str(raw).isdigit() else None
+                    messages.append(QueueMessage(str(message_id), str(session_id), generation))
         return messages
 
-    async def acknowledge(self, message_id: str, session_id: str) -> None:
+    async def acknowledge(
+        self, message_id: str, session_id: str, generation: int | None = None
+    ) -> None:
         await self.client.xack(self.stream, self.group, message_id)
         await self.client.xdel(self.stream, message_id)
-        await self.client.delete(f"{self.stream}:queued:{session_id}")
+        await self.client.delete(self._dedupe_key(session_id, generation))
 
     async def acquire_session_lock(self, session_id: str) -> str | None:
         token = secrets.token_hex(16)

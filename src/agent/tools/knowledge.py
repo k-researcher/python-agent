@@ -5,7 +5,6 @@ import math
 import re
 from typing import Any
 
-import httpx
 from sqlalchemy import select
 
 from agent.config import Settings
@@ -13,7 +12,7 @@ from agent.database import session_factory
 from agent.models import KnowledgeDocument, utcnow
 from agent.tools.advanced import audit
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
-from agent.tools.network import validate_outbound_url
+from agent.tools.network import pinned_client, validate_outbound_url
 
 WORD_PATTERN = re.compile(r"[\w-]{3,}", re.UNICODE)
 MAX_KNOWLEDGE_CONTENT_CHARS = 1_000_000
@@ -53,7 +52,7 @@ class EmbeddingService:
         encoded = str(payload)
         await audit(context, "embedding", url, "embed", encoded, "started")
         try:
-            async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+            async with pinned_client(self.settings.network_allowlist) as client:
                 response = await client.post(url, json=payload, headers=headers)
                 response.raise_for_status()
                 vector = response.json()["data"][0]["embedding"]

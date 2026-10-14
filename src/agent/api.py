@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import attributes, selectinload
+from sqlalchemy.sql.elements import ColumnElement
 
 from agent.auth import check_request
 from agent.checkpoints import load_context_rows
@@ -15,6 +20,7 @@ from agent.config import Settings, get_settings
 from agent.context_inference import ContextInference, ContextPreparationError, context_stats
 from agent.database import get_db, session_factory
 from agent.events import broker, emit_event
+from agent.message_tree import IDLE_STATUSES, append_message
 from agent.model_registry import effective_registry, select_model
 from agent.models import (
     Approval,
@@ -48,6 +54,7 @@ from agent.session_service import create_session_record
 router = APIRouter(prefix="/api")
 settings: Settings = get_settings()
 supervisor = AgentSupervisor(settings)
+logger = logging.getLogger(__name__)
 
 
 @router.get("/health")
@@ -240,15 +247,94 @@ async def list_messages(session_id: str, db: AsyncSession = Depends(get_db)) -> 
     return list((await db.execute(query)).scalars())
 
 
+async def _claim_session_run(
+    db: AsyncSession, session_id: str, *, allow_initial_pending: bool = False
+) -> Session:
+    eligible: ColumnElement[bool] = Session.status.in_(IDLE_STATUSES)
+    if allow_initial_pending:
+        eligible = or_(
+            eligible,
+            (Session.status == SessionStatus.pending.value) & (Session.run_generation == 0),
+        )
+    claimed = cast(
+        CursorResult[Any],
+        await db.execute(
+            update(Session)
+            .where(
+                Session.id == session_id,
+                eligible,
+                or_(Session.owner_token.is_(None), Session.lease_until < datetime.now(UTC)),
+            )
+            .values(
+                status=SessionStatus.pending.value,
+                run_generation=Session.run_generation + 1,
+                owner_token=None,
+                lease_until=None,
+                stop_requested=False,
+                error=None,
+            )
+            .execution_options(synchronize_session=False)
+        ),
+    )
+    if claimed.rowcount != 1:
+        exists = await db.scalar(select(Session.id).where(Session.id == session_id))
+        if exists is None:
+            raise HTTPException(404, "Session not found")
+        raise HTTPException(409, "The session is busy; wait until it finishes or stop it")
+    session = await db.get(Session, session_id, populate_existing=True)
+    if session is None:
+        raise HTTPException(404, "Session not found")
+    return session
+
+
+async def _dispatch_session_run(db: AsyncSession, session_id: str, generation: int) -> bool:
+    try:
+        started = await supervisor.start(session_id, new_run=False, expected_generation=generation)
+        if not started:
+            state = (
+                await db.execute(
+                    select(Session.id).where(
+                        Session.id == session_id,
+                        Session.run_generation == generation,
+                        Session.status == SessionStatus.pending.value,
+                        Session.stop_requested.is_(False),
+                    )
+                )
+            ).scalar_one_or_none()
+            if state is not None:
+                raise RuntimeError("Dispatch refused the current pending generation")
+        return started
+    except (Exception, asyncio.CancelledError) as exc:
+        await db.rollback()
+        await db.execute(
+            update(Session)
+            .where(
+                Session.id == session_id,
+                Session.run_generation == generation,
+                Session.status == SessionStatus.pending.value,
+                Session.owner_token.is_(None),
+                Session.stop_requested.is_(False),
+            )
+            .values(
+                status=SessionStatus.error.value,
+                error="The run could not be scheduled; start it again",
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await db.commit()
+        logger.exception("Session %s: run dispatch failed", session_id)
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        raise HTTPException(
+            503, "The run could not be scheduled. Saved messages are kept; retry Start, not Send"
+        ) from exc
+
+
 @router.post("/sessions/{session_id}/messages", response_model=MessageRead, status_code=201)
 async def add_message(
     session_id: str, payload: MessageCreate, db: AsyncSession = Depends(get_db)
 ) -> Message:
-    session = await db.get(Session, session_id)
-    if session is None:
-        raise HTTPException(404, "Session not found")
-    if session.status in {SessionStatus.running.value, SessionStatus.awaiting_confirmation.value}:
-        raise HTTPException(409, f"Cannot add a message while session is {session.status}")
+    session = await _claim_session_run(db, session_id, allow_initial_pending=True)
 
     if payload.reasoning_effort is not None:
         model = select_model(
@@ -258,36 +344,42 @@ async def add_message(
             validate_effort(model, payload.reasoning_effort)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
-    message = Message(
-        session_id=session.id,
+    message = await append_message(
+        db,
+        session.id,
         role="user",
         content=payload.content,
         reasoning_effort=payload.reasoning_effort,
     )
-    db.add(message)
-    session.status = SessionStatus.pending.value
-    session.stop_requested = False
-    session.error = None
+    event = Event(
+        session_id=session.id,
+        type="message.created",
+        payload={"role": "user", "message_id": message.id},
+    )
+    db.add(event)
+    await db.flush()
     await db.commit()
-    await db.refresh(message)
-    await emit_event(db, "message.created", {"role": "user", "message_id": message.id}, session.id)
-    await supervisor.start(session.id)
+    await _dispatch_session_run(db, session.id, session.run_generation)
+    try:
+        await broker.broadcast(
+            {
+                "id": event.id,
+                "session_id": event.session_id,
+                "type": event.type,
+                "payload": event.payload,
+                "created_at": event.created_at.isoformat(),
+            }
+        )
+    except Exception:
+        logger.exception("Session %s: message event publication failed", session.id)
     return message
 
 
 @router.post("/sessions/{session_id}/start", status_code=202)
 async def start_session(session_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, bool]:
-    session = await db.get(Session, session_id)
-    if session is None:
-        raise HTTPException(404, "Session not found")
-    if session.status == SessionStatus.awaiting_confirmation.value:
-        raise HTTPException(409, "Resolve pending approvals before starting")
-    if session.status in TERMINAL_STATUSES | {SessionStatus.interrupted.value}:
-        session.status = SessionStatus.pending.value
-        session.stop_requested = False
-        session.error = None
-        await db.commit()
-    return {"started": await supervisor.start(session.id)}
+    session = await _claim_session_run(db, session_id, allow_initial_pending=True)
+    await db.commit()
+    return {"started": await _dispatch_session_run(db, session.id, session.run_generation)}
 
 
 @router.post("/sessions/{session_id}/stop")

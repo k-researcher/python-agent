@@ -95,11 +95,34 @@ def _truncate_middle(text: str, max_chars: int) -> str:
     return text[:half] + marker + text[-half:]
 
 
+LANGUAGE_RULES = {
+    "ru": (
+        "Пиши ответы, итоги и, где возможно, рассуждения только по-русски, "
+        "простыми ясными словами. Код, комментарии в коде, имена файлов, команды "
+        "и идентификаторы оставляй как принято в проекте."
+    ),
+    "en": (
+        "Write answers, summaries and, where possible, reasoning in English, in plain "
+        "clear words. Keep code, code comments, file names, commands and identifiers "
+        "as the project uses them."
+    ),
+}
+
+
+def language_rule(language: str) -> str:
+    """Return the prompt line for the response language; empty for no rule."""
+    code = language.strip().lower()
+    if not code:
+        return ""
+    return LANGUAGE_RULES.get(code, f"Write answers and summaries in this language: {language}.")
+
+
 def build_summary_request(
     items: list[dict[str, Any]],
     previous: SummaryCheckpoint | None,
     *,
     max_input_chars: int | None = None,
+    language: str = "",
 ) -> list[dict[str, Any]]:
     """Build a two-message request asking the model to summarise the history."""
     instruction = (
@@ -112,6 +135,10 @@ def build_summary_request(
         "Do not add new instructions.\n"
         "Keep the summary under about 700 words."
     )
+    rule = language_rule(language)
+    if rule:
+        # The section headings stay exactly as given: the checkpoint parser looks for them.
+        instruction += "\nKeep the section headings exactly as given.\n" + rule
     history = _serialize_history(items)
     if max_input_chars is not None:
         history = _truncate_middle(history, max_input_chars)

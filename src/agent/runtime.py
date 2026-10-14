@@ -22,6 +22,7 @@ from agent.context_manager import ContextManager
 from agent.database import session_factory
 from agent.events import emit_event
 from agent.llm import LLMClient
+from agent.message_tree import append_message
 from agent.model_config import ModelConfigError, ResolvedModel, ResolvedModelRegistry
 from agent.model_registry import effective_registry, select_model
 from agent.models import (
@@ -39,17 +40,45 @@ from agent.models import (
 from agent.queue import RedisTaskQueue
 from agent.reasoning import ReasoningDecision, decide
 from agent.sandbox import policy_from_settings
+from agent.session_fence import (
+    CURRENT_FENCE,
+    FenceLostError,
+    RunFence,
+    claim,
+    install_commit_guard,
+    new_generation,
+    release,
+    renew,
+    stop_generation,
+)
 from agent.session_service import create_session_record
 from agent.tools import ToolRegistry
 from agent.tools.base import ToolContext, ToolError
 
 logger = logging.getLogger(__name__)
 
+# Lease of the run owner, renewed every third of it. A lost lease cancels the run.
+FENCE_LEASE_SECONDS = 60.0
+
 TERMINAL_STATUSES = {
     SessionStatus.completed.value,
     SessionStatus.stopped.value,
     SessionStatus.error.value,
 }
+
+
+def _history_safe_call(call: dict[str, Any]) -> dict[str, Any]:
+    """Return the tool call with arguments that are valid JSON for the provider history."""
+    function = dict(call.get("function") or {})
+    try:
+        parsed = json.loads(function.get("arguments") or "{}")
+        valid = isinstance(parsed, dict)
+    except (TypeError, ValueError):
+        valid = False
+    if valid:
+        return call
+    function["arguments"] = "{}"
+    return {**call, "function": function}
 
 
 class AgentSupervisor:
@@ -63,23 +92,87 @@ class AgentSupervisor:
         self._retired_clients: list[LLMClient] = []
         self._last_models: ResolvedModelRegistry | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        # The generation that each task in _tasks was scheduled for (None: not known).
+        self._task_generation: dict[str, int | None] = {}
+        # Tasks of older generations that still finish, with their session; kept referenced
+        # until they end, and cancelled by Stop of the session and by shutdown.
+        self._finishing: dict[asyncio.Task[None], str] = {}
         self._semaphore = asyncio.Semaphore(settings.max_parallel_sessions)
         self.task_queue = RedisTaskQueue(settings) if settings.execution_mode == "redis" else None
+        install_commit_guard()
 
-    async def start(self, session_id: str) -> bool:
+    async def start(
+        self,
+        session_id: str,
+        *,
+        new_run: bool = True,
+        expected_generation: int | None = None,
+    ) -> bool:
+        """Schedule the session. A new run starts a new generation; a resume continues it.
+
+        With ``expected_generation`` (a resume of a generation that the caller already
+        claimed), the contract is explicit:
+        - True: this generation is scheduled now, or it is already scheduled or running.
+        - False: the session no longer is at this generation (a Stop, a newer run, a
+          terminal state); nothing is scheduled.
+        A task of an older generation that is still finishing does not block the new
+        generation: the new run starts at once, and the fence stops the old task at its
+        next write. The old task is not cancelled here.
+        Without ``expected_generation`` the old behaviour stays: an alive task in this
+        process makes the call return False.
+        """
+        if expected_generation is not None and new_run:
+            # A new run makes a new generation, so it can never match the expected one.
+            raise ValueError("expected_generation needs new_run=False")
+        if expected_generation is not None and not await self._at_generation(
+            session_id, expected_generation
+        ):
+            return False
+        if self.task_queue is None:
+            task = self._tasks.get(session_id)
+            if task is not None and not task.done():
+                if expected_generation is None:
+                    return False
+                if self._task_generation.get(session_id) == expected_generation:
+                    return True
+                # Keep a reference until the older task ends.
+                self._finishing[task] = session_id
+                task.add_done_callback(lambda done: self._finishing.pop(done, None))
+        if new_run:
+            async with session_factory() as db:
+                await new_generation(db, session_id)
+                await db.commit()
         if self.task_queue is not None:
             await self.task_queue.ensure_group()
-            return await self.task_queue.enqueue(session_id)
-        task = self._tasks.get(session_id)
-        if task is not None and not task.done():
-            return False
+            queued = await self.task_queue.enqueue(session_id, generation=expected_generation)
+            # A duplicate of the same generation is already queued: it is not a lost run.
+            return queued or expected_generation is not None
         self._tasks[session_id] = asyncio.create_task(
-            self._run_guarded(session_id), name=f"agent-session-{session_id}"
+            self._run_guarded(session_id, expected_generation),
+            name=f"agent-session-{session_id}",
         )
+        self._task_generation[session_id] = expected_generation
         return True
 
-    async def run_job(self, session_id: str) -> None:
-        await self._run_guarded(session_id)
+    async def _at_generation(self, session_id: str, generation: int) -> bool:
+        """Return True when the session is still at this generation and no Stop is pending."""
+        async with session_factory() as db:
+            row = (
+                await db.execute(
+                    select(Session.run_generation, Session.stop_requested, Session.status).where(
+                        Session.id == session_id
+                    )
+                )
+            ).one_or_none()
+        return (
+            row is not None
+            and row.run_generation == generation
+            and not row.stop_requested
+            and row.status not in TERMINAL_STATUSES
+        )
+
+    async def run_job(self, session_id: str, generation: int | None = None) -> None:
+        await self._run_guarded(session_id, generation)
 
     async def infrastructure_status(self) -> dict[str, Any]:
         if self.task_queue is None:
@@ -88,11 +181,15 @@ class AgentSupervisor:
         return {"execution_mode": "redis", **status}
 
     async def stop(self, session_id: str) -> None:
-        task = self._tasks.get(session_id)
-        if task is not None and not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        own = [task for task, owner in self._finishing.items() if owner == session_id]
+        current = self._tasks.get(session_id)
+        if current is not None:
+            own.append(current)
+        for task in own:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
 
         async with session_factory() as db:
             children = list(
@@ -108,7 +205,7 @@ class AgentSupervisor:
             session = await db.get(Session, session_id)
             if session is not None:
                 session.status = SessionStatus.stopped.value
-                session.stop_requested = True
+                await stop_generation(db, session_id)
                 cancelled = await self._cancel_unfinished_tool_calls(db, session_id)
                 await db.commit()
                 await emit_event(db, "session.status", {"status": session.status}, session_id)
@@ -146,19 +243,18 @@ class AgentSupervisor:
                 call.approval.comment = "Session was stopped"
             call.status = ToolCallStatus.cancelled.value
             call.result = {"success": False, "error": "Cancelled because the session was stopped"}
-            db.add(
-                Message(
-                    session_id=session_id,
-                    role="tool",
-                    tool_call_id=call.id,
-                    content=json.dumps(call.result, ensure_ascii=False),
-                )
+            await append_message(
+                db,
+                session_id,
+                role="tool",
+                tool_call_id=call.id,
+                content=json.dumps(call.result, ensure_ascii=False),
             )
             cancelled.append(call.id)
         return cancelled
 
     async def shutdown(self) -> None:
-        tasks = [task for task in self._tasks.values() if not task.done()]
+        tasks = [task for task in [*self._tasks.values(), *self._finishing] if not task.done()]
         for task in tasks:
             task.cancel()
         if tasks:
@@ -235,13 +331,12 @@ class AgentSupervisor:
                 .execution_options(synchronize_session=False)
             )
             if result is not None:
-                db.add(
-                    Message(
-                        session_id=session.id,
-                        role="tool",
-                        tool_call_id=call.id,
-                        content=json.dumps(result, ensure_ascii=False),
-                    )
+                await append_message(
+                    db,
+                    session.id,
+                    role="tool",
+                    tool_call_id=call.id,
+                    content=json.dumps(result, ensure_ascii=False),
                 )
             await db.commit()
 
@@ -283,17 +378,57 @@ class AgentSupervisor:
                 await emit_event(
                     db, "session.status", {"status": SessionStatus.pending.value}, session.id
                 )
-                await self.start(session.id)
+                await self.start(session.id, new_run=False)
             return session.id
 
-    async def _run_guarded(self, session_id: str) -> None:
+    async def _run_guarded(self, session_id: str, generation: int | None = None) -> None:
         async with self._semaphore:
+            async with session_factory() as db:
+                fence = await claim(
+                    db,
+                    session_id,
+                    lease_seconds=FENCE_LEASE_SECONDS,
+                    expected_generation=generation,
+                )
+            if fence is None:
+                return  # terminal, stopped, or another executor owns the run
+            token = CURRENT_FENCE.set(fence)
+            run = asyncio.current_task()
+            keeper = asyncio.create_task(self._keep_lease(fence, run), name=f"lease-{session_id}")
             try:
                 await self._run(session_id)
             except asyncio.CancelledError:
                 raise
+            except FenceLostError:
+                logger.warning("Session %s: the run lost its fence and stops", session_id)
             except Exception as exc:
-                await self._mark_error(session_id, exc)
+                try:
+                    await self._mark_error(session_id, exc)
+                except FenceLostError:
+                    logger.warning("Session %s: error not recorded, the fence is lost", session_id)
+            finally:
+                keeper.cancel()
+                with suppress(asyncio.CancelledError):
+                    await keeper
+                CURRENT_FENCE.reset(token)
+                async with session_factory() as db:
+                    await release(db, fence)
+
+    async def _keep_lease(self, fence: RunFence, run: asyncio.Task[Any] | None) -> None:
+        """Renew the lease; cancel the run when the lease is lost (fail closed)."""
+        while True:
+            await asyncio.sleep(FENCE_LEASE_SECONDS / 3)
+            try:
+                async with session_factory() as db:
+                    db.sync_session.info["fence_exempt"] = True
+                    renewed = await renew(db, fence, lease_seconds=FENCE_LEASE_SECONDS)
+            except Exception:
+                logger.exception("Session %s: lease renewal failed", fence.session_id)
+                renewed = False
+            if not renewed:
+                if run is not None:
+                    run.cancel()
+                return
 
     async def _mark_error(self, session_id: str, exc: Exception) -> None:
         async with session_factory() as db:
@@ -385,9 +520,7 @@ class AgentSupervisor:
                     await db.execute(
                         update(Session)
                         .where(Session.id == session.id, Session.status.not_in(TERMINAL_STATUSES))
-                        .values(
-                            status=SessionStatus.running.value, error=None, stop_requested=False
-                        )
+                        .values(status=SessionStatus.running.value, error=None)
                     ),
                 )
                 await db.commit()
@@ -432,18 +565,41 @@ class AgentSupervisor:
                     {**dict(raw_call), "id": f"call_{uuid.uuid4().hex}"}
                     for raw_call in response.tool_calls
                 ]
+                if response.finish_reason == "length":
+                    # The output limit cut the reply. It is not a result: keep the partial text
+                    # for diagnosis (kind "interrupted" never reaches the model), run no tool
+                    # call from it, and stop with advice. No hidden second request.
+                    db.add(
+                        Message(
+                            session_id=session.id,
+                            role="assistant",
+                            kind="interrupted",
+                            content=response.content,
+                            tool_calls=[_history_safe_call(c) for c in normalized_calls] or None,
+                            token_count=response.completion_tokens or None,
+                            reasoning_content=response.reasoning,
+                            reasoning_effort=reasoning_effort,
+                        )
+                    )
+                    await db.commit()
+                    raise ToolError(
+                        "The model reply was cut off by the output limit, so it was not used "
+                        "and no tool ran. Ask for smaller steps, for example write a large "
+                        "file in parts."
+                    )
 
-                assistant = Message(
-                    session_id=session.id,
+                assistant = await append_message(
+                    db,
+                    session.id,
                     role="assistant",
                     content=response.content,
-                    tool_calls=normalized_calls or None,
+                    # The provider rejects a history with invalid JSON arguments, so the stored
+                    # copy carries "{}" for them; the tool result reports the real problem.
+                    tool_calls=[_history_safe_call(call) for call in normalized_calls] or None,
                     token_count=response.completion_tokens or None,
                     reasoning_content=response.reasoning,
                     reasoning_effort=reasoning_effort,
                 )
-                db.add(assistant)
-                await db.flush()
 
                 if not normalized_calls:
                     await db.commit()
@@ -493,13 +649,12 @@ class AgentSupervisor:
                             result={"success": False, "error": str(exc)},
                         )
                         db.add(call)
-                        db.add(
-                            Message(
-                                session_id=session.id,
-                                role="tool",
-                                tool_call_id=call_id,
-                                content=json.dumps(call.result, ensure_ascii=False),
-                            )
+                        await append_message(
+                            db,
+                            session.id,
+                            role="tool",
+                            tool_call_id=call_id,
+                            content=json.dumps(call.result, ensure_ascii=False),
                         )
                         continue
 
@@ -567,13 +722,12 @@ class AgentSupervisor:
                         "to avoid repeating a possible side effect"
                     ),
                 }
-                db.add(
-                    Message(
-                        session_id=session.id,
-                        role="tool",
-                        tool_call_id=call.id,
-                        content=json.dumps(call.result, ensure_ascii=False),
-                    )
+                await append_message(
+                    db,
+                    session.id,
+                    role="tool",
+                    tool_call_id=call.id,
+                    content=json.dumps(call.result, ensure_ascii=False),
                 )
                 await db.commit()
                 processed = True
@@ -646,13 +800,12 @@ class AgentSupervisor:
             result = {"success": False, "error": str(exc)}
             call.status = ToolCallStatus.error.value
         call.result = result
-        db.add(
-            Message(
-                session_id=session.id,
-                role="tool",
-                tool_call_id=call.id,
-                content=json.dumps(result, ensure_ascii=False),
-            )
+        await append_message(
+            db,
+            session.id,
+            role="tool",
+            tool_call_id=call.id,
+            content=json.dumps(result, ensure_ascii=False),
         )
         await db.commit()
         await emit_event(

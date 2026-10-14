@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from math import ceil
 from typing import Any, Literal
 
+from agent.config import get_settings
 from agent.context_blocks import Block, flatten, protected_blocks, split_blocks
 from agent.context_budget import Budget, input_budget
 from agent.context_compaction import fold_write_arguments, mask_tool_result
@@ -420,7 +421,9 @@ class ContextManager:
 
         summary_calls = 0
         if summary_runner is not None and light_prefix:
-            request_msgs = build_summary_request(prefix_items, snapshot.checkpoint)
+            request_msgs = build_summary_request(
+                prefix_items, snapshot.checkpoint, language=get_settings().response_language
+            )
             summary_calls = 1
             text = await summary_runner(request_msgs)
 
@@ -543,7 +546,9 @@ def _msg_budget(
     summary_calibration_factor: float,
 ) -> int:
     """Approximate token budget of the summary request under the chosen rules."""
-    request_msgs = build_summary_request(items, snapshot.checkpoint)
+    request_msgs = build_summary_request(
+        items, snapshot.checkpoint, language=get_settings().response_language
+    )
     if summary_model is not None:
         request = build_wire_request(
             summary_model,

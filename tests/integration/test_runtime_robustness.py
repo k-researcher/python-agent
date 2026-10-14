@@ -130,9 +130,13 @@ def test_cut_off_streamed_reply_is_not_retried(tmp_path: Path) -> None:
     try:
         with authed_client() as client:
             session_id = project_session(client, tmp_path, "truncation")
-            wait_for(client, session_id, "completed")
+            wait_for(client, session_id, "error")
             messages = client.get(f"/api/sessions/{session_id}/messages").json()
+            session = client.get(f"/api/sessions/{session_id}").json()
+        # The partial text is kept for diagnosis only; it is not a completed answer.
         assert messages[-1]["content"] == "partial"
-        assert len(fake.budgets) == 1
+        assert messages[-1]["kind"] == "interrupted"
+        assert "cut off by the output limit" in session["error"]
+        assert len(fake.budgets) == 1  # no hidden second request
     finally:
         supervisor.llm = original

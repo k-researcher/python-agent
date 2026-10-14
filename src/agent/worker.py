@@ -112,7 +112,7 @@ class AgentWorker:
             wait_for_stop(message.session_id), name=f"stop-watch-{message.session_id}"
         )
         run_task = asyncio.create_task(
-            self.supervisor.run_job(message.session_id),
+            self.supervisor.run_job(message.session_id, message.generation),
             name=f"execute-session-{message.session_id}",
         )
         try:
@@ -129,7 +129,7 @@ class AgentWorker:
                     lock_heartbeat.result()
             else:
                 await run_task
-            await self.queue.acknowledge(message.message_id, message.session_id)
+            await self.queue.acknowledge(message.message_id, message.session_id, message.generation)
         except asyncio.CancelledError:
             run_task.cancel()
             raise

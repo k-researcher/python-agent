@@ -18,6 +18,8 @@ from agent.auth_api import router as auth_router
 from agent.config import get_settings
 from agent.database import init_database, session_factory
 from agent.events import broker
+from agent.frontend import frontend_response
+from agent.message_tree_api import router as message_tree_router
 from agent.settings_api import router as settings_router
 
 settings = get_settings()
@@ -74,6 +76,7 @@ async def browser_auth(request: Request, call_next: RequestResponseEndpoint) -> 
 app.include_router(auth_router)
 app.include_router(settings_router)
 app.include_router(router)
+app.include_router(message_tree_router)
 app.add_api_websocket_route("/ws", websocket_endpoint)
 
 
@@ -84,19 +87,7 @@ if settings.frontend_dist.is_dir():
 
     @app.get("/{path:path}", include_in_schema=False, response_model=None)
     async def frontend(path: str) -> FileResponse | JSONResponse:
-        if path:
-            try:
-                frontend_root = settings.frontend_dist.resolve(strict=True)
-                candidate = (frontend_root / path).resolve(strict=True)
-                candidate.relative_to(frontend_root)
-            except (OSError, ValueError):
-                return JSONResponse({"detail": "Not found"}, status_code=404)
-            if candidate.is_file():
-                return FileResponse(candidate)
-        index = settings.frontend_dist / "index.html"
-        if index.is_file():
-            return FileResponse(index)
-        return JSONResponse({"status": "frontend is not built"}, status_code=404)
+        return frontend_response(settings.frontend_dist, path)
 else:
 
     @app.get("/", include_in_schema=False)

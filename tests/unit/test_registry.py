@@ -35,10 +35,32 @@ def test_ask_definitions_are_read_only() -> None:
         "search_files",
         "glob",
         "read_many",
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_show",
+        "todo_write",
+        "todo_read",
         "excel_read",
         "excel_sheets",
     } == names
     assert all(registry.risk(name, "ask") is RiskLevel.read_only for name in names)
+
+
+def test_run_checks_is_a_dev_tool_that_needs_approval() -> None:
+    registry = ToolRegistry()
+    assert "run_checks" in {item["function"]["name"] for item in registry.definitions("dev")}
+    assert registry.risk("run_checks", "dev") is RiskLevel.process_execution
+    assert registry.requires_confirmation("run_checks", "dev") is True
+    with pytest.raises(ToolError):
+        registry.get("run_checks", "ask")
+
+
+def test_plan_tools_need_no_approval_in_both_modes() -> None:
+    registry = ToolRegistry()
+    for mode in ("ask", "dev"):
+        for name in ("todo_write", "todo_read"):
+            assert registry.requires_confirmation(name, mode) is False
 
 
 def test_disabled_capabilities_are_not_exposed_to_model() -> None:

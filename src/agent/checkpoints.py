@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent.context_summary import SUMMARY_VERSION, SummaryCheckpoint
+from agent.context_summary import SUMMARY_VERSION, SummaryCheckpoint, source_hash
 from agent.models import Message
 
 _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -18,17 +19,66 @@ class CheckpointError(ValueError):
     """Raised when a checkpoint cannot be saved."""
 
 
+_SOURCE_FIELDS = (
+    "id",
+    "role",
+    "kind",
+    "skipped",
+    "content",
+    "tool_calls",
+    "tool_call_id",
+    "reasoning_content",
+    "reasoning_effort",
+)
+
+
+def source_item(message: Message) -> dict[str, Any]:
+    """Return the fields of a message that the stored checkpoint hash covers."""
+    return {name: getattr(message, name) for name in _SOURCE_FIELDS}
+
+
+async def stored_source_hash(db: AsyncSession, session_id: str, covers_until: int) -> str:
+    """Return the hash of all non-summary rows up to ``covers_until``, as saved with a summary.
+
+    The hash covers every such row, hidden ones too, with its ``skipped`` flag. So it
+    changes when an edit or a branch switch changes the rows that the summary covered.
+    """
+    prefix: list[dict[str, Any]] = []
+    cursor = 0
+    while True:
+        page = list(
+            await db.scalars(
+                select(Message)
+                .where(
+                    Message.session_id == session_id,
+                    Message.kind != "summary",
+                    Message.id > cursor,
+                    Message.id <= covers_until,
+                )
+                .order_by(Message.id)
+                .limit(500)
+            )
+        )
+        if not page:
+            return source_hash(prefix)
+        prefix.extend(source_item(row) for row in page)
+        cursor = page[-1].id
+
+
 async def load_context_rows(db: AsyncSession, session_id: str) -> list[Message]:
     """Return session rows for the context window.
 
     With a usable checkpoint, anchor around it: leading system rows, the first
     normal user message, the checkpoint itself and the covered tail. Otherwise
-    return all session rows ordered by id.
+    return all session rows ordered by id, except summary rows: no summary is
+    usable then (for example, it covers a hidden branch), so none may reach a reader.
     """
     checkpoint = await _best_checkpoint(db, session_id)
     if checkpoint is None:
         all_rows = await db.scalars(
-            select(Message).where(Message.session_id == session_id).order_by(Message.id)
+            select(Message)
+            .where(Message.session_id == session_id, Message.kind != "summary")
+            .order_by(Message.id)
         )
         return list(all_rows)
 
@@ -127,11 +177,15 @@ async def _best_checkpoint(db: AsyncSession, session_id: str) -> Message | None:
 async def _is_usable_checkpoint(db: AsyncSession, session_id: str, message: Message) -> bool:
     """Return True when a stored checkpoint row carries well-formed metadata.
 
-    Rejects whitespace-only text, non-hex or wrong-length source hashes and
-    coverage that does not point to a real source (non-summary) message of the
-    same session. The covered message must be older than the checkpoint row: a
-    checkpoint is always saved after the messages that it covers.
+    Rejects skipped/hidden summary rows, whitespace-only text, non-hex or
+    wrong-length source hashes and coverage that does not point to an active
+    (kind == "normal", skipped == False) source message of the same session.
+    The covered message must be older than the checkpoint row: a checkpoint is
+    always saved after the messages that it covers. The stored source hash must
+    match the current covered rows (see stored_source_hash).
     """
+    if message.skipped:
+        return False
     if not message.content or not message.content.strip():
         return False
     if not message.source_hash or not _HEX64.fullmatch(message.source_hash):
@@ -142,10 +196,16 @@ async def _is_usable_checkpoint(db: AsyncSession, session_id: str, message: Mess
         select(Message.id).where(
             Message.id == message.covers_until,
             Message.session_id == session_id,
-            Message.kind != "summary",
+            Message.kind == "normal",
+            Message.skipped.is_(False),
         )
     )
-    return covered is not None and covered < message.id
+    if covered is None or covered >= message.id:
+        return False
+    # The stored hash must still match the covered rows: a summary of other or changed
+    # history is never used.
+    stored = await stored_source_hash(db, session_id, message.covers_until)
+    return stored == message.source_hash.lower()
 
 
 async def _leading_system_rows(db: AsyncSession, session_id: str) -> list[Message]:

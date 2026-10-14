@@ -81,8 +81,15 @@ def _is_valid_hex(source_hash: str) -> bool:
     return len(source_hash) == 64 and all(char in _HEX_DIGITS for char in source_hash)
 
 
-def _eligible_checkpoint(row: SourceMessage, non_summary_ids: set[int]) -> bool:
-    """Return True when a summary row carries a usable checkpoint payload."""
+def _eligible_checkpoint(row: SourceMessage, active_source_ids: set[int]) -> bool:
+    """Return True when a summary row carries a usable checkpoint payload.
+
+    A usable checkpoint is not itself hidden and its ``covers_until`` points to
+    an active (kind == \"normal\", skipped == False) source row of the same
+    session with a smaller id.
+    """
+    if row.skipped:
+        return False
     if row.summary_version != SUMMARY_VERSION:
         return False
     if not row.content or not row.content.strip():
@@ -92,7 +99,7 @@ def _eligible_checkpoint(row: SourceMessage, non_summary_ids: set[int]) -> bool:
     covers_until = row.covers_until
     if covers_until is None:
         return False
-    return covers_until in non_summary_ids and covers_until < row.id
+    return covers_until in active_source_ids and covers_until < row.id
 
 
 def build_snapshot(rows: Sequence[SourceMessage]) -> HistorySnapshot:
@@ -104,12 +111,12 @@ def build_snapshot(rows: Sequence[SourceMessage]) -> HistorySnapshot:
     system rows, the first user row and the rows after ``covers_until`` remain.
     """
     candidate = [row for row in rows if row.kind == "normal" and not row.skipped]
-    non_summary_ids = {row.id for row in rows if row.kind != "summary"}
+    active_source_ids = {row.id for row in candidate}
 
     best: SourceMessage | None = None
     best_key = (-1, -1)
     for row in rows:
-        if row.kind != "summary" or not _eligible_checkpoint(row, non_summary_ids):
+        if row.kind != "summary" or not _eligible_checkpoint(row, active_source_ids):
             continue
         key = (row.covers_until or 0, row.id)
         if key > best_key:

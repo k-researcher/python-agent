@@ -1039,7 +1039,12 @@ def test_compatible_summary_estimate_matches_plain_json() -> None:
         summary_model=None,
         summary_calibration_factor=1.0,
     )
-    request_msgs = build_summary_request(items, snapshot.checkpoint)
+    # The estimate covers the real request, which carries the configured language rule.
+    from agent.config import get_settings
+
+    request_msgs = build_summary_request(
+        items, snapshot.checkpoint, language=get_settings().response_language
+    )
     assert estimate == len(json.dumps(request_msgs)) // 4
 
 

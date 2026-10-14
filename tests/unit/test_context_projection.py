@@ -47,6 +47,7 @@ def _summary(
     content: str = "summary text",
     source_hash: str = VALID_HASH,
     version: int = SUMMARY_VERSION,
+    skipped: bool = False,
 ) -> SourceMessage:
     return SourceMessage(
         id=id,
@@ -56,6 +57,7 @@ def _summary(
         covers_until=covers_until,
         source_hash=source_hash,
         summary_version=version,
+        skipped=skipped,
     )
 
 
@@ -251,6 +253,75 @@ def test_checkpoint_stores_raw_content_not_stripped() -> None:
     snapshot = build_snapshot([_msg(1, "user", "task"), _summary(2, 1, content=raw)])
     assert snapshot.checkpoint is not None
     assert snapshot.checkpoint.text == raw
+
+
+def test_skipped_summary_is_not_selected() -> None:
+    rows = [
+        _msg(1, "user", "task"),
+        _msg(2, "assistant", "a"),
+        _msg(3, "user", "follow-up"),
+        _summary(id=4, covers_until=3, skipped=True),
+    ]
+    snapshot = build_snapshot(rows)
+    assert snapshot.checkpoint is None
+    assert snapshot.checkpoint_message_id is None
+    assert [message.id for message in snapshot.messages] == [1, 2, 3]
+
+
+def test_summary_covers_skipped_row_is_not_selected() -> None:
+    rows = [
+        _msg(1, "user", "task"),
+        _msg(2, "assistant", "a", skipped=True),
+        _msg(3, "user", "follow-up"),
+        _summary(id=4, covers_until=2),
+    ]
+    snapshot = build_snapshot(rows)
+    assert snapshot.checkpoint is None
+    assert snapshot.checkpoint_message_id is None
+    assert [message.id for message in snapshot.messages] == [1, 3]
+
+
+def test_summary_covers_skipped_row_falls_to_valid() -> None:
+    rows = [
+        _msg(1, "user", "task"),
+        _msg(2, "assistant", "a", skipped=True),
+        _msg(3, "user", "follow-up"),
+        _summary(id=4, covers_until=1, content="small valid"),
+        _summary(id=5, covers_until=2, content="covers skipped"),
+    ]
+    snapshot = build_snapshot(rows)
+    assert snapshot.checkpoint is not None
+    assert snapshot.checkpoint.text == "small valid"
+    assert snapshot.checkpoint_message_id == 4
+
+
+def test_best_summary_skipped_falls_to_second() -> None:
+    rows = [
+        _msg(1, "user", "task"),
+        _msg(2, "assistant", "a"),
+        _msg(3, "user", "follow-up"),
+        _summary(id=4, covers_until=1, content="small valid"),
+        _summary(id=5, covers_until=3, content="hidden large", skipped=True),
+    ]
+    snapshot = build_snapshot(rows)
+    assert snapshot.checkpoint is not None
+    assert snapshot.checkpoint.text == "small valid"
+    assert snapshot.checkpoint_message_id == 4
+    assert [message.id for message in snapshot.messages] == [1, 2, 3]
+
+
+def test_valid_summary_still_selected_when_hidden_present() -> None:
+    rows = [
+        _msg(1, "user", "task"),
+        _msg(2, "assistant", "a"),
+        _summary(id=3, covers_until=2, content="visible summary"),
+        _summary(id=4, covers_until=2, content="hidden same-coverage", skipped=True),
+    ]
+    snapshot = build_snapshot(rows)
+    assert snapshot.checkpoint is not None
+    assert snapshot.checkpoint.text == "visible summary"
+    assert snapshot.checkpoint_message_id == 3
+    assert [message.id for message in snapshot.messages] == [1]
 
 
 # --------------------------------------------------------------------------- #

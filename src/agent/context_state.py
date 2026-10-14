@@ -7,7 +7,7 @@ from typing import Any, cast
 from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent.checkpoints import load_context_rows, save_checkpoint
+from agent.checkpoints import load_context_rows, save_checkpoint, source_item
 from agent.context_blocks import split_blocks
 from agent.context_projection import HistorySnapshot, SourceMessage
 from agent.context_summary import SummaryCheckpoint, source_hash
@@ -25,23 +25,6 @@ class LoadedHistory:
     cursor: int
     fingerprint: str
     covered_messages: int
-
-
-def source_item(message: Message) -> dict[str, Any]:
-    return {
-        name: getattr(message, name)
-        for name in (
-            "id",
-            "role",
-            "kind",
-            "skipped",
-            "content",
-            "tool_calls",
-            "tool_call_id",
-            "reasoning_content",
-            "reasoning_effort",
-        )
-    }
 
 
 async def load_history(db: AsyncSession, session_id: str) -> LoadedHistory:

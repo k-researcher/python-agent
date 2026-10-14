@@ -14,16 +14,21 @@ _MAX_EDIT_BYTES = 1_000_000
 _READ_CHUNK_BYTES = 65_536
 
 
+class MissingFileError(ToolError):
+    """The file does not exist."""
+
+
 class SafeProjectFS:
     """Perform POSIX file operations without following project symlinks."""
 
     def __init__(self, root: Path) -> None:
-        required = {os.open, os.stat, os.mkdir, os.rename, os.unlink}
+        required = {os.open, os.stat, os.mkdir, os.rename, os.unlink, os.link}
         flags = ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
         if (
             os.name != "posix"
             or not required.issubset(os.supports_dir_fd)
             or os.stat not in os.supports_follow_symlinks
+            or os.link not in os.supports_follow_symlinks
             or not all(hasattr(os, flag) for flag in flags)
             or not all(hasattr(os, primitive) for primitive in ("fchmod", "fsync", "replace"))
         ):
@@ -35,6 +40,53 @@ class SafeProjectFS:
         with self._parent(relative, create_parents=create_parents) as (parent_fd, name):
             existing = self._file_stat(name, parent_fd)
             self._replace_text(name, parent_fd, content, existing, check_conflict=False)
+        return relative
+
+    def create_text_exclusive(self, path: str, content: str) -> Path:
+        """Create a file only if it does not already exist.
+
+        The creation is atomic and never follows a symlink. It writes the
+        content to a unique temporary file and links it into place with
+        ``os.link``, which fails with ``FileExistsError`` when the target
+        exists. Raises :class:`ToolError` ("File already exists") in that case.
+        """
+        relative = self._relative_path(path)
+        with self._parent(relative, create_parents=True) as (parent_fd, name):
+            if self._file_stat(name, parent_fd) is not None:
+                raise ToolError("File already exists")
+            try:
+                data = memoryview(content.encode("utf-8"))
+            except UnicodeEncodeError as exc:
+                raise ToolError("Content is not valid UTF-8 text") from exc
+            temporary, descriptor = self._create_temp(parent_fd)
+            try:
+                while data:
+                    written = os.write(descriptor, data)
+                    if written <= 0:
+                        raise ToolError("Could not write temporary file")
+                    data = data[written:]
+                os.fsync(descriptor)
+                try:
+                    os.link(
+                        temporary,
+                        name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError as exc:
+                    raise ToolError("File already exists") from exc
+                # os.link adds a second name; remove the temporary name, or it stays behind.
+                os.unlink(temporary, dir_fd=parent_fd)
+                temporary = ""
+                self._sync_directory(parent_fd)
+            finally:
+                try:
+                    os.close(descriptor)
+                finally:
+                    if temporary:
+                        with suppress(OSError):
+                            os.unlink(temporary, dir_fd=parent_fd)
         return relative
 
     def edit_text(self, path: str, old: str, new: str, *, replace_all: bool) -> tuple[Path, int]:
@@ -91,9 +143,62 @@ class SafeProjectFS:
         relative = self._relative_path(path)
         with self._parent(relative) as (parent_fd, name):
             if self._file_stat(name, parent_fd) is None:
-                raise ToolError("File does not exist")
+                raise MissingFileError("File does not exist")
             os.unlink(name, dir_fd=parent_fd)
             self._sync_directory(parent_fd)
+        return relative
+
+    def remove_if_unchanged(self, path: str, expected: str) -> Path:
+        """Remove the file only if its content equals ``expected``.
+
+        Reads the file and compares it to ``expected``. Rechecks the file
+        before the unlink to guard against a concurrent change between the
+        read and the unlink. Raises :class:`ToolError` ("File changed
+        (conflict)") on a mismatch.
+
+        Limitation: the unlink itself is not a compare-and-swap. A concurrent
+        replacement between the final version check and the unlink could
+        remove the replacement file. This narrow window is inherent to unlink.
+        """
+        relative = self._relative_path(path)
+        with self._parent(relative) as (parent_fd, name):
+            content, existing = self._read_regular(name, parent_fd, _MAX_EDIT_BYTES)
+            if content != expected:
+                raise ToolError("File changed (conflict)")
+            current = self._file_stat(name, parent_fd)
+            if current is None or not self._same_version(existing, current):
+                raise ToolError("File changed during delete (conflict)")
+            os.unlink(name, dir_fd=parent_fd)
+            self._sync_directory(parent_fd)
+        return relative
+
+    def exists(self, path: str) -> bool:
+        """Return whether the file exists without following symlinks.
+
+        Returns ``False`` when the file or any parent directory is missing or
+        cannot be safely opened.
+        """
+        relative = self._relative_path(path)
+        try:
+            with self._parent(relative) as (parent_fd, name):
+                return self._file_stat(name, parent_fd) is not None
+        except ToolError:
+            return False
+
+    def replace_if_unchanged(self, path: str, expected: str, new: str) -> Path:
+        """Atomically replace the file content only if it equals ``expected``.
+
+        Reads the file once and compares it to ``expected``; raises
+        :class:`ToolError` (\"File changed (conflict)\") on mismatch. Writes via
+        :meth:`_replace_text` with ``check_conflict=True`` to guard against a
+        concurrent change between the read and the replace.
+        """
+        relative = self._relative_path(path)
+        with self._parent(relative) as (parent_fd, name):
+            content, existing = self._read_regular(name, parent_fd, _MAX_EDIT_BYTES)
+            if content != expected:
+                raise ToolError("File changed (conflict)")
+            self._replace_text(name, parent_fd, new, existing, check_conflict=True)
         return relative
 
     def _relative_path(self, value: str) -> Path:
@@ -186,7 +291,7 @@ class SafeProjectFS:
     ) -> tuple[str, os.stat_result]:
         initial = self._file_stat(name, parent_fd)
         if initial is None:
-            raise ToolError("File does not exist")
+            raise MissingFileError("File does not exist")
         try:
             descriptor = os.open(
                 name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd
