@@ -114,6 +114,9 @@ class Settings(BaseSettings):
 
     data_dir: Path = PROJECT_ROOT / "data"
     prompts_dir: Path = PROJECT_ROOT / "prompts"
+    # Language of answers, summaries and, where the model allows, reasoning ("ru" by default).
+    # An empty value removes the language rule from the prompts.
+    response_language: str = Field(default="ru", max_length=20)
     frontend_dist: Path = PROJECT_ROOT / "frontend" / "dist"
 
     def prepare_directories(self) -> None:

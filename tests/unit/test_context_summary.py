@@ -10,6 +10,7 @@ from agent.context_summary import (
     SummaryCheckpoint,
     build_summary_request,
     deterministic_summary,
+    language_rule,
     normalize_summary,
     render_summary_item,
     source_hash,
@@ -261,3 +262,22 @@ def test_normalize_limit_keeps_added_sections() -> None:
     assert len(result) <= 6000
     for section in SECTIONS:
         assert f"## {section}" in result
+
+
+def test_language_rule_values() -> None:
+    assert "по-русски" in language_rule("ru")
+    assert "по-русски" in language_rule(" RU ")
+    assert "English" in language_rule("en")
+    assert language_rule("") == ""
+    assert "de" in language_rule("de")
+
+
+def test_summary_request_adds_the_language_rule_and_keeps_headings() -> None:
+    items = [{"role": "user", "content": "task"}, {"role": "assistant", "content": "done"}]
+    plain = build_summary_request(items, None)[0]["content"]
+    russian = build_summary_request(items, None, language="ru")[0]["content"]
+    assert "по-русски" not in plain
+    assert "по-русски" in russian
+    assert "Keep the section headings exactly as given." in russian
+    for section in SECTIONS:
+        assert f"## {section}" in russian

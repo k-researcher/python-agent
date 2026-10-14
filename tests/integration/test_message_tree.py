@@ -1012,3 +1012,34 @@ async def test_runtime_history_uses_checkpoint_only_on_its_branch(tmp_path: Path
         history = await load_history(db, session_id)
     assert history.snapshot.checkpoint is not None
     assert visible(history) == ["s", "u1", "u2", "a2"]
+
+
+async def test_system_prompt_carries_the_response_language(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent.session_service import create_session_record
+
+    await init_database(recover_running=False)
+    async with session_factory() as db:
+        project = Project(name="lang", root_path=str(tmp_path / "lang"))
+        db.add(project)
+        await db.commit()
+        project_id = project.id
+    for language, expected in (("ru", "по-русски"), ("", None)):
+        monkeypatch.setattr(get_settings(), "response_language", language, raising=False)
+        async with session_factory() as db:
+            project = await db.get(Project, project_id)
+            assert project is not None
+            session = await create_session_record(
+                db, get_settings(), project, prompt="task", mode="ask"
+            )
+            system = await db.scalar(
+                select(Message.content).where(
+                    Message.session_id == session.id, Message.role == "system"
+                )
+            )
+        assert system is not None
+        if expected:
+            assert expected in system
+        else:
+            assert "по-русски" not in system

@@ -5,6 +5,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.config import Settings
+from agent.context_summary import language_rule
 from agent.message_tree import append_message
 from agent.model_registry import effective_registry, select_model
 from agent.models import Project, Session, SessionStatus
@@ -32,6 +33,9 @@ async def create_session_record(
         raise ValueError(f"Prompt is missing for mode {mode}")
 
     system_prompt = prompt_file.read_text(encoding="utf-8")
+    rule = language_rule(settings.response_language)
+    if rule:
+        system_prompt += f"\n\n{rule}"
     system_prompt += f"\n\nКорневая директория проекта: `{project.root_path}`"
     session = Session(
         project_id=project.id,
