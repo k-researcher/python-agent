@@ -21,25 +21,45 @@ def _check_host(hostname: str, allowlist: list[str]) -> str:
 
 
 def _blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    return any(
-        (
-            ip.is_private,
-            ip.is_loopback,
-            ip.is_link_local,
-            ip.is_multicast,
-            ip.is_reserved,
-            ip.is_unspecified,
-        )
+    """Return True for every address that is not a public unicast address.
+
+    An IPv4-mapped IPv6 address is checked as its IPv4 address. ``is_global`` is False
+    for private, loopback, link-local, shared (CGNAT 100.64.0.0/10), documentation and
+    other special ranges; the other flags close the remaining special cases.
+    """
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return (
+        not ip.is_global
+        or ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
     )
 
 
-async def resolve_checked(hostname: str, port: int, allowlist: list[str]) -> list[str]:
-    """Resolve an allowed host and return its addresses; refuse when any address is blocked."""
+# Upper limit of one DNS lookup, also when the caller gives no timeout.
+DNS_TIMEOUT_SECONDS = 10.0
+
+
+async def resolve_checked(
+    hostname: str, port: int, allowlist: list[str], *, timeout: float | None = None
+) -> list[str]:
+    """Resolve an allowed host and return its addresses; refuse when any address is blocked.
+
+    The lookup stops after ``timeout`` seconds, and never later than DNS_TIMEOUT_SECONDS.
+    """
     host = _check_host(hostname, allowlist)
+    limit = DNS_TIMEOUT_SECONDS if timeout is None else min(timeout, DNS_TIMEOUT_SECONDS)
     try:
-        addresses = await asyncio.get_running_loop().getaddrinfo(
-            host, port, type=socket.SOCK_STREAM
+        addresses = await asyncio.wait_for(
+            asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM),
+            timeout=max(limit, 0.0),
         )
+    except TimeoutError as exc:
+        raise ToolError(f"DNS lookup timed out: {host}") from exc
     except OSError as exc:
         raise ToolError(f"Cannot resolve destination host: {host}") from exc
     result: list[str] = []
@@ -88,14 +108,24 @@ class PinnedNetworkBackend(httpcore.AsyncNetworkBackend):
         local_address: str | None = None,
         socket_options: typing.Iterable[httpcore.SOCKET_OPTION] | None = None,
     ) -> httpcore.AsyncNetworkStream:
-        addresses = await resolve_checked(host, port, self._allowlist)
+        loop = asyncio.get_running_loop()
+        # One deadline covers the lookup and all connect attempts.
+        deadline = None if timeout is None else loop.time() + timeout
+
+        def remaining() -> float | None:
+            return None if deadline is None else deadline - loop.time()
+
+        addresses = await resolve_checked(host, port, self._allowlist, timeout=remaining())
         error: Exception | None = None
         for address in addresses:
+            left = remaining()
+            if left is not None and left <= 0:
+                raise httpcore.ConnectTimeout(f"Connect deadline passed for {host}")
             try:
                 return await self._inner.connect_tcp(
                     address,
                     port,
-                    timeout=timeout,
+                    timeout=left,
                     local_address=local_address,
                     socket_options=socket_options,
                 )
@@ -122,10 +152,12 @@ class PinnedTransport(httpx.AsyncHTTPTransport):
     def __init__(
         self, allowlist: list[str], inner: httpcore.AsyncNetworkBackend | None = None
     ) -> None:
-        super().__init__()
+        # trust_env=False: SSL_CERT_FILE and SSL_CERT_DIR from the environment must not
+        # change the trusted certificates. The default store and hostname checks stay on.
+        super().__init__(trust_env=False)
         # httpx has no public option for the network backend: replace the pool it built.
         self._pool = httpcore.AsyncConnectionPool(
-            ssl_context=httpx.create_ssl_context(),
+            ssl_context=httpx.create_ssl_context(trust_env=False),
             network_backend=PinnedNetworkBackend(allowlist, inner),
         )
 
