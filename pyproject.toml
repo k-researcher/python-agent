@@ -40,7 +40,7 @@ dev = [
 ]
 
 [project.scripts]
-agent = "agent.cli:main"
+pyagent = "agent.cli:main"
 agent-worker = "agent.worker:run"
 
 [tool.hatch.build.targets.wheel]

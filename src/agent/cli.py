@@ -1,4 +1,4 @@
-"""``agent`` command: run the server or manage logins and configuration.
+"""``pyagent`` command: run the server or manage logins and configuration.
 
 Kept free of ``agent.main`` imports so auxiliary commands never build the app or supervisor.
 """
@@ -32,7 +32,7 @@ async def _auth_revoke_all() -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="agent", description="Python Agent")
+    parser = argparse.ArgumentParser(prog="pyagent", description="Python Agent")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("serve", help="run the API and UI (default)")
     auth = commands.add_parser("auth", help="browser logins").add_subparsers(
