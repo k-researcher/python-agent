@@ -20,8 +20,8 @@ from agent.config import Settings
 from agent.context_inference import ContextInference
 from agent.context_manager import ContextManager
 from agent.database import session_factory
-from agent.events import emit_event
-from agent.llm import LLMClient
+from agent.events import StreamPublisher, emit_event
+from agent.llm import LLMClient, LLMResponse
 from agent.message_tree import append_message
 from agent.model_config import ModelConfigError, ResolvedModel, ResolvedModelRegistry
 from agent.model_registry import effective_registry, select_model
@@ -38,7 +38,7 @@ from agent.models import (
     utcnow,
 )
 from agent.queue import RedisTaskQueue
-from agent.reasoning import ReasoningDecision, decide
+from agent.reasoning import ReasoningDecision, decide, lower_effort
 from agent.sandbox import policy_from_settings
 from agent.session_fence import (
     CURRENT_FENCE,
@@ -75,6 +75,33 @@ def _batch_result(outcome: BatchResult) -> dict[str, Any]:
     if outcome.ok:
         return {"success": True, "output": outcome.output}
     return {"success": False, "error": outcome.error}
+
+
+def _cut_in_reasoning(response: LLMResponse) -> bool:
+    """Tell whether the output limit cut the reply while the model was still reasoning."""
+    return (
+        response.finish_reason == "length"
+        and not (response.content or "").strip()
+        and not response.tool_calls
+        and bool((response.reasoning or "").strip())
+    )
+
+
+def _lowered(
+    decisions: dict[str, ReasoningDecision], models: ResolvedModelRegistry
+) -> dict[str, ReasoningDecision]:
+    """Return the decisions with each effective level one step lower where the model allows it."""
+    lowered: dict[str, ReasoningDecision] = {}
+    for model_id, decision in decisions.items():
+        lower = lower_effort(models.models[model_id], decision.effective)
+        lowered[model_id] = (
+            decision
+            if lower is None
+            else ReasoningDecision(
+                decision.requested, lower, decision.source, "lowered after a reply cut off"
+            )
+        )
+    return lowered
 
 
 def _history_safe_call(call: dict[str, Any]) -> dict[str, Any]:
@@ -548,26 +575,60 @@ class AgentSupervisor:
                 }
                 await db.commit()
 
-                def reasoning_for(
-                    candidate: ResolvedModel,
-                    snapshot: dict[str, ReasoningDecision] = decisions,
-                ) -> ReasoningDecision:
-                    return snapshot[candidate.id]
+                retried = False
+                while True:
 
-                inference = ContextInference(
-                    session.id,
-                    self.settings.context_reserved_tokens,
-                    definitions,
-                    models,
-                    partial(self._llm_for, models),
-                    reasoning_for,
-                )
-                outcome = await inference.run(model)
-                response = outcome.response
-                reasoning_effort = outcome.reasoning.effective
-                await db.refresh(session, attribute_names=["status", "stop_requested"])
-                if session.stop_requested or session.status == SessionStatus.stopped.value:
-                    return
+                    def reasoning_for(
+                        candidate: ResolvedModel,
+                        snapshot: dict[str, ReasoningDecision] = decisions,
+                    ) -> ReasoningDecision:
+                        return snapshot[candidate.id]
+
+                    inference = ContextInference(
+                        session.id,
+                        self.settings.context_reserved_tokens,
+                        definitions,
+                        models,
+                        partial(self._llm_for, models),
+                        reasoning_for,
+                    )
+                    outcome = await inference.run(model)
+                    response = outcome.response
+                    reasoning_effort = outcome.reasoning.effective
+                    await db.refresh(session, attribute_names=["status", "stop_requested"])
+                    if session.stop_requested or session.status == SessionStatus.stopped.value:
+                        return
+                    lower = lower_effort(outcome.model, reasoning_effort)
+                    if retried or lower is None or not _cut_in_reasoning(response):
+                        break
+                    # The output limit cut the reply during reasoning, before any text: keep the
+                    # cut reply for diagnosis and try once more with a lower reasoning level.
+                    retried = True
+                    db.add(
+                        Message(
+                            session_id=session.id,
+                            role="assistant",
+                            kind="interrupted",
+                            content=response.content,
+                            token_count=response.completion_tokens or None,
+                            reasoning_content=response.reasoning,
+                            reasoning_effort=reasoning_effort,
+                        )
+                    )
+                    await db.commit()
+                    await StreamPublisher(session.id).reset()
+                    await emit_event(
+                        db,
+                        "inference.retry",
+                        {
+                            "reason": "output_limit_in_reasoning",
+                            "model_id": outcome.model.id,
+                            "from": reasoning_effort,
+                            "to": lower,
+                        },
+                        session.id,
+                    )
+                    decisions = _lowered(decisions, models)
 
                 # Our own globally unique IDs: providers may omit or reuse theirs, and the
                 # step counter restarts whenever the loop resumes after an approval.
