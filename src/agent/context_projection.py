@@ -1,4 +1,4 @@
-"""Project a stored message history into LLM wire items (stage 2.3c).
+"""Project a stored message history into LLM wire items.
 
 Builds a plain, ORM-free snapshot of the source rows and renders it as
 OpenAI-style chat items. When a summary checkpoint is present, the projection

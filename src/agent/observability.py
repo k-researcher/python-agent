@@ -2,7 +2,7 @@
 
 This module provides a JSON logging formatter, helpers to time
 operations, and an accumulator for session-level usage statistics.
-It does not connect to the application at this phase.
+It is not connected to the application yet.
 """
 
 from __future__ import annotations

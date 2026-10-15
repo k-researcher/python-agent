@@ -1,4 +1,4 @@
-"""Session task plan tools for the agent (phase 4)."""
+"""Session task plan tools for the agent."""
 
 from __future__ import annotations
 

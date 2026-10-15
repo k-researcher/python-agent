@@ -261,7 +261,7 @@ def test_legacy_unknown_default_is_rejected() -> None:
 def test_decisions_enabled_is_rejected(tmp_path: Path) -> None:
     data = _data()
     data["decisions"] = {"enabled": True}
-    with pytest.raises(ModelConfigError, match="decisions.enabled.*unsupported in this phase"):
+    with pytest.raises(ModelConfigError, match="decisions.enabled.*not supported yet"):
         load_models(_write(tmp_path, data), {"MODEL_KEY": _SECRET}, None)
 
 
@@ -285,7 +285,9 @@ def test_unsupported_transport_selection_is_rejected(
         "fallback": ["future"],
         "roles": {"review": "future"},
     }[routing]
-    with pytest.raises(ModelConfigError, match=f"routing.{routing}.*unsupported transport"):
+    with pytest.raises(
+        ModelConfigError, match=f"routing.{routing}.*transport is not supported yet"
+    ):
         load_models(_write(tmp_path, data), {"MODEL_KEY": _SECRET}, None)
 
 

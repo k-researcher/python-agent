@@ -143,7 +143,7 @@ class ProviderSpec(_Spec):
     api_key_env: str | None = None
     timeout_seconds: float = Field(default=120, gt=0)
     max_retries: int = Field(default=2, ge=0, le=10)
-    # Flexible provider features (phase 4.1, section 11.6).
+    # Flexible provider features.
     auth: AuthSpec | None = None
     # Extra headers; a value may reference the environment as ${NAME}.
     headers: dict[str, str] = Field(default_factory=dict, max_length=32)
@@ -258,7 +258,7 @@ class DecisionsSpec(_Spec):
     @classmethod
     def validate_enabled(cls, value: bool) -> bool:
         if value:
-            raise ValueError("unsupported in this phase")
+            raise ValueError("not supported yet")
         return value
 
 
@@ -309,7 +309,7 @@ class ModelsConfig(_Spec):
                 selected_model.provider in self.providers
                 and self.providers[selected_model.provider].kind not in SUPPORTED_TRANSPORTS
             ):
-                errors.append(_validation_issue(location, "unsupported transport in this phase"))
+                errors.append(_validation_issue(location, "transport is not supported yet"))
         if errors:
             raise ValidationError.from_exception_data(type(self).__name__, errors, hide_input=True)
         return self
