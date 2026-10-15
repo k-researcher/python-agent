@@ -11,12 +11,13 @@ import fakeredis.aioredis
 import pytest
 from sqlalchemy import update
 
+import agent.runtime as runtime
 from agent.config import Settings, get_settings
 from agent.database import init_database, session_factory
 from agent.models import Project, Session, SessionStatus
 from agent.queue import RedisTaskQueue
 from agent.runtime import AgentSupervisor
-from agent.session_fence import CURRENT_FENCE
+from agent.session_fence import CURRENT_FENCE, new_generation
 
 
 async def make_session(root: Path, **values: Any) -> str:
@@ -223,3 +224,166 @@ async def test_expected_generation_with_new_run_is_rejected(tmp_path: Path) -> N
         session = await db.get(Session, session_id)
         assert session is not None and session.run_generation == 1
     assert session_id not in supervisor._tasks
+
+
+async def test_stop_scoped_does_not_affect_newer_generation(tmp_path: Path) -> None:
+    supervisor = RecordingSupervisor()
+    session_id = await make_session(tmp_path, run_generation=1)
+    assert await supervisor.start(session_id, new_run=False, expected_generation=1)
+    old_task = supervisor._tasks[session_id]
+    async with session_factory() as db:
+        await db.execute(update(Session).where(Session.id == session_id).values(run_generation=2))
+        await db.commit()
+    assert await supervisor.start(session_id, new_run=False, expected_generation=2)
+    new_task = supervisor._tasks[session_id]
+    await asyncio.sleep(0)
+
+    # A stale stop of generation 1 must not affect generation 2.
+    assert await supervisor.stop_scoped(session_id, 1) is False
+    async with session_factory() as db:
+        session = await db.get(Session, session_id)
+        assert session is not None
+        assert session.run_generation == 2
+        assert session.stop_requested is False
+    assert not new_task.cancelled()
+
+    # A stop of the current generation cancels its task.
+    assert await supervisor.stop_scoped(session_id, 2) is True
+    assert new_task.cancelled()
+
+    supervisor.release.set()
+    await asyncio.gather(old_task, return_exceptions=True)
+
+
+# --- scoped Stop after the commit: events fail, the caller is cancelled, a newer run starts
+
+
+class WaitingSupervisor(AgentSupervisor):
+    """Hold each scheduled task at an explicit barrier and report its generation."""
+
+    def __init__(self) -> None:
+        super().__init__(get_settings())
+        self.entered: asyncio.Queue[int | None] = asyncio.Queue()
+        self.release = asyncio.Event()
+
+    async def _run(self, session_id: str) -> None:
+        fence = CURRENT_FENCE.get()
+        assert fence is not None
+        await self.entered.put(fence.generation)
+        await self.release.wait()
+
+
+async def assert_stopped(session_id: str) -> None:
+    async with session_factory() as db:
+        stored = await db.get(Session, session_id)
+        assert stored is not None
+        assert stored.status == SessionStatus.stopped.value
+        assert stored.stop_requested is True
+        assert stored.run_generation == 2
+
+
+async def test_event_failure_after_commit_still_cancels_expected_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = WaitingSupervisor()
+    session_id = await make_session(tmp_path, run_generation=1)
+    assert await supervisor.start(session_id, new_run=False, expected_generation=1)
+    assert await asyncio.wait_for(supervisor.entered.get(), 2) == 1
+    task = supervisor._tasks[session_id]
+
+    async def broken_event(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("synthetic event failure")
+
+    monkeypatch.setattr(runtime, "emit_event", broken_event)
+    try:
+        # A time limit: without the immediate cancel only the lease loss (60 s) ends the task.
+        with pytest.raises(RuntimeError, match="synthetic event failure"):
+            async with asyncio.timeout(5):
+                await supervisor.stop_scoped(session_id, 1)
+        await assert_stopped(session_id)
+        assert task.cancelled()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_cancelled_stop_after_commit_still_cancels_expected_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = WaitingSupervisor()
+    session_id = await make_session(tmp_path, run_generation=1)
+    assert await supervisor.start(session_id, new_run=False, expected_generation=1)
+    assert await asyncio.wait_for(supervisor.entered.get(), 2) == 1
+    task = supervisor._tasks[session_id]
+    in_event = asyncio.Event()
+    release_event = asyncio.Event()
+
+    async def blocked_event(*args: object, **kwargs: object) -> None:
+        in_event.set()
+        await release_event.wait()
+
+    monkeypatch.setattr(runtime, "emit_event", blocked_event)
+    stop_task = asyncio.create_task(supervisor.stop_scoped(session_id, 1))
+    try:
+        await asyncio.wait_for(in_event.wait(), 2)
+        await assert_stopped(session_id)
+        stop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            async with asyncio.timeout(5):
+                await stop_task
+        assert task.cancelled()
+    finally:
+        release_event.set()
+        stop_task.cancel()
+        task.cancel()
+        await asyncio.gather(stop_task, task, return_exceptions=True)
+
+
+async def test_replaced_registry_after_commit_cancels_only_old_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor = WaitingSupervisor()
+    session_id = await make_session(tmp_path, run_generation=1)
+    assert await supervisor.start(session_id, new_run=False, expected_generation=1)
+    assert await asyncio.wait_for(supervisor.entered.get(), 2) == 1
+    old_task = supervisor._tasks[session_id]
+    in_event = asyncio.Event()
+    release_event = asyncio.Event()
+
+    async def blocked_event(*args: object, **kwargs: object) -> None:
+        in_event.set()
+        await release_event.wait()
+
+    monkeypatch.setattr(runtime, "emit_event", blocked_event)
+    stop_task = asyncio.create_task(supervisor.stop_scoped(session_id, 1))
+    tasks = [old_task, stop_task]
+    try:
+        await asyncio.wait_for(in_event.wait(), 2)
+        await assert_stopped(session_id)
+        async with session_factory() as db:
+            await new_generation(db, session_id)
+            await db.execute(
+                update(Session).where(Session.id == session_id).values(status="pending")
+            )
+            await db.commit()
+        assert await supervisor.start(session_id, new_run=False, expected_generation=3)
+        assert await asyncio.wait_for(supervisor.entered.get(), 2) == 3
+        new_task = supervisor._tasks[session_id]
+        tasks.append(new_task)
+        assert new_task is not old_task
+        release_event.set()
+        async with asyncio.timeout(5):
+            assert await stop_task is True
+        assert not new_task.done()
+        async with session_factory() as db:
+            stored = await db.get(Session, session_id)
+            assert stored is not None
+            assert stored.run_generation == 3
+            assert stored.stop_requested is False
+            assert stored.status == "pending"
+        assert old_task.cancelled()
+    finally:
+        release_event.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session as SyncSession
 
 from agent.models import Session as SessionRow
+from agent.models import SessionStatus
 
 TERMINAL_STATUSES = ("completed", "stopped", "error")
 
@@ -195,6 +196,41 @@ async def stop_generation(db: AsyncSession, session_id: str) -> bool:
     statement = (
         sa.update(_sessions)
         .where(_sessions.c.id == session_id, _sessions.c.stop_requested.is_(False))
+        .values(
+            run_generation=_sessions.c.run_generation + 1,
+            owner_token=None,
+            lease_until=None,
+            stop_requested=True,
+        )
+    )
+    return await _rowcount(db, statement) == 1
+
+
+_SCOPED_TERMINAL_STATUSES = (
+    SessionStatus.completed.value,
+    SessionStatus.error.value,
+    SessionStatus.stopped.value,
+    SessionStatus.interrupted.value,
+)
+
+
+async def stop_generation_scoped(
+    db: AsyncSession, session_id: str, expected_generation: int
+) -> bool:
+    """Stop only the expected run generation; return False otherwise. No commit.
+
+    The stop invalidates the run only when the session is still at the expected
+    generation, no Stop is pending, and the session is not terminal. A late stop
+    after a newer generation started does nothing. The check is only in the WHERE.
+    """
+    statement = (
+        sa.update(_sessions)
+        .where(
+            _sessions.c.id == session_id,
+            _sessions.c.run_generation == expected_generation,
+            _sessions.c.stop_requested.is_(False),
+            _sessions.c.status.not_in(_SCOPED_TERMINAL_STATUSES),
+        )
         .values(
             run_generation=_sessions.c.run_generation + 1,
             owner_token=None,
