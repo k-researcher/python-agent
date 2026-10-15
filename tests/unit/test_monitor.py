@@ -392,7 +392,7 @@ async def test_rows_show_project_name_and_short_path(tmp_path: Path) -> None:
     assert rows and rows[0].project
     assert rows[0].path
     lines = render_table(rows, 160)
-    assert "ПРОЕКТ" in lines[0] and "ПУТЬ" in lines[0]
+    assert "Проект" in lines[0] and "Путь" in lines[0]
     assert rows[0].project[:6] in lines[1]
 
 
