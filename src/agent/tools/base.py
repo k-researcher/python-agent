@@ -43,6 +43,9 @@ class Tool(ABC):
     allowed_modes: frozenset[str] = frozenset({"dev", "ask"})
     network_capability: bool = False
     knowledge_capability: bool = False
+    # True only for a read-only tool that keeps no shared state and does not use the
+    # session database: the runtime may run several such calls at the same time.
+    parallel_safe: bool = False
 
     def parameters(self, model_ids: list[str] | None = None) -> dict[str, Any]:
         """JSON Schema sent to the model; override when it depends on live configuration."""
