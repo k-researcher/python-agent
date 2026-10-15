@@ -117,3 +117,16 @@ def test_reasoning_history_policy(policy: str, expected: list[str]) -> None:
     sent = [item["reasoning_content"] for item in prepared.messages if "reasoning_content" in item]
     assert sent == expected
     assert all(item.get("content") != "cut" for item in prepared.messages)
+
+
+def test_lower_effort_steps_down_to_the_next_allowed_level() -> None:
+    from agent.reasoning import lower_effort
+
+    target = model(["none", "low", "high"], "low")
+    assert lower_effort(target, "high") == "low"
+    assert lower_effort(target, "low") == "none"
+    assert lower_effort(target, "none") is None
+    # A level the model does not list still steps down to an allowed one.
+    assert lower_effort(target, "medium") == "low"
+    assert lower_effort(target, None) is None
+    assert lower_effort(target, "unknown") is None

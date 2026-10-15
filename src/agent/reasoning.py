@@ -49,6 +49,15 @@ def _nearest(model: ResolvedModel, wanted: str) -> str | None:
     return min(allowed, key=distance)
 
 
+def lower_effort(model: ResolvedModel, effort: str | None) -> str | None:
+    """Return the next level below ``effort`` that the model accepts, or None."""
+    if effort is None or effort not in EFFORT_ORDER:
+        return None
+    below = EFFORT_ORDER[: EFFORT_ORDER.index(effort)]
+    allowed = [level for level in below if level in model.reasoning.allowed_efforts]
+    return allowed[-1] if allowed else None
+
+
 def _auto(model: ResolvedModel, mode: str, task_chars: int, recent_errors: int) -> tuple[str, str]:
     level = "low" if mode == "ask" else "medium"
     reason = f"mode {mode}"

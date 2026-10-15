@@ -68,6 +68,7 @@ class ListDirTool(Tool):
     name = "list_dir"
     description = "List files and directories inside the selected project."
     risk_level = RiskLevel.read_only
+    parallel_safe = True
     input_schema = {
         "type": "object",
         "properties": {"path": {"type": "string", "default": "."}},
@@ -91,6 +92,7 @@ class ReadFileTool(Tool):
     name = "read_file"
     description = "Read an UTF-8 text file inside the selected project."
     risk_level = RiskLevel.read_only
+    parallel_safe = True
     input_schema = {
         "type": "object",
         "properties": {
@@ -123,6 +125,7 @@ class SearchFilesTool(Tool):
     name = "search_files"
     description = "Search UTF-8 project files using a regular expression."
     risk_level = RiskLevel.read_only
+    parallel_safe = True
     input_schema = {
         "type": "object",
         "properties": {
@@ -178,6 +181,7 @@ class GlobTool(Tool):
     name = "glob"
     description = "Find project files matching a glob pattern."
     risk_level = RiskLevel.read_only
+    parallel_safe = True
     input_schema = {
         "type": "object",
         "properties": {
@@ -223,6 +227,7 @@ class ReadManyTool(Tool):
     name = "read_many"
     description = "Read several UTF-8 text files inside the selected project."
     risk_level = RiskLevel.read_only
+    parallel_safe = True
     input_schema = {
         "type": "object",
         "properties": {

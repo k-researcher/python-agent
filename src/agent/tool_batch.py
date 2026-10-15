@@ -31,7 +31,7 @@ class BatchResult:
 
     call_id: str
     ok: bool
-    output: str
+    output: Any
     error: str
     duration_ms: int
 
@@ -74,16 +74,16 @@ def split_parallel(
 
 async def run_batch(
     calls: list[BatchCall],
-    execute: Callable[[BatchCall], Awaitable[str]],
+    execute: Callable[[BatchCall], Awaitable[Any]],
     *,
     max_concurrency: int = 4,
-    timeout_seconds: float = 60.0,
+    timeout_seconds: float | None = 60.0,
 ) -> list[BatchResult]:
     """Run tool calls and return results in the original order.
 
     Each call runs as its own asyncio task.
     A semaphore bounds the number of concurrent calls.
-    A per-call timeout turns the call into a failed result.
+    A per-call timeout turns the call into a failed result; None sets no timeout.
     An exception in one call does not affect the other calls.
     An external cancellation stops all unfinished tasks and propagates.
     """

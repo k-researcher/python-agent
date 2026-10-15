@@ -284,3 +284,22 @@ async def test_tool_timeout_error_keeps_its_own_message() -> None:
     results = await run_batch([BatchCall("c1", "read_file", {})], execute, timeout_seconds=5)
     assert results[0].ok is False
     assert results[0].error == "upstream service timed out after 3 s"
+
+
+async def test_run_batch_without_timeout_waits_for_the_call() -> None:
+    async def execute(call: BatchCall) -> dict[str, Any]:
+        await asyncio.sleep(0.05)
+        return {"call": call.call_id}
+
+    results = await run_batch([BatchCall("c1", "read_file", {})], execute, timeout_seconds=None)
+    assert results[0].ok is True
+    assert results[0].output == {"call": "c1"}
+
+
+def test_only_plain_file_readers_are_parallel_safe() -> None:
+    from agent.tools import ToolRegistry
+
+    registry = ToolRegistry()
+    safe = sorted(name for name, tool in registry._tools.items() if is_parallel_safe(tool))
+    # Git tools may take the index lock and todo tools write the session row: never parallel.
+    assert safe == ["glob", "list_dir", "read_file", "read_many", "search_files"]

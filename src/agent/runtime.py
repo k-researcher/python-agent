@@ -20,8 +20,8 @@ from agent.config import Settings
 from agent.context_inference import ContextInference
 from agent.context_manager import ContextManager
 from agent.database import session_factory
-from agent.events import emit_event
-from agent.llm import LLMClient
+from agent.events import StreamPublisher, emit_event
+from agent.llm import LLMClient, LLMResponse
 from agent.message_tree import append_message
 from agent.model_config import ModelConfigError, ResolvedModel, ResolvedModelRegistry
 from agent.model_registry import effective_registry, select_model
@@ -38,7 +38,7 @@ from agent.models import (
     utcnow,
 )
 from agent.queue import RedisTaskQueue
-from agent.reasoning import ReasoningDecision, decide
+from agent.reasoning import ReasoningDecision, decide, lower_effort
 from agent.sandbox import policy_from_settings
 from agent.session_fence import (
     CURRENT_FENCE,
@@ -52,6 +52,7 @@ from agent.session_fence import (
     stop_generation,
 )
 from agent.session_service import create_session_record
+from agent.tool_batch import BatchCall, BatchResult, is_parallel_safe, run_batch
 from agent.tools import ToolRegistry
 from agent.tools.base import ToolContext, ToolError
 
@@ -59,12 +60,48 @@ logger = logging.getLogger(__name__)
 
 # Lease of the run owner, renewed every third of it. A lost lease cancels the run.
 FENCE_LEASE_SECONDS = 60.0
+# Most read-only tool calls of one model reply that run at the same time.
+PARALLEL_TOOL_LIMIT = 4
 
 TERMINAL_STATUSES = {
     SessionStatus.completed.value,
     SessionStatus.stopped.value,
     SessionStatus.error.value,
 }
+
+
+def _batch_result(outcome: BatchResult) -> dict[str, Any]:
+    """Convert a batch outcome to the result shape of a sequential tool call."""
+    if outcome.ok:
+        return {"success": True, "output": outcome.output}
+    return {"success": False, "error": outcome.error}
+
+
+def _cut_in_reasoning(response: LLMResponse) -> bool:
+    """Tell whether the output limit cut the reply while the model was still reasoning."""
+    return (
+        response.finish_reason == "length"
+        and not (response.content or "").strip()
+        and not response.tool_calls
+        and bool((response.reasoning or "").strip())
+    )
+
+
+def _lowered(
+    decisions: dict[str, ReasoningDecision], models: ResolvedModelRegistry
+) -> dict[str, ReasoningDecision]:
+    """Return the decisions with each effective level one step lower where the model allows it."""
+    lowered: dict[str, ReasoningDecision] = {}
+    for model_id, decision in decisions.items():
+        lower = lower_effort(models.models[model_id], decision.effective)
+        lowered[model_id] = (
+            decision
+            if lower is None
+            else ReasoningDecision(
+                decision.requested, lower, decision.source, "lowered after a reply cut off"
+            )
+        )
+    return lowered
 
 
 def _history_safe_call(call: dict[str, Any]) -> dict[str, Any]:
@@ -538,26 +575,60 @@ class AgentSupervisor:
                 }
                 await db.commit()
 
-                def reasoning_for(
-                    candidate: ResolvedModel,
-                    snapshot: dict[str, ReasoningDecision] = decisions,
-                ) -> ReasoningDecision:
-                    return snapshot[candidate.id]
+                retried = False
+                while True:
 
-                inference = ContextInference(
-                    session.id,
-                    self.settings.context_reserved_tokens,
-                    definitions,
-                    models,
-                    partial(self._llm_for, models),
-                    reasoning_for,
-                )
-                outcome = await inference.run(model)
-                response = outcome.response
-                reasoning_effort = outcome.reasoning.effective
-                await db.refresh(session, attribute_names=["status", "stop_requested"])
-                if session.stop_requested or session.status == SessionStatus.stopped.value:
-                    return
+                    def reasoning_for(
+                        candidate: ResolvedModel,
+                        snapshot: dict[str, ReasoningDecision] = decisions,
+                    ) -> ReasoningDecision:
+                        return snapshot[candidate.id]
+
+                    inference = ContextInference(
+                        session.id,
+                        self.settings.context_reserved_tokens,
+                        definitions,
+                        models,
+                        partial(self._llm_for, models),
+                        reasoning_for,
+                    )
+                    outcome = await inference.run(model)
+                    response = outcome.response
+                    reasoning_effort = outcome.reasoning.effective
+                    await db.refresh(session, attribute_names=["status", "stop_requested"])
+                    if session.stop_requested or session.status == SessionStatus.stopped.value:
+                        return
+                    lower = lower_effort(outcome.model, reasoning_effort)
+                    if retried or lower is None or not _cut_in_reasoning(response):
+                        break
+                    # The output limit cut the reply during reasoning, before any text: keep the
+                    # cut reply for diagnosis and try once more with a lower reasoning level.
+                    retried = True
+                    db.add(
+                        Message(
+                            session_id=session.id,
+                            role="assistant",
+                            kind="interrupted",
+                            content=response.content,
+                            token_count=response.completion_tokens or None,
+                            reasoning_content=response.reasoning,
+                            reasoning_effort=reasoning_effort,
+                        )
+                    )
+                    await db.commit()
+                    await StreamPublisher(session.id).reset()
+                    await emit_event(
+                        db,
+                        "inference.retry",
+                        {
+                            "reason": "output_limit_in_reasoning",
+                            "model_id": outcome.model.id,
+                            "from": reasoning_effort,
+                            "to": lower,
+                        },
+                        session.id,
+                    )
+                    decisions = _lowered(decisions, models)
 
                 # Our own globally unique IDs: providers may omit or reuse theirs, and the
                 # step counter restarts whenever the loop resumes after an approval.
@@ -709,7 +780,10 @@ class AgentSupervisor:
                 ToolCallStatus.awaiting_confirmation.value,
             }
         ]
-        for call in unfinished:
+        index = 0
+        while index < len(unfinished):
+            call = unfinished[index]
+            index += 1
             await db.refresh(session, attribute_names=["status", "stop_requested"])
             if session.stop_requested or session.status == SessionStatus.stopped.value:
                 return "stopped"
@@ -738,7 +812,14 @@ class AgentSupervisor:
                 waiting = True
                 continue
             if approval is None or approval.status == ApprovalStatus.approved.value:
-                if not await self._execute_tool_call(db, session, call):
+                group = [call]
+                if self._may_run_in_parallel(session, call):
+                    group += self._parallel_followers(session, unfinished[index:])
+                if len(group) > 1:
+                    index += len(group) - 1
+                    if not await self._execute_parallel(db, session, group):
+                        return "stopped"
+                elif not await self._execute_tool_call(db, session, call):
                     return "stopped"
                 processed = True
 
@@ -778,27 +859,85 @@ class AgentSupervisor:
         await db.refresh(call, attribute_names=["status"])
         return claimed.rowcount == 1
 
-    async def _execute_tool_call(self, db: Any, session: Session, call: ToolCall) -> bool:
-        if not await self._claim_tool_call(db, call):
+    def _parallel_followers(self, session: Session, rest: list[ToolCall]) -> list[ToolCall]:
+        """Return the calls right after a parallel-safe call that may join its group.
+
+        A follower is a queued call without an approval whose tool is parallel safe.
+        The group stops at the first call that is not.
+        """
+        followers: list[ToolCall] = []
+        for call in rest:
+            if not self._may_run_in_parallel(session, call):
+                break
+            followers.append(call)
+        return followers
+
+    def _may_run_in_parallel(self, session: Session, call: ToolCall) -> bool:
+        if call.status != ToolCallStatus.pending.value or call.approval is not None:
             return False
-        depth = int((session.configuration or {}).get("depth", 0))
-        context = ToolContext(
+        try:
+            return is_parallel_safe(self.registry.get(call.name, session.mode))
+        except Exception:
+            return False
+
+    def _tool_context(self, session: Session) -> ToolContext:
+        return ToolContext(
             session_id=session.id,
             project_root=Path(session.project.root_path).resolve(strict=True),
-            depth=depth,
+            depth=int((session.configuration or {}).get("depth", 0)),
             audit_egress=partial(self._audit_egress, session.id),
             spawn_child=partial(self._spawn_child, session),
             sandbox=policy_from_settings(self.settings),
         )
+
+    async def _execute_parallel(self, db: Any, session: Session, group: list[ToolCall]) -> bool:
+        """Run a group of parallel-safe calls at the same time; store results in call order.
+
+        Only the tool bodies run concurrently. Claims and result rows use the one database
+        session in sequence. Returns False when Stop prevented a claim; the claimed calls
+        still run to the end and keep their results.
+        """
+        claimed: list[ToolCall] = []
+        for call in group:
+            if not await self._claim_tool_call(db, call):
+                break
+            claimed.append(call)
+        if claimed:
+            context = self._tool_context(session)
+
+            async def execute(item: BatchCall) -> Any:
+                return await self.registry.execute(item.name, session.mode, context, item.arguments)
+
+            results = await run_batch(
+                [BatchCall(call.id, call.name, dict(call.arguments)) for call in claimed],
+                execute,
+                max_concurrency=PARALLEL_TOOL_LIMIT,
+                timeout_seconds=None,
+            )
+            for call, outcome in zip(claimed, results, strict=True):
+                await self._store_tool_result(db, session, call, _batch_result(outcome))
+        return len(claimed) == len(group)
+
+    async def _execute_tool_call(self, db: Any, session: Session, call: ToolCall) -> bool:
+        if not await self._claim_tool_call(db, call):
+            return False
+        context = self._tool_context(session)
         try:
             output = await self.registry.execute(
                 call.name, session.mode, context, dict(call.arguments)
             )
             result = {"success": True, "output": output}
-            call.status = ToolCallStatus.completed.value
         except Exception as exc:
             result = {"success": False, "error": str(exc)}
-            call.status = ToolCallStatus.error.value
+        await self._store_tool_result(db, session, call, result)
+        return True
+
+    async def _store_tool_result(
+        self, db: Any, session: Session, call: ToolCall, result: dict[str, Any]
+    ) -> None:
+        call.status = (
+            ToolCallStatus.completed.value if result["success"] else ToolCallStatus.error.value
+        )
         call.result = result
         await append_message(
             db,
@@ -814,7 +953,6 @@ class AgentSupervisor:
             {"tool_call_id": call.id, "name": call.name, "status": call.status},
             session.id,
         )
-        return True
 
     @staticmethod
     def _reasoning_for(session: Session, model: ResolvedModel) -> ReasoningDecision:
