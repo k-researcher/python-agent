@@ -1,0 +1,74 @@
+/* Design tokens (UI spec §6). Light theme by default; dark via
+   prefers-color-scheme (unless data-theme="light") and via data-theme="dark". */
+
+:root {
+  color-scheme: light;
+
+  --bg: #f7f7f8;
+  --bg-subtle: #ececee;
+  --surface: #ffffff;
+  --border: #e6e6e9;
+  --text: #111114;
+  --text-muted: #6b6b76;
+  --accent: #111114;
+  --accent-contrast: #ffffff;
+  --link: #2563eb;
+  --info: #2563eb;
+  --success: #16a34a;
+  --warning: #d97706;
+  --danger: #dc2626;
+
+  --radius: 10px;
+  --radius-sm: 6px;
+  --shadow: 0 1px 2px rgba(17, 17, 20, 0.06), 0 8px 24px rgba(17, 17, 20, 0.08);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji",
+    "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+}
+
+/* Dark theme by system preference, unless the user pinned the light theme. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --bg: #0c0f14;
+    --bg-subtle: #161b24;
+    --surface: #121720;
+    --border: #293140;
+    --text: #e7eaf0;
+    --text-muted: #9ba7b8;
+    --accent: #e7eaf0;
+    --accent-contrast: #111114;
+    --link: #6ea8fe;
+    --info: #60a5fa;
+    --success: #2fbf71;
+    --warning: #e5a53d;
+    --danger: #ef6a6a;
+
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.4);
+  }
+}
+
+/* Explicit dark theme override (toggle in the Topbar). */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0c0f14;
+  --bg-subtle: #161b24;
+  --surface: #121720;
+  --border: #293140;
+  --text: #e7eaf0;
+  --text-muted: #9ba7b8;
+  --accent: #e7eaf0;
+  --accent-contrast: #111114;
+  --link: #6ea8fe;
+  --info: #60a5fa;
+  --success: #2fbf71;
+  --warning: #e5a53d;
+  --danger: #ef6a6a;
+
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.4);
+}
