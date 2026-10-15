@@ -44,6 +44,7 @@ EXAMPLES = """\
   pyagent list                  сессии текущей папки
   pyagent continue              продолжить последнюю сессию
   pyagent stop                  остановить работающую сессию
+  pyagent monitor               таблица сессий, обновляется каждые 2 с
 """
 
 
@@ -137,6 +138,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     command("list", "сессии текущей папки: время, статус, название (последние 20)")
     command("continue", "продолжить последнюю сессию текущей папки в режиме chat")
     command("stop", "остановить работающую сессию текущей папки")
+    monitor = command("monitor", "таблица сессий агента (читает локальную базу)")
+    monitor.add_argument("--once", action="store_true", help="показать один раз и выйти")
+    monitor.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        metavar="СЕКУНДЫ",
+        help="период обновления, по умолчанию 2 (не меньше 0.5)",
+    )
 
     auth = command("auth", "браузерные входы").add_subparsers(
         dest="auth_command", required=True, title="команды", metavar="<команда>"
@@ -187,6 +197,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "auth" and args.auth_command == "revoke-all":
         print(f"revoked: {asyncio.run(_auth_revoke_all())}")
         return 0
+    if args.command == "monitor":
+        from agent.cli_client.monitor_view import run_monitor
+
+        try:
+            return asyncio.run(run_monitor(sys.stdout, once=args.once, interval=args.interval))
+        except KeyboardInterrupt:
+            # Ctrl+C is the normal way to close the monitor.
+            print()
+            return 0
     if args.command in ("chat", "run", "list", "continue", "stop"):
         rest = list(args.task) if args.command == "run" else []
         try:
