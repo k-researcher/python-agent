@@ -70,7 +70,7 @@ def _localize(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return parser
 
 
-async def _run_command(argv: Sequence[str], command: str) -> int:
+async def _run_command(argv: Sequence[str], command: str, yes_read_only: bool = False) -> int:
     """Dispatch a CLI client command; returns the process exit code."""
     from agent.cli_client import AgentApi
     from agent.cli_client.commands import build_config
@@ -86,7 +86,13 @@ async def _run_command(argv: Sequence[str], command: str) -> int:
             return await commands.cmd_chat(api, sys.stdout, read, project_root)
         if command == "run":
             return await commands.cmd_run(
-                api, sys.stdout, read, interactive, project_root, " ".join(argv)
+                api,
+                sys.stdout,
+                read,
+                interactive,
+                project_root,
+                " ".join(argv),
+                yes_read_only,
             )
         if command == "list":
             return await commands.cmd_list(api, sys.stdout, read, project_root)
@@ -135,6 +141,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Выполнить одну задачу в текущей папке и напечатать результат.",
     )
     run.add_argument("task", nargs="*", metavar="задача", help="текст задачи")
+    run.add_argument(
+        "--yes-read-only",
+        action="store_true",
+        help="одобрять только инструменты чтения, остальные отклонять",
+    )
     command("list", "сессии текущей папки: время, статус, название (последние 20)")
     command("continue", "продолжить последнюю сессию текущей папки в режиме chat")
     command("stop", "остановить работающую сессию текущей папки")
@@ -208,8 +219,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
     if args.command in ("chat", "run", "list", "continue", "stop"):
         rest = list(args.task) if args.command == "run" else []
+        yes_read_only = getattr(args, "yes_read_only", False)
         try:
-            return asyncio.run(_run_command(rest, args.command))
+            return asyncio.run(_run_command(rest, args.command, yes_read_only))
         except KeyboardInterrupt:
             # Ctrl+C outside an agent answer ends the command without a traceback.
             print()

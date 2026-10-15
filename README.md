@@ -82,6 +82,7 @@ LM Studio, `mlx_lm.server`, Ollama); `openai_responses` (Codex/GPT) и `anthropi
 ```bash
 pyagent chat                  # разговор; /выход или Ctrl+C для выхода
 pyagent run "обнови README"   # одна задача и результат
+pyagent run --yes-read-only "обнови README"  # одобрять только чтение, остальное отклонять
 pyagent list                  # сессии текущей папки
 pyagent continue              # продолжить последнюю сессию
 pyagent stop                  # остановить работающую сессию

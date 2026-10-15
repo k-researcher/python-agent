@@ -31,6 +31,8 @@ from agent.cli_client.commands import (
     NO_SERVER_HINT,
     NO_TOKEN_HINT,
     NON_INTERACTIVE_REJECT_COMMENT,
+    READ_ONLY_APPROVE_COMMENT,
+    READ_ONLY_REJECT_COMMENT,
     TURN_STOPPED_TEXT,
     cmd_chat,
     cmd_continue,
@@ -223,9 +225,12 @@ def _run_cmd(
     *,
     task: str = "сделай что-нибудь",
     interactive: bool = False,
+    yes_read_only: bool = False,
 ) -> tuple[int, str]:
     out = io.StringIO()
-    result = run_async(cmd_run(api, out, input_reader(), interactive, Path.cwd(), task))
+    result = run_async(
+        cmd_run(api, out, input_reader(), interactive, Path.cwd(), task, yes_read_only)
+    )
     return result, out.getvalue()
 
 
@@ -337,6 +342,68 @@ def test_run_interactive_approval_asks_user() -> None:
     assert api.resolved_calls == [("a1", "reject", None)]
     # The renderer printed the approval request.
     assert "Запрос инструмента" in output
+
+
+def _approval_setup(
+    approvals: list[dict[str, Any]],
+    status: str = "awaiting_confirmation",
+    event: dict[str, Any] | None = None,
+) -> FakeApi:
+    api = FakeApi()
+    api.add_project({"id": "p1", "name": "p", "root_path": str(Path.cwd().resolve())})
+    api.set_approvals("s1", approvals)
+    api.set_status("s1", status)
+    api.set_events("s1", [event or completed_status_event("s1")])
+    return api
+
+
+def test_run_yes_read_only_approves_read_only() -> None:
+    api = _approval_setup([{"id": "a1", "tool_name": "read_file", "risk_level": "read_only"}])
+    reader = input_reader("n")  # Must not be used; the flag decides alone.
+    out = io.StringIO()
+    code = run_async(cmd_run(api, out, reader, True, Path.cwd(), "задача", True))
+    assert code == EXIT_OK
+    assert api.resolved_calls == [("a1", "approve", READ_ONLY_APPROVE_COMMENT)]
+
+
+def test_run_yes_read_only_rejects_local_write() -> None:
+    api = _approval_setup(
+        [{"id": "a1", "tool_name": "write_file", "risk_level": "local_write"}],
+        event=stopped_status_event("s1"),
+    )
+    out = io.StringIO()
+    code = run_async(cmd_run(api, out, input_reader(), True, Path.cwd(), "задача", True))
+    assert code == EXIT_TASK_FAILED
+    assert api.resolved_calls == [("a1", "reject", READ_ONLY_REJECT_COMMENT)]
+
+
+def test_run_yes_read_only_rejects_missing_risk_level() -> None:
+    api = _approval_setup([{"id": "a1", "tool_name": "shell"}], event=stopped_status_event("s1"))
+    out = io.StringIO()
+    code = run_async(cmd_run(api, out, input_reader(), False, Path.cwd(), "задача", True))
+    assert code == EXIT_TASK_FAILED
+    assert api.resolved_calls == [("a1", "reject", READ_ONLY_REJECT_COMMENT)]
+
+
+def test_run_yes_read_only_does_not_prompt_in_interactive_mode() -> None:
+    api = _approval_setup([{"id": "a1", "tool_name": "read_file", "risk_level": "read_only"}])
+    reader = input_reader("n")  # Would reject if asked; the flag skips the question.
+    out = io.StringIO()
+    code = run_async(cmd_run(api, out, reader, True, Path.cwd(), "задача", True))
+    assert code == EXIT_OK
+    assert api.resolved_calls == [("a1", "approve", READ_ONLY_APPROVE_COMMENT)]
+
+
+def test_run_without_flag_keeps_prior_behavior() -> None:
+    api = _approval_setup(
+        [{"id": "a1", "tool_name": "read_file", "risk_level": "read_only"}],
+        event=stopped_status_event("s1"),
+    )
+    reader = input_reader("n")
+    out = io.StringIO()
+    code = run_async(cmd_run(api, out, reader, False, Path.cwd(), "задача", False))
+    assert code == EXIT_TASK_FAILED
+    assert api.resolved_calls == [("a1", "reject", NON_INTERACTIVE_REJECT_COMMENT)]
 
 
 # --- chat -----------------------------------------------------------------
@@ -703,6 +770,22 @@ def test_run_help_is_russian() -> None:
     assert "задачу" in text or "папке" in text
 
 
+def test_run_help_contains_yes_read_only() -> None:
+    from agent.cli import main
+
+    old_stdout = sys.stdout
+    buf = io.StringIO()
+    sys.stdout = buf
+    try:
+        main(["run", "--help"])
+    except SystemExit as exit_code:
+        assert exit_code.code == 0
+    finally:
+        sys.stdout = old_stdout
+    text = buf.getvalue()
+    assert "--yes-read-only" in text
+
+
 # --- self-check: chat exit command -----------------------------------------
 
 
@@ -978,3 +1061,20 @@ def test_list_time_is_local(monkeypatch: pytest.MonkeyPatch) -> None:
     finally:
         monkeypatch.undo()
         time.tzset()
+
+
+def test_yes_read_only_refuses_writes_without_asking_in_a_terminal() -> None:
+    api = FakeApi()
+    api.add_project({"id": "p1", "name": "p", "root_path": str(Path.cwd().resolve())})
+    api.set_approvals("s1", [{"id": "a1", "tool_name": "write_file", "risk_level": "local_write"}])
+    api.set_status("s1", "awaiting_confirmation")
+    api.set_events("s1", [stopped_status_event("s1")])
+
+    def read(_prompt: str) -> str:
+        raise AssertionError("the flag must not ask the user")
+
+    code = run_async(
+        cmd_run(api, io.StringIO(), read, True, Path.cwd(), "задача", yes_read_only=True)
+    )
+    assert code == EXIT_TASK_FAILED
+    assert api.resolved_calls == [("a1", "reject", READ_ONLY_REJECT_COMMENT)]
