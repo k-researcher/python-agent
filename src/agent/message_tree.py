@@ -3,7 +3,7 @@
 Invariant: the active rows of a session (kind "normal", skipped False) form one chain from the
 root to the head. A child is always created after its parent, so along any branch the ids grow,
 and the id order of the active rows is the branch order. Context building, summaries and
-checkpoints of step 2.3 therefore keep working on the active rows.
+checkpoints therefore keep working on the active rows.
 
 Rules:
 - Rows are immutable. An edit or a regeneration adds a new user row next to the old one; the old

@@ -1,4 +1,4 @@
-"""Unit tests for the context compression coordinator (stage 2.3c)."""
+"""Unit tests for the context compression coordinator."""
 
 from __future__ import annotations
 

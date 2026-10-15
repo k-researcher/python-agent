@@ -1,4 +1,4 @@
-"""Regression tests for the findings of the phase 1 review."""
+"""Regression tests for earlier review findings."""
 
 from __future__ import annotations
 

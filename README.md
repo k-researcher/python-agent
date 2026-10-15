@@ -65,7 +65,7 @@ uv run pyagent config check --strict
 
 Типы провайдеров: `openai` — любой OpenAI-совместимый `/chat/completions` (корпоративные шлюзы, GLM,
 LM Studio, `mlx_lm.server`, Ollama); `openai_responses` (Codex/GPT) и `anthropic` (Claude)
-объявляются заранее, их адаптеры появятся в следующей фазе. У каждой модели свои окно
+объявляются заранее, их адаптеры пока не готовы. У каждой модели свои окно
 контекста, `max_tokens` и допустимые уровни рассуждений; уровень выбирается при создании
 сессии (`reasoning_effort`). Модель сессии: явная → по роли (`routing.roles`) → `routing.default`.
 

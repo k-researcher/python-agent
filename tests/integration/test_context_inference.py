@@ -1,4 +1,4 @@
-"""Integration regressions for ContextInference (phase 2.3).
+"""Integration regressions for ContextInference.
 
 These tests exercise the real LLMClient.send() path over httpx.MockTransport and the
 real database audit/calibration persistence. No network request leaves the process and

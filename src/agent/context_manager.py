@@ -1,4 +1,4 @@
-"""Context coordinator with progressive compression stages (stage 2.3c).
+"""Context coordinator with progressive compression stages.
 
 Starts from a projected history and walks a fixed ladder of stages until a
 projection fits the token budget: no-op, tool-result masking, argument

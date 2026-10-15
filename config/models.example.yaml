@@ -10,11 +10,11 @@ providers:
     max_retries: 3
 
   # --- Шаблоны других провайдеров: раскомментируйте нужные ---
-  # anthropic:                      # Claude (адаптер Messages API — фаза 2)
+  # anthropic:                      # адаптер Messages API пока не готов
   #   kind: anthropic
   #   base_url: https://api.anthropic.com/v1
   #   api_key_env: ANTHROPIC_API_KEY
-  # openai:                         # GPT / Codex-модели (адаптер Responses API — фаза 2)
+  # openai:                         # адаптер Responses API пока не готов
   #   kind: openai_responses
   #   base_url: https://api.openai.com/v1
   #   api_key_env: OPENAI_API_KEY
@@ -64,5 +64,5 @@ routing:
   # Модель для служебных задач: сводки контекста и названия сессий. Нет поля — default.
   light: light
 
-decisions:                          # слой решений (Jev) — фаза 4.5
+decisions:                          # слой решений, пока выключен
   enabled: false
