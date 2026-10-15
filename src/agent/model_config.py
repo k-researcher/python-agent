@@ -6,8 +6,9 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +43,13 @@ ModelId = Annotated[
 _MAX_FILE_BYTES = 1024 * 1024
 _EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "host.docker.internal"})
+# Environment variable names and ${NAME} references in header values and model templates.
+EnvName = Annotated[str, StringConstraints(pattern=r"\A[A-Za-z_][A-Za-z0-9_]{0,127}\z")]
+_ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]{0,127})\}")
+_HEADER_NAME = re.compile(r"\A[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}\Z")
+# The LLM transport does not apply these provider features yet. A provider that needs one
+# stays unconfigured with a warning, so that no request goes out with the wrong credentials.
+ADVANCED_PROVIDER_TRANSPORT = False
 _YAML_TAGS = frozenset(
     f"tag:yaml.org,2002:{name}" for name in ("map", "seq", "str", "null", "bool", "int", "float")
 )
@@ -57,37 +65,132 @@ class _Spec(BaseModel):
     )
 
 
+def _check_http_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("must be a valid HTTP(S) URL") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or port == 0
+        or any(character.isspace() or ord(character) < 32 for character in value)
+        or "\\" in value
+    ):
+        raise ValueError("must be a valid HTTP(S) URL")
+    if parsed.username is not None or parsed.password is not None or "?" in value or "#" in value:
+        raise ValueError("URL must not contain userinfo, query or fragment")
+    return value
+
+
+class HeaderKeyAuthSpec(_Spec):
+    """A key in a header, for example "Authorization: Api-Key <key>"."""
+
+    type: Literal["header_key"]
+    key_env: EnvName
+    header: str = "Authorization"
+    prefix: str = "Api-Key "
+
+
+class BearerAuthSpec(_Spec):
+    """A static token in "Authorization: Bearer <token>"."""
+
+    type: Literal["bearer"]
+    key_env: EnvName
+
+
+class OAuthAuthSpec(_Spec):
+    """A key that the provider exchanges for a short-lived token (OAuth client credentials)."""
+
+    type: Literal["oauth_client_credentials"]
+    token_url: str = Field(repr=False)
+    key_env: EnvName
+    scope: str = Field(min_length=1, max_length=200)
+    request_id_header: str | None = "RqUID"
+    expires_at_unit: Literal["ms", "s"] = "ms"
+
+    @field_validator("token_url")
+    @classmethod
+    def validate_token_url(cls, value: str) -> str:
+        _check_http_url(value)
+        if urlsplit(value).scheme != "https":
+            raise ValueError("token URL must use HTTPS")
+        return value
+
+
+class CommandAuthSpec(_Spec):
+    """A token printed by a local command, without a shell."""
+
+    type: Literal["command"]
+    argv: list[str] = Field(min_length=1, max_length=32)
+    ttl_seconds: float = Field(default=300, gt=0, le=86400)
+
+
+class NoAuthSpec(_Spec):
+    type: Literal["none"]
+
+
+AuthSpec = Annotated[
+    HeaderKeyAuthSpec | BearerAuthSpec | OAuthAuthSpec | CommandAuthSpec | NoAuthSpec,
+    Field(discriminator="type"),
+]
+
+
 class ProviderSpec(_Spec):
     kind: ProviderKind
     base_url: str = Field(repr=False)
     api_key_env: str | None = None
     timeout_seconds: float = Field(default=120, gt=0)
     max_retries: int = Field(default=2, ge=0, le=10)
+    # Flexible provider features (phase 4.1, section 11.6).
+    auth: AuthSpec | None = None
+    # Extra headers; a value may reference the environment as ${NAME}.
+    headers: dict[str, str] = Field(default_factory=dict, max_length=32)
+    ca_bundle: str | None = None
+    dialect: Literal["chat", "functions"] = "chat"
+    # Provider model ID built from the model name, for example "${FOLDER}/{model}/latest".
+    model_template: str | None = Field(default=None, max_length=300)
+    # Data stays in Russia: projects with personal data may use only such providers.
+    data_in_russia: bool = False
+
+    @field_validator("headers")
+    @classmethod
+    def validate_headers(cls, value: dict[str, str]) -> dict[str, str]:
+        for name, header_value in value.items():
+            if not _HEADER_NAME.fullmatch(name):
+                raise ValueError("contains an invalid header name")
+            if any(ord(character) < 32 for character in header_value):
+                raise ValueError("contains a control character in a header value")
+        return value
+
+    @field_validator("model_template")
+    @classmethod
+    def validate_template(cls, value: str | None) -> str | None:
+        if value is not None and value.count("{model}") != 1:
+            raise ValueError("must contain {model} exactly once")
+        return value
+
+    @model_validator(mode="after")
+    def validate_auth(self) -> Self:
+        if self.auth is not None and self.api_key_env is not None:
+            raise ValueError("use either api_key_env or auth, not both")
+        return self
+
+    @property
+    def advanced(self) -> bool:
+        """Tell whether the provider needs transport features beyond a Bearer key."""
+        return (
+            self.auth is not None
+            or bool(self.headers)
+            or self.ca_bundle is not None
+            or self.dialect != "chat"
+        )
 
     @field_validator("base_url")
     @classmethod
     def validate_url(cls, value: str) -> str:
-        try:
-            parsed = urlsplit(value)
-            port = parsed.port
-        except ValueError:
-            raise ValueError("must be a valid HTTP(S) URL") from None
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or port == 0
-            or any(character.isspace() or ord(character) < 32 for character in value)
-            or "\\" in value
-        ):
-            raise ValueError("must be a valid HTTP(S) URL")
-        if (
-            parsed.username is not None
-            or parsed.password is not None
-            or "?" in value
-            or "#" in value
-        ):
-            raise ValueError("URL must not contain userinfo, query or fragment")
-        return value
+        return _check_http_url(value)
 
 
 class ReasoningSpec(_Spec):
@@ -267,6 +370,13 @@ class ResolvedModel:
     max_retries: int
     reasoning: ReasoningSpec
     pricing: PricingSpec | None
+    # Flexible provider features; the defaults describe a plain Bearer-key provider.
+    auth: AuthSpec | None = None
+    auth_secret: str = field(default="", repr=False)
+    headers: dict[str, str] = field(default_factory=dict, repr=False)
+    ca_bundle: str | None = None
+    dialect: Literal["chat", "functions"] = "chat"
+    data_in_russia: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,6 +495,85 @@ def _validate(data: object, diagnostics: _Diagnostics) -> ModelsConfig:
         raise ModelConfigError("\n".join(messages)) from None
 
 
+def _expand(value: str, env: Mapping[str, str], missing: set[str]) -> str:
+    """Replace each ${NAME} with its environment value; collect the names that are not set."""
+
+    def substitute(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if not env.get(name):
+            missing.add(name)
+            return ""
+        return env[name]
+
+    return _ENV_REFERENCE.sub(substitute, value)
+
+
+def secret_env(provider: ProviderSpec) -> str | None:
+    """Return the environment variable that holds the provider secret, if any."""
+    if provider.auth is not None:
+        return getattr(provider.auth, "key_env", None)
+    return provider.api_key_env
+
+
+def resolve_model(
+    model_id: str,
+    model: ModelSpec,
+    provider_id: str,
+    provider: ProviderSpec,
+    *,
+    secret: str,
+    configured: bool,
+    env: Mapping[str, str],
+    warn: Callable[[FieldPath, str], None],
+) -> ResolvedModel:
+    """Build one runtime model; the YAML loader and the UI override layer share it.
+
+    ``configured`` is the caller's key decision. Missing ${NAME} values and provider
+    features without transport support make the model unconfigured with a warning.
+    """
+    missing: set[str] = set()
+    headers = {name: _expand(value, env, missing) for name, value in provider.headers.items()}
+    name = model.model
+    if provider.model_template is not None:
+        name = _expand(provider.model_template, env, missing).replace("{model}", model.model)
+    if missing:
+        warn(
+            ("models", model_id),
+            "environment variables for headers or model_template are not set: "
+            + ", ".join(sorted(missing)),
+        )
+        configured = False
+    if provider.advanced and not ADVANCED_PROVIDER_TRANSPORT:
+        warn(
+            ("providers", provider_id),
+            "auth, headers, ca_bundle and dialect need transport support that is not "
+            "available yet; provider is unconfigured",
+        )
+        configured = False
+    return ResolvedModel(
+        id=model_id,
+        provider_id=provider_id,
+        kind=provider.kind,
+        base_url=provider.base_url,
+        # The legacy Bearer key only; an auth block keeps its secret apart.
+        api_key=secret if provider.auth is None else "",
+        configured=configured,
+        model=name,
+        context_window=model.context_window,
+        max_tokens=model.max_tokens,
+        timeout_seconds=provider.timeout_seconds,
+        max_retries=provider.max_retries,
+        reasoning=model.reasoning,
+        pricing=model.pricing,
+        auth=provider.auth,
+        auth_secret=secret if provider.auth is not None else "",
+        headers=headers,
+        ca_bundle=provider.ca_bundle,
+        dialect=provider.dialect,
+        data_in_russia=provider.data_in_russia,
+    )
+
+
 def _resolve(
     config: ModelsConfig,
     credentials: Mapping[str, str],
@@ -392,7 +581,9 @@ def _resolve(
     source: Literal["yaml", "legacy"],
     checksum: str,
     warnings: list[str],
+    env: Mapping[str, str] | None = None,
 ) -> ResolvedModelRegistry:
+    env = env or {}
     for provider_id, provider in config.providers.items():
         parsed = urlsplit(provider.base_url)
         if parsed.scheme == "http" and parsed.hostname not in _LOCAL_HOSTS:
@@ -402,24 +593,30 @@ def _resolve(
                     "non-local HTTP base URL is not encrypted",
                 )
             )
+
+    def warn(location: FieldPath, message: str) -> None:
+        text = diagnostics.message(location, message)
+        if text not in warnings:
+            warnings.append(text)
+
     models: dict[str, ResolvedModel] = {}
     for model_id, model in config.models.items():
         provider = config.providers[model.provider]
-        api_key = credentials[model.provider]
-        models[model_id] = ResolvedModel(
-            id=model_id,
-            provider_id=model.provider,
-            kind=provider.kind,
-            base_url=provider.base_url,
-            api_key=api_key,
-            configured=bool(api_key) or (source == "yaml" and provider.api_key_env is None),
-            model=model.model,
-            context_window=model.context_window,
-            max_tokens=model.max_tokens,
-            timeout_seconds=provider.timeout_seconds,
-            max_retries=provider.max_retries,
-            reasoning=model.reasoning,
-            pricing=model.pricing,
+        secret = credentials[model.provider]
+        key_env = secret_env(provider)
+        if provider.auth is None:
+            configured = bool(secret) or (source == "yaml" and key_env is None)
+        else:
+            configured = bool(secret) or key_env is None
+        models[model_id] = resolve_model(
+            model_id,
+            model,
+            model.provider,
+            provider,
+            secret=secret,
+            configured=configured,
+            env=env,
+            warn=warn,
         )
     return ResolvedModelRegistry(
         models=models,
@@ -516,13 +713,18 @@ def load_models(
     credentials: dict[str, str] = {}
     warnings_missing: list[str] = []
     for provider_id, provider in config.providers.items():
-        api_key = env.get(provider.api_key_env, "") if provider.api_key_env is not None else ""
-        if provider.api_key_env is not None and not api_key:
+        key_env = secret_env(provider)
+        api_key = env.get(key_env, "") if key_env is not None else ""
+        if key_env is not None and not api_key:
             # A declared-but-unkeyed provider must not block startup; it stays unconfigured.
+            location: FieldPath = (
+                ("providers", provider_id, "api_key_env")
+                if provider.auth is None
+                else ("providers", provider_id, "auth", "key_env")
+            )
             warnings_missing.append(
                 diagnostics.message(
-                    ("providers", provider_id, "api_key_env"),
-                    "API key environment variable is not set; provider is unconfigured",
+                    location, "API key environment variable is not set; provider is unconfigured"
                 )
             )
         credentials[provider_id] = api_key
@@ -544,7 +746,13 @@ def load_models(
         )
     )
     return _resolve(
-        config, credentials, diagnostics, "yaml", hashlib.sha256(content).hexdigest(), warnings
+        config,
+        credentials,
+        diagnostics,
+        "yaml",
+        hashlib.sha256(content).hexdigest(),
+        warnings,
+        env,
     )
 
 

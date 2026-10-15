@@ -259,8 +259,8 @@ def merge_layers(
                 raise SecretKeyError("Settings are required to decrypt UI API keys")
             key = decrypt_secret(delta.api_key_ciphertext, settings, env)
             sources["api_key"] = "ui"
-        elif spec.api_key_env is not None:
-            key = env.get(spec.api_key_env, "")
+        elif model_config.secret_env(spec) is not None:
+            key = env.get(model_config.secret_env(spec) or "", "")
             sources["api_key"] = "env"
         elif "api_key_env" in delta.fields:
             key = ""
@@ -275,11 +275,11 @@ def merge_layers(
             and provider_id in legacy_keys
             and "api_key_env" not in delta.fields
             and delta.api_key_ciphertext is None
-            else spec.api_key_env is None or bool(key)
+            else model_config.secret_env(spec) is None or bool(key)
         )
         if not delta.disabled:
             providers[provider_id] = spec
-            if spec.api_key_env and not key:
+            if model_config.secret_env(spec) and not key:
                 warnings.append(f"Provider {provider_id}: API key environment variable is missing")
             parsed = urlsplit(spec.base_url)
             if parsed.scheme == "http" and parsed.hostname not in model_config._LOCAL_HOSTS:
@@ -355,23 +355,22 @@ def merge_layers(
     checksum = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()
     view["checksum"] = checksum
     resolved: dict[str, ResolvedModel] = {}
+
+    def warn(location: tuple[str | int, ...], message: str) -> None:
+        text = f"{'.'.join(str(part) for part in location)}: {message}"
+        if text not in warnings:
+            warnings.append(text)
+
     for model_id, spec_model in config.models.items():
-        provider = config.providers[spec_model.provider]
-        key = provider_keys[spec_model.provider]
-        resolved[model_id] = ResolvedModel(
-            id=model_id,
-            provider_id=spec_model.provider,
-            kind=provider.kind,
-            base_url=provider.base_url,
-            api_key=key,
+        resolved[model_id] = model_config.resolve_model(
+            model_id,
+            spec_model,
+            spec_model.provider,
+            config.providers[spec_model.provider],
+            secret=provider_keys[spec_model.provider],
             configured=provider_configured[spec_model.provider],
-            model=spec_model.model,
-            context_window=spec_model.context_window,
-            max_tokens=spec_model.max_tokens,
-            timeout_seconds=provider.timeout_seconds,
-            max_retries=provider.max_retries,
-            reasoning=spec_model.reasoning,
-            pricing=spec_model.pricing,
+            env=env,
+            warn=warn,
         )
     registry = ResolvedModelRegistry(
         models=resolved,
