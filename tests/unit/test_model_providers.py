@@ -9,7 +9,6 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-import agent.model_config as model_config
 from agent.model_config import ModelsConfig, ProviderSpec, load_models
 from agent.model_overrides import OverrideSnapshot, merge_layers
 
@@ -59,20 +58,15 @@ def test_header_key_provider_resolves_secret_headers_and_template(tmp_path: Path
     assert _SECRET not in repr(model)
 
 
-def test_advanced_provider_stays_unconfigured_until_the_transport_supports_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_flexible_provider_is_configured_when_its_secret_is_set(tmp_path: Path) -> None:
     registry = _load(tmp_path, _CLOUD, _ENV)
-    assert registry.get("main").configured is False
-    assert any("transport support" in warning for warning in registry.warnings)
-    monkeypatch.setattr(model_config, "ADVANCED_PROVIDER_TRANSPORT", True)
-    assert _load(tmp_path, _CLOUD, _ENV).get("main").configured is True
+    assert registry.get("main").configured is True
+    assert not any("CLOUD" in warning for warning in registry.warnings)
 
 
 def test_missing_template_variable_is_named_without_values(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(model_config, "ADVANCED_PROVIDER_TRANSPORT", True)
     registry = _load(tmp_path, _CLOUD, {"CLOUD_KEY": _SECRET})
     assert registry.get("main").configured is False
     text = " ".join(registry.warnings)
@@ -81,9 +75,8 @@ def test_missing_template_variable_is_named_without_values(
 
 
 def test_missing_auth_key_makes_the_provider_unconfigured(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(model_config, "ADVANCED_PROVIDER_TRANSPORT", True)
     registry = _load(tmp_path, _CLOUD, {"CLOUD_FOLDER": "folder42"})
     assert registry.get("main").configured is False
     assert any("auth.key_env" in warning for warning in registry.warnings)
@@ -111,9 +104,7 @@ def test_oauth_command_and_none_auth_types_parse(tmp_path: Path) -> None:
             "auth": {"type": "command", "argv": ["tok"]},
         }
     )
-    assert command.advanced is True
-    plain = ProviderSpec.model_validate({"kind": "openai", "base_url": "https://x.test/v1"})
-    assert plain.advanced is False
+    assert command.auth is not None and command.auth.type == "command"
 
 
 @pytest.mark.parametrize(
@@ -140,10 +131,7 @@ def test_invalid_provider_settings_are_rejected(provider: dict[str, Any]) -> Non
         ModelsConfig.model_validate(_config(provider))
 
 
-def test_override_layer_applies_the_same_provider_features(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(model_config, "ADVANCED_PROVIDER_TRANSPORT", True)
+def test_override_layer_applies_the_same_provider_features() -> None:
     base = ModelsConfig.model_validate(_config(_CLOUD))
     effective = merge_layers(base, None, OverrideSnapshot(), _ENV)
     model = effective.registry.get("main")

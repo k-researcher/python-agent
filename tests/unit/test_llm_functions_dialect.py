@@ -107,37 +107,27 @@ def test_single_tool_call_with_result() -> None:
     assert function["content"] == "answer"
 
 
-def test_two_tool_calls_split_with_results() -> None:
-    messages = [
-        {"role": "user", "content": "do both"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                _call("c1", "search", '{"q": "a"}'),
-                _call("c2", "calc", '{"op": "sum"}'),
-            ],
-        },
-        _result("c1", "first"),
-        _result("c2", "second"),
-    ]
-    body = {"model": "m", "messages": messages}
-    result = to_functions_request(body)
-    converted = result["messages"]
-    assert converted[0] == messages[0]
-    assert converted[1]["role"] == "assistant"
-    assert converted[1]["function_call"] == {
-        "name": "search",
-        "arguments": {"q": "a"},
+def test_two_tool_calls_in_one_message_are_refused() -> None:
+    from agent.llm_functions_dialect import DialectError
+
+    body = {
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "do both"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    _call("c1", "search", '{"q": "a"}'),
+                    _call("c2", "calc", '{"op": "sum"}'),
+                ],
+            },
+            _result("c1", "first"),
+            _result("c2", "second"),
+        ],
     }
-    assert converted[2] == {"role": "function", "name": "search", "content": "first"}
-    assert converted[3]["role"] == "assistant"
-    assert converted[3]["function_call"] == {
-        "name": "calc",
-        "arguments": {"op": "sum"},
-    }
-    assert converted[4] == {"role": "function", "name": "calc", "content": "second"}
-    assert len(converted) == 5
+    with pytest.raises(DialectError, match="one tool call"):
+        to_functions_request(body)
 
 
 def test_unknown_tool_call_id_raises() -> None:
@@ -213,16 +203,17 @@ def test_response_with_function_call() -> None:
     parsed = json.loads(call["function"]["arguments"])
     assert parsed == {"q": "x"}
     assert call["id"].startswith("call_")
-    assert len(call["id"]) == len("call_") + 12
+    assert call["id"].startswith("call_") and len(call["id"]) > len("call_")
 
 
-def test_deterministic_call_id() -> None:
+def test_each_reply_gets_its_own_call_id() -> None:
     function_call = {"name": "search", "arguments": {"q": "x"}}
     choice = {"message": {"function_call": function_call}, "finish_reason": "function_call"}
     data = {"choices": [choice]}
-    first = from_functions_response(data)
-    second = from_functions_response(data)
-    assert first == second
+    first = from_functions_response(data)["choices"][0]["message"]["tool_calls"][0]["id"]
+    second = from_functions_response(data)["choices"][0]["message"]["tool_calls"][0]["id"]
+    assert first.startswith("call_") and second.startswith("call_")
+    assert first != second
 
 
 def test_response_without_function_call_is_copy() -> None:
@@ -266,12 +257,10 @@ def test_original_request_is_not_mutated() -> None:
         {
             "role": "assistant",
             "content": None,
-            "tool_calls": [
-                _call("c1", "search", '{"q": "a"}'),
-                _call("c2", "calc", '{"op": "sum"}'),
-            ],
+            "tool_calls": [_call("c1", "search", '{"q": "a"}')],
         },
         _result("c1", "first"),
+        {"role": "assistant", "content": None, "tool_calls": [_call("c2", "calc", "{}")]},
         _result("c2", "second"),
     ]
     body = {

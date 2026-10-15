@@ -47,9 +47,6 @@ _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "host.docker.internal
 EnvName = Annotated[str, StringConstraints(pattern=r"\A[A-Za-z_][A-Za-z0-9_]{0,127}\z")]
 _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]{0,127})\}")
 _HEADER_NAME = re.compile(r"\A[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}\Z")
-# The LLM transport does not apply these provider features yet. A provider that needs one
-# stays unconfigured with a warning, so that no request goes out with the wrong credentials.
-ADVANCED_PROVIDER_TRANSPORT = False
 _YAML_TAGS = frozenset(
     f"tag:yaml.org,2002:{name}" for name in ("map", "seq", "str", "null", "bool", "int", "float")
 )
@@ -176,16 +173,6 @@ class ProviderSpec(_Spec):
         if self.auth is not None and self.api_key_env is not None:
             raise ValueError("use either api_key_env or auth, not both")
         return self
-
-    @property
-    def advanced(self) -> bool:
-        """Tell whether the provider needs transport features beyond a Bearer key."""
-        return (
-            self.auth is not None
-            or bool(self.headers)
-            or self.ca_bundle is not None
-            or self.dialect != "chat"
-        )
 
     @field_validator("base_url")
     @classmethod
@@ -528,8 +515,8 @@ def resolve_model(
 ) -> ResolvedModel:
     """Build one runtime model; the YAML loader and the UI override layer share it.
 
-    ``configured`` is the caller's key decision. Missing ${NAME} values and provider
-    features without transport support make the model unconfigured with a warning.
+    ``configured`` is the caller's key decision. Missing ${NAME} values make the model
+    unconfigured with a warning.
     """
     missing: set[str] = set()
     headers = {name: _expand(value, env, missing) for name, value in provider.headers.items()}
@@ -541,13 +528,6 @@ def resolve_model(
             ("models", model_id),
             "environment variables for headers or model_template are not set: "
             + ", ".join(sorted(missing)),
-        )
-        configured = False
-    if provider.advanced and not ADVANCED_PROVIDER_TRANSPORT:
-        warn(
-            ("providers", provider_id),
-            "auth, headers, ca_bundle and dialect need transport support that is not "
-            "available yet; provider is unconfigured",
         )
         configured = False
     return ResolvedModel(
