@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ssl
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -14,7 +15,19 @@ from agent.llm_errors import (
     classify_exception,
     classify_http_error,
 )
+from agent.llm_functions_dialect import from_functions_response, from_functions_stream_delta
 from agent.model_config import SUPPORTED_TRANSPORTS, ResolvedModel
+from agent.provider_auth import (
+    AuthError,
+    AuthProvider,
+    AuthSpec,
+    BearerAuth,
+    CommandTokenAuth,
+    HeaderKeyAuth,
+    NoAuth,
+    OAuthClientCredentials,
+    build_ssl_context,
+)
 from agent.redaction import redact
 from agent.wire import WireRequest, body_sha256, build_wire_request
 
@@ -58,6 +71,41 @@ class _CallbackError(Exception):
 
 
 AttemptCallback = Callable[[AttemptRecord], Awaitable[None]]
+
+# Headers that a provider config may not set: they carry framing or the request type.
+_RESERVED_HEADERS = frozenset(
+    {"content-type", "content-length", "host", "transfer-encoding", "connection"}
+)
+
+
+class _AuthExpired(Exception):
+    """Marker: the provider answered 401 before any fragment; the token may be stale."""
+
+    def __init__(self, token: str | None, next_attempt: int) -> None:
+        super().__init__()
+        self.token = token
+        self.next_attempt = next_attempt
+
+
+def _auth_spec(model: ResolvedModel) -> AuthSpec:
+    """Build the transport auth spec from the provider config and its resolved secret."""
+    config = model.auth
+    secret = model.auth_secret
+    if config is None or config.type == "none":
+        return NoAuth()
+    if config.type == "header_key":
+        return HeaderKeyAuth(secret=secret, header=config.header, prefix=config.prefix)
+    if config.type == "bearer":
+        return BearerAuth(secret=secret)
+    if config.type == "oauth_client_credentials":
+        return OAuthClientCredentials(
+            token_url=config.token_url,
+            basic_key=secret,
+            scope=config.scope,
+            request_id_header=config.request_id_header,
+            expires_at_unit=config.expires_at_unit,
+        )
+    return CommandTokenAuth(argv=tuple(config.argv), ttl_seconds=config.ttl_seconds)
 
 
 class LLMError(RuntimeError):
@@ -108,6 +156,7 @@ class LLMClient:
     def __init__(self, model: ResolvedModel) -> None:
         self.model = model
         self._http: httpx.AsyncClient | None = None
+        self._auth: AuthProvider | None = None
 
     @property
     def profile_name(self) -> str:
@@ -123,13 +172,78 @@ class LLMClient:
             self._http = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.model.timeout_seconds, connect=15.0),
                 follow_redirects=False,
+                verify=self._verify(),
             )
         return self._http
+
+    def _verify(self) -> ssl.SSLContext | bool:
+        """Return a verifying TLS setting; an extra CA bundle adds to the system roots."""
+        try:
+            return build_ssl_context(self.model.ca_bundle)
+        except AuthError as exc:
+            raise LLMError(f"Model {self.model.id}: {exc}") from None
+
+    def _auth_provider(self) -> AuthProvider | None:
+        if self.model.auth is None:
+            return None
+        if self._auth is None:
+            self._auth = AuthProvider(_auth_spec(self.model), verify=self._verify())
+        return self._auth
+
+    def _secrets(self, sent: str | None = None) -> tuple[str | None, ...]:
+        """Return every secret that must never appear in an error text.
+
+        ``sent`` is the token of the current attempt: a parallel request may already have
+        replaced the cached token, but the error text can still quote the sent one.
+        """
+        cached = self._auth.token if self._auth is not None else None
+        return (self.model.api_key, self.model.auth_secret, cached, sent)
+
+    async def _headers(self) -> tuple[dict[str, str], str | None]:
+        """Build the headers of one attempt and return the token they carry, if any."""
+        auth_header = "authorization"
+        if self.model.auth is not None and self.model.auth.type == "header_key":
+            auth_header = self.model.auth.header.lower()
+        for name in self.model.headers:
+            if name.lower() in _RESERVED_HEADERS or name.lower() == auth_header:
+                raise LLMError(f"Model {self.model.id}: provider headers must not set {name!r}")
+        headers = {**self.model.headers, "Content-Type": "application/json"}
+        provider = self._auth_provider()
+        if provider is None:
+            if self.model.api_key:
+                headers["Authorization"] = f"Bearer {self.model.api_key}"
+            return headers, None
+        try:
+            headers.update(await provider.headers())
+        except AuthError as exc:
+            message = redact(str(exc), tuple(item for item in self._secrets() if item))
+            raise LLMError(f"Provider authentication failed: {message}") from None
+        return headers, provider.token if provider.refreshable else None
+
+    def _convert(self, data: Any) -> Any:
+        """Turn a reply in the provider dialect into the chat-completions shape."""
+        if self.model.dialect == "functions" and isinstance(data, dict):
+            return from_functions_response(data)
+        return data
+
+    def _convert_chunk(self, data: str) -> str:
+        if self.model.dialect != "functions" or data == "[DONE]":
+            return data
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            return data  # The accumulator reports the invalid chunk.
+        if not isinstance(parsed, dict):
+            return data
+        return json.dumps(from_functions_stream_delta(parsed), ensure_ascii=False)
 
     async def aclose(self) -> None:
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+        if self._auth is not None:
+            await self._auth.aclose()
+            self._auth = None
 
     async def send(
         self,
@@ -151,15 +265,25 @@ class LLMClient:
         if not self.model.configured:
             raise LLMError(f"Model {self.model.id} is not configured: API key is missing")
 
-        headers = {"Content-Type": "application/json"}
-        if self.model.api_key:
-            headers["Authorization"] = f"Bearer {self.model.api_key}"
         sha256 = body_sha256(request)
         state = _AuditState()
-        if streaming:
-            assert on_delta is not None
-            return await self._stream(state, headers, request, sha256, on_delta, on_attempt)
-        return await self._complete(state, headers, request, sha256, on_attempt)
+        provider = self._auth_provider()
+        # One token refresh after a 401, then at most one more request.
+        refresh = provider is not None and provider.refreshable
+        offset = 0
+        while True:
+            try:
+                if streaming:
+                    assert on_delta is not None
+                    return await self._stream(
+                        state, request, sha256, on_delta, on_attempt, offset, refresh
+                    )
+                return await self._complete(state, request, sha256, on_attempt, offset, refresh)
+            except _AuthExpired as expired:
+                assert provider is not None
+                provider.invalidate(expired.token)
+                refresh = False
+                offset = expired.next_attempt
 
     async def chat(
         self,
@@ -184,25 +308,30 @@ class LLMClient:
     async def _complete(
         self,
         state: _AuditState,
-        headers: dict[str, str],
         request: WireRequest,
         sha256: str,
         on_attempt: AttemptCallback | None,
+        offset: int,
+        refresh: bool,
     ) -> LLMResponse:
-        """Send a non-streaming request. Retry 429 and 5xx with backoff."""
+        """Send a non-streaming request. Retry 429 and 5xx with backoff.
+
+        With ``refresh``, a 401 ends this call with ``_AuthExpired`` for one token refresh.
+        """
         client = self._client()
         retries = self.model.max_retries
-        secrets = (self.model.api_key,)
         payload_bytes = len(request.body)
         for attempt in range(retries + 1):
-            await self._emit_attempt(state, on_attempt, attempt, "started", payload_bytes, sha256)
+            number = attempt + offset
+            headers, token = await self._headers()
+            await self._emit_attempt(state, on_attempt, number, "started", payload_bytes, sha256)
             try:
                 response = await client.post(self.endpoint, headers=headers, content=request.body)
             except asyncio.CancelledError:
                 await self._emit_attempt(
                     state,
                     on_attempt,
-                    attempt,
+                    number,
                     "error",
                     payload_bytes,
                     sha256,
@@ -214,11 +343,11 @@ class LLMClient:
                 httpx.NetworkError,
                 httpx.RemoteProtocolError,
             ) as exc:
-                info = _redacted(classify_exception(exc), secrets)
+                info = _redacted(classify_exception(exc), self._secrets(token))
                 await self._emit_attempt(
                     state,
                     on_attempt,
-                    attempt,
+                    number,
                     "error",
                     payload_bytes,
                     sha256,
@@ -232,23 +361,35 @@ class LLMClient:
                 await self._emit_attempt(
                     state,
                     on_attempt,
-                    attempt,
+                    number,
                     "error",
                     payload_bytes,
                     sha256,
                     error_kind=classify_exception(exc).kind,
                 )
                 raise
+            if response.status_code == 401 and refresh:
+                await self._emit_attempt(
+                    state,
+                    on_attempt,
+                    number,
+                    "error",
+                    payload_bytes,
+                    sha256,
+                    error_kind=LLMErrorKind.auth,
+                )
+                raise _AuthExpired(token, number + 1)
             try:
                 retryable = response.status_code == 429 or response.status_code >= 500
                 if retryable and attempt < retries:
                     info = _redacted(
-                        classify_http_error(response.status_code, response.text), secrets
+                        classify_http_error(response.status_code, response.text),
+                        self._secrets(token),
                     )
                     await self._emit_attempt(
                         state,
                         on_attempt,
-                        attempt,
+                        number,
                         "error",
                         payload_bytes,
                         sha256,
@@ -257,14 +398,16 @@ class LLMClient:
                     await asyncio.sleep(min(8.0, 2.0**attempt))
                     continue
                 response.raise_for_status()
-                parsed = self._parse_response(response.json())
+                parsed = self._parse_response(self._convert(response.json()))
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
-                info = _redacted(classify_http_error(status, exc.response.text), secrets)
+                info = _redacted(
+                    classify_http_error(status, exc.response.text), self._secrets(token)
+                )
                 await self._emit_attempt(
                     state,
                     on_attempt,
-                    attempt,
+                    number,
                     "error",
                     payload_bytes,
                     sha256,
@@ -275,7 +418,7 @@ class LLMClient:
                 await self._emit_attempt(
                     state,
                     on_attempt,
-                    attempt,
+                    number,
                     "error",
                     payload_bytes,
                     sha256,
@@ -286,7 +429,7 @@ class LLMClient:
                 await self._emit_attempt(
                     state,
                     on_attempt,
-                    attempt,
+                    number,
                     "error",
                     payload_bytes,
                     sha256,
@@ -296,7 +439,7 @@ class LLMClient:
             await self._emit_attempt(
                 state,
                 on_attempt,
-                attempt,
+                number,
                 "completed",
                 payload_bytes,
                 sha256,
@@ -311,34 +454,51 @@ class LLMClient:
     async def _stream(
         self,
         state: _AuditState,
-        headers: dict[str, str],
         request: WireRequest,
         sha256: str,
         on_delta: DeltaCallback,
         on_attempt: AttemptCallback | None,
+        offset: int,
+        refresh: bool,
     ) -> LLMResponse:
-        """Stream one request. A retry is possible only before the first received fragment."""
+        """Stream one request. A retry is possible only before the first received fragment.
+
+        With ``refresh``, a 401 ends this call with ``_AuthExpired`` for one token refresh.
+        """
         from agent.sse import ChatStreamAccumulator, SSEDecoder
 
-        secrets = (self.model.api_key,)
         retries = self.model.max_retries
         payload_bytes = len(request.body)
         for attempt in range(retries + 1):
+            number = attempt + offset
             started = False
-            await self._emit_attempt(state, on_attempt, attempt, "started", payload_bytes, sha256)
+            headers, token = await self._headers()
+            await self._emit_attempt(state, on_attempt, number, "started", payload_bytes, sha256)
             try:
                 async with self._client().stream(
                     "POST", self.endpoint, headers=headers, content=request.body
                 ) as response:
+                    if response.status_code == 401 and refresh:
+                        await response.aread()
+                        await self._emit_attempt(
+                            state,
+                            on_attempt,
+                            number,
+                            "error",
+                            payload_bytes,
+                            sha256,
+                            error_kind=LLMErrorKind.auth,
+                        )
+                        raise _AuthExpired(token, number + 1)
                     if response.status_code >= 400:
                         status = response.status_code
                         body = (await response.aread()).decode(errors="replace")
-                        info = _redacted(classify_http_error(status, body), secrets)
+                        info = _redacted(classify_http_error(status, body), self._secrets(token))
                         if info.retryable and attempt < retries:
                             await self._emit_attempt(
                                 state,
                                 on_attempt,
-                                attempt,
+                                number,
                                 "error",
                                 payload_bytes,
                                 sha256,
@@ -350,7 +510,7 @@ class LLMClient:
                     decoder, accumulator = SSEDecoder(), ChatStreamAccumulator()
                     async for chunk in response.aiter_bytes():
                         for data in decoder.feed(chunk):
-                            for event in accumulator.add(data):
+                            for event in accumulator.add(self._convert_chunk(data)):
                                 if event.kind == "tool_call":
                                     started = True
                                 elif event.kind in {"content", "reasoning"} and event.text:
@@ -363,7 +523,7 @@ class LLMClient:
                                         await self._emit_attempt(
                                             state,
                                             on_attempt,
-                                            attempt,
+                                            number,
                                             "error",
                                             payload_bytes,
                                             sha256,
@@ -371,28 +531,36 @@ class LLMClient:
                                         )
                                         raise _CallbackError(exc) from exc
                     for data in decoder.close():
-                        accumulator.add(data)
+                        accumulator.add(self._convert_chunk(data))
                     result = accumulator.result()
             except _CallbackError as exc:
                 raise exc.original from None
+            except _AuthExpired:
+                raise
             except LLMError as exc:
-                # An error event inside the stream: keep its classification, add the state.
-                exc.started = exc.started or started
+                # An error event inside the stream: keep its classification and state, but
+                # never its secrets.
+                secrets = tuple(item for item in self._secrets(token) if item)
+                clean = type(exc)(
+                    redact(str(exc), secrets),
+                    info=_redacted(exc.info, self._secrets(token)),
+                    started=exc.started or started,
+                )
                 await self._emit_attempt(
                     state,
                     on_attempt,
-                    attempt,
+                    number,
                     "error",
                     payload_bytes,
                     sha256,
                     error_kind=exc.kind,
                 )
-                raise
+                raise clean from None
             except asyncio.CancelledError:
                 await self._emit_attempt(
                     state,
                     on_attempt,
-                    attempt,
+                    number,
                     "error",
                     payload_bytes,
                     sha256,
@@ -404,11 +572,11 @@ class LLMClient:
                 httpx.NetworkError,
                 httpx.RemoteProtocolError,
             ) as exc:
-                info = _redacted(classify_exception(exc), secrets)
+                info = _redacted(classify_exception(exc), self._secrets(token))
                 await self._emit_attempt(
                     state,
                     on_attempt,
-                    attempt,
+                    number,
                     "error",
                     payload_bytes,
                     sha256,
@@ -424,7 +592,7 @@ class LLMClient:
                 await self._emit_attempt(
                     state,
                     on_attempt,
-                    attempt,
+                    number,
                     "error",
                     payload_bytes,
                     sha256,
@@ -435,7 +603,7 @@ class LLMClient:
                 await self._emit_attempt(
                     state,
                     on_attempt,
-                    attempt,
+                    number,
                     "completed",
                     payload_bytes,
                     sha256,

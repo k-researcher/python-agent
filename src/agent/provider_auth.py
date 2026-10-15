@@ -172,12 +172,24 @@ class AuthProvider:
         token = await self._token()
         return {"Authorization": "Bearer " + token}
 
-    def invalidate(self) -> None:
-        """Drop the cached token.
+    @property
+    def refreshable(self) -> bool:
+        """Tell whether a new token can replace a rejected one (OAuth or command)."""
+        return isinstance(self._spec, (OAuthClientCredentials, CommandTokenAuth))
 
-        Call this after a 401 to force a fresh token request.
+    @property
+    def token(self) -> str | None:
+        """Return the cached token, so that callers can remove it from error texts."""
+        return self._cached.token if self._cached is not None else None
+
+    def invalidate(self, token: str | None = None) -> None:
+        """Drop the cached token after a 401.
+
+        With ``token``, drop the cache only while it still holds that token: a parallel
+        request may already have fetched a new one, and that one must stay.
         """
-        self._cached = None
+        if token is None or (self._cached is not None and self._cached.token == token):
+            self._cached = None
 
     async def aclose(self) -> None:
         """Close the owned HTTP client.

@@ -9,8 +9,8 @@ use the ``function`` message role instead of ``tool``. Responses use
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
+import uuid
 from typing import Any
 
 
@@ -30,6 +30,10 @@ def _arguments_object(arguments: Any) -> dict[str, Any]:
             return parsed
         return {"_raw": arguments}
     return {"_raw": str(arguments)}
+
+
+class DialectError(ValueError):
+    """The history cannot be expressed in the functions dialect without losing data."""
 
 
 def _tool_index(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -59,18 +63,22 @@ def _result_entry(tool: dict[str, Any], tool_index: dict[str, dict[str, Any]]) -
 
 
 def _convert_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert the message list to the dialect list."""
+    """Convert the message list to the dialect list.
+
+    Each call takes the first unused result with its ID that follows it. A result is
+    never looked up in the whole history: an equal ID earlier or later belongs to
+    another call.
+    """
     tool_index = _tool_index(messages)
     result: list[dict[str, Any]] = []
-    consumed: set[str] = set()
-    for message in messages:
+    consumed: set[int] = set()
+    for position, message in enumerate(messages):
         role = message.get("role")
         if role == "tool":
-            call_id = message.get("tool_call_id", "")
-            if call_id in consumed:
+            if position in consumed:
                 continue
             result.append(_result_entry(message, tool_index))
-            consumed.add(call_id)
+            consumed.add(position)
             continue
         if role != "assistant":
             result.append(copy.deepcopy(message))
@@ -79,6 +87,11 @@ def _convert_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not calls:
             result.append(copy.deepcopy(message))
             continue
+        if len(calls) > 1:
+            raise DialectError(
+                "the functions dialect takes one tool call per assistant message; "
+                f"this message has {len(calls)}"
+            )
         base: dict[str, Any] = {}
         for key, value in message.items():
             if key not in ("tool_calls", "function_call"):
@@ -89,14 +102,23 @@ def _convert_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             name = function.get("name", "")
             arguments = _arguments_object(function.get("arguments"))
             entry["function_call"] = {"name": name, "arguments": arguments}
+            state_id = call.get("functions_state_id")
+            if isinstance(state_id, str) and state_id:
+                # The provider links the function result to its state through this ID.
+                entry["functions_state_id"] = state_id
             result.append(entry)
             call_id = call.get("id")
             if not call_id:
                 continue
-            for tool in messages:
-                if tool.get("role") == "tool" and tool.get("tool_call_id") == call_id:
+            for later in range(position + 1, len(messages)):
+                tool = messages[later]
+                if (
+                    later not in consumed
+                    and tool.get("role") == "tool"
+                    and tool.get("tool_call_id") == call_id
+                ):
                     result.append(_result_entry(tool, tool_index))
-                    consumed.add(call_id)
+                    consumed.add(later)
                     break
     return result
 
@@ -131,10 +153,16 @@ def _tool_calls_from_function_call(
 ) -> list[dict[str, Any]]:
     """Build the chat-completions tool_calls list from one function_call."""
     name = function_call.get("name", "")
-    arguments = function_call.get("arguments", {})
-    raw = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
-    digest = hashlib.sha256(f"{name}{raw}{index}".encode()).hexdigest()
-    call_id = "call_" + digest[:12]
+    if "arguments" in function_call:
+        arguments = function_call["arguments"]
+        raw = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
+    else:
+        # A stream sends the arguments in string fragments: a fragment without them adds
+        # nothing. A full reply without arguments means a call with no arguments.
+        raw = "" if streamed else "{}"
+    # Each reply gets its own ID: two calls with the same name and arguments are different
+    # calls, and each must keep its own result.
+    call_id = "call_" + uuid.uuid4().hex[:24]
     call: dict[str, Any] = {
         "id": call_id,
         "type": "function",
@@ -162,7 +190,16 @@ def _convert_choice(choice: dict[str, Any]) -> dict[str, Any]:
             container["tool_calls"] = _tool_calls_from_function_call(
                 function_call, 0, streamed=streamed
             )
+            state_id = container.get("functions_state_id")
+            if isinstance(state_id, str) and state_id:
+                # Keep the ID with the call: the call is what the history stores.
+                container["tool_calls"][0]["functions_state_id"] = state_id
             container.pop("function_call", None)
+        elif streamed and isinstance(container.get("functions_state_id"), str):
+            # A late chunk can carry only the state ID of the call that started earlier.
+            container["tool_calls"] = [
+                {"index": 0, "functions_state_id": container["functions_state_id"]}
+            ]
     if converted.get("finish_reason") == "function_call":
         converted["finish_reason"] = "tool_calls"
     return converted

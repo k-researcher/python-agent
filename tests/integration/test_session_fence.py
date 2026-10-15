@@ -29,6 +29,7 @@ from agent.session_fence import (
     release,
     renew,
     stop_generation,
+    stop_generation_scoped,
 )
 
 
@@ -438,3 +439,48 @@ async def test_stop_then_new_generation_resets_stop_and_allows_claim(
     assert again is not None
     assert again.generation == 2
     assert again.epoch == 2
+
+
+async def test_stop_generation_scoped_matches_current_generation(tmp_path: Path) -> None:
+    session_id = await new_session(tmp_path, status=SessionStatus.running.value, run_generation=2)
+    async with session_factory() as db:
+        assert await stop_generation_scoped(db, session_id, 2) is True
+        await db.commit()
+    state = await fence_state(session_id)
+    assert state["run_generation"] == 3
+    assert state["stop_requested"] is True
+    assert state["owner_token"] is None
+    assert state["lease_until"] is None
+
+
+async def test_stop_generation_scoped_wrong_generation_is_noop(tmp_path: Path) -> None:
+    session_id = await new_session(tmp_path, status=SessionStatus.running.value, run_generation=2)
+    async with session_factory() as db:
+        assert await stop_generation_scoped(db, session_id, 1) is False
+    state = await fence_state(session_id)
+    assert state["run_generation"] == 2
+    assert state["stop_requested"] is False
+    assert state["owner_token"] is None
+    assert state["status"] == SessionStatus.running.value
+
+
+async def test_stop_generation_scoped_terminal_status_is_noop(tmp_path: Path) -> None:
+    session_id = await new_session(tmp_path, status=SessionStatus.completed.value, run_generation=2)
+    async with session_factory() as db:
+        assert await stop_generation_scoped(db, session_id, 2) is False
+    state = await fence_state(session_id)
+    assert state["run_generation"] == 2
+    assert state["stop_requested"] is False
+    assert state["status"] == SessionStatus.completed.value
+
+
+async def test_stop_generation_scoped_repeated_stop_is_noop(tmp_path: Path) -> None:
+    session_id = await new_session(tmp_path, status=SessionStatus.running.value, run_generation=5)
+    async with session_factory() as db:
+        assert await stop_generation_scoped(db, session_id, 5) is True
+        await db.commit()
+    async with session_factory() as db:
+        assert await stop_generation_scoped(db, session_id, 5) is False
+    state = await fence_state(session_id)
+    assert state["run_generation"] == 6
+    assert state["stop_requested"] is True

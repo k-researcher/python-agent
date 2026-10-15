@@ -1,351 +1,489 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+// New app shell: auth, realtime, theme, sidebar persistence, layout wiring.
+
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
+import { useAppStore } from "./stores/app";
+import { useSessionStore } from "./stores/session";
+import { Realtime, type ConnectionStatus } from "./realtime";
+import { clearAuth, loginFromFragment, logout, refreshAuth } from "./auth";
+import { confirmAuthenticated, newSessionProfile, resetAuthCache } from "./router";
+import type { ServerEvent } from "./api/types";
+import AppShell from "./components/layout/AppShell.vue";
+import Topbar from "./components/layout/Topbar.vue";
+import LeftSidebar from "./components/layout/LeftSidebar.vue";
+import RightPanel from "./components/layout/RightPanel.vue";
 import {
-  api,
-  ApiError,
-  type Approval,
-  type ContextStats,
-  type Message,
-  type OutboundAudit,
-  type Project,
-  type PublicConfig,
-  type Session,
-} from "./api";
-import { loginFromFragment, logout, refreshAuth } from "./auth";
+  toChildSessions,
+  toAuditEntries,
+  toLayoutContext,
+  toLayoutSessionTree,
+  toProjectOptions,
+  toToolEntries,
+} from "./uiAdapters";
 
-const projects = ref<Project[]>([]);
-const sessions = ref<Session[]>([]);
-const messages = ref<Message[]>([]);
-const approvals = ref<Approval[]>([]);
-const children = ref<Session[]>([]);
-const audit = ref<OutboundAudit[]>([]);
-const contextStats = ref<ContextStats | null>(null);
-const config = ref<PublicConfig | null>(null);
-const selectedId = ref<string | null>(null);
-const connected = ref(false);
-const error = ref("");
+const appStore = useAppStore();
+const sessionStore = useSessionStore();
+const router = useRouter();
+const route = useRoute();
+
+// ---------------------------------------------------------------------------
+// Auth state
+// ---------------------------------------------------------------------------
+
 const authenticated = ref<boolean | null>(null);
-const streaming = ref("");
+let authGeneration = 0;
 
-const projectName = ref("");
-const projectPath = ref("");
-const selectedProjectId = ref("");
-const mode = ref("dev");
-const selectedLlmProfile = ref("");
-const newPrompt = ref("");
-const newMessage = ref("");
+// Surface-level error/notice shown in the shell (create-project failures,
+// settings explanation) so a failed action is never swallowed silently.
+const projectError = ref("");
+const shellNotice = ref("");
 
-let socket: WebSocket | null = null;
-let reconnectTimer: number | undefined;
-let reconnectAttempts = 0;
-let disposed = false;
+// ---------------------------------------------------------------------------
+// Theme (light by default; preference in localStorage with guarded reads)
+// ---------------------------------------------------------------------------
 
-const current = computed(() => sessions.value.find((item) => item.id === selectedId.value));
-const canSend = computed(() =>
-  current.value && ["completed", "stopped", "error", "interrupted"].includes(current.value.status),
-);
+const THEME_KEY = "agent:theme";
 
-async function refresh(): Promise<void> {
+function readStoredTheme(): "light" | "dark" {
   try {
-    [config.value, projects.value, sessions.value] = await Promise.all([
-      api.config(),
-      api.projects(),
-      api.sessions(),
-    ]);
-    if (!selectedProjectId.value && projects.value.length) selectedProjectId.value = projects.value[0].id;
-    if (!selectedLlmProfile.value && config.value) {
-      selectedLlmProfile.value = config.value.default_llm_profile;
-    }
-    if (selectedId.value) await refreshCurrent();
-  } catch (cause) {
-    if (cause instanceof ApiError && cause.status === 401) {
-      signedOut();
-      return;
-    }
-    error.value = cause instanceof Error ? cause.message : String(cause);
+    const saved = window.localStorage.getItem(THEME_KEY);
+    return saved === "dark" ? "dark" : "light";
+  } catch {
+    return "light";
   }
 }
 
-function signedOut(): void {
-  authenticated.value = false;
-  socket?.close();
-}
-
-async function signOut(): Promise<void> {
-  await logout().catch(() => undefined);
-  signedOut();
-}
-
-async function refreshCurrent(): Promise<void> {
-  if (!selectedId.value) return;
-  [messages.value, approvals.value, children.value, audit.value, contextStats.value] = await Promise.all([
-    api.messages(selectedId.value),
-    api.approvals(selectedId.value),
-    api.children(selectedId.value),
-    api.audit(selectedId.value),
-    api.context(selectedId.value),
-  ]);
-}
-
-async function selectSession(id: string): Promise<void> {
-  selectedId.value = id;
-  await refreshCurrent();
-}
-
-async function addProject(): Promise<void> {
-  error.value = "";
+function writeStoredTheme(theme: "light" | "dark"): void {
   try {
-    const project = await api.createProject(projectName.value, projectPath.value);
-    projectName.value = "";
-    projectPath.value = "";
-    selectedProjectId.value = project.id;
-    await refresh();
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause);
+    window.localStorage.setItem(THEME_KEY, theme);
+  } catch {
+    // storage unavailable — theme just won't persist
   }
 }
 
-async function createSession(): Promise<void> {
-  if (!selectedProjectId.value || !newPrompt.value.trim()) return;
-  error.value = "";
-  try {
-    const session = await api.createSession(
-      selectedProjectId.value,
-      newPrompt.value,
-      mode.value,
-      selectedLlmProfile.value,
-    );
-    newPrompt.value = "";
-    await refresh();
-    await selectSession(session.id);
-  } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : String(cause);
-  }
+const theme = ref<"light" | "dark">(readStoredTheme());
+
+function applyTheme(t: "light" | "dark"): void {
+  document.documentElement.setAttribute("data-theme", t);
 }
 
-async function sendMessage(): Promise<void> {
-  if (!selectedId.value || !newMessage.value.trim()) return;
-  const content = newMessage.value;
-  newMessage.value = "";
-  try {
-    await api.sendMessage(selectedId.value, content);
-    await refresh();
-  } catch (cause) {
-    newMessage.value = content;
-    error.value = cause instanceof Error ? cause.message : String(cause);
-  }
-}
-
-async function decide(item: Approval, decision: "approve" | "reject"): Promise<void> {
-  const comment = decision === "reject" ? window.prompt("Причина отклонения:") ?? "" : "";
-  await api.resolveApproval(item.id, decision, comment);
-  await refresh();
-}
-
-function connect(): void {
-  if (reconnectTimer) window.clearTimeout(reconnectTimer);
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  // The session cookie authenticates the handshake; no token is sent from JavaScript.
-  socket = new WebSocket(`${protocol}//${location.host}/ws`);
-  socket.onmessage = (event) => {
-    const message = JSON.parse(String(event.data)) as {
-      type?: string;
-      ephemeral?: boolean;
-      session_id?: string;
-      payload?: { delta?: string };
-    };
-    // Streamed text: show it in place, do not reload the state for each fragment.
-    if (message.ephemeral) {
-      if (message.session_id !== selectedId.value) return;
-      if (message.type === "message.delta") streaming.value += message.payload?.delta ?? "";
-      if (message.type === "stream.reset") streaming.value = "";
-      return;
-    }
-    if (message.type === "message.created") streaming.value = "";
-    if (message.type === "connected") {
-      connected.value = true;
-      reconnectAttempts = 0;
-    }
-    void refresh();
-  };
-  socket.onclose = async (event) => {
-    connected.value = false;
-    if (disposed || authenticated.value === false) return;
-    // A rejected handshake looks like a plain close; ask the server if the login is still valid.
-    if (event.code === 4401 || event.code === 1006 || event.code === 1008) {
-      const state = await refreshAuth().catch(() => ({ authenticated: false }));
-      if (!state.authenticated) {
-        signedOut();
-        return;
-      }
-    }
-    const delay = Math.min(15_000, 1000 * 2 ** reconnectAttempts);
-    reconnectAttempts += 1;
-    reconnectTimer = window.setTimeout(connect, delay);
-  };
-}
-
-onMounted(async () => {
-  disposed = false;
-  try {
-    const state = (await loginFromFragment()) ?? (await refreshAuth());
-    authenticated.value = state.authenticated;
-  } catch (cause) {
-    authenticated.value = false;
-    error.value = cause instanceof Error ? cause.message : String(cause);
-  }
-  if (!authenticated.value) return;
-  await refresh();
-  connect();
+// Unconditionally set theme on startup/mount
+onMounted(() => {
+  applyTheme(theme.value);
 });
 
-onUnmounted(() => {
-  disposed = true;
-  if (reconnectTimer) window.clearTimeout(reconnectTimer);
-  socket?.close();
+function toggleTheme(): void {
+  theme.value = theme.value === "dark" ? "light" : "dark";
+  applyTheme(theme.value);
+  writeStoredTheme(theme.value);
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar state (persisted separately from theme)
+// ---------------------------------------------------------------------------
+
+const SIDEBAR_KEY = "agent:sidebar";
+const leftOpen = ref(window.innerWidth > 760);
+const rightOpen = ref(window.innerWidth > 1100);
+
+function readSidebarState(): void {
+  try {
+    const saved = window.localStorage.getItem(SIDEBAR_KEY);
+    if (!saved) return;
+    const parsed: unknown = JSON.parse(saved);
+    if (typeof parsed !== "object" || parsed === null) return;
+    const rec = parsed as Record<string, unknown>;
+    if (typeof rec.leftOpen === "boolean") leftOpen.value = rec.leftOpen;
+    if (typeof rec.rightOpen === "boolean") rightOpen.value = rec.rightOpen;
+  } catch {
+    // ignore corrupt saved state
+  }
+}
+
+watch(
+  [leftOpen, rightOpen],
+  () => {
+    try {
+      window.localStorage.setItem(
+        SIDEBAR_KEY,
+        JSON.stringify({ leftOpen: leftOpen.value, rightOpen: rightOpen.value }),
+      );
+    } catch {
+      // storage unavailable — sidebar state won't persist
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Realtime
+// ---------------------------------------------------------------------------
+
+let realtime: Realtime | null = null;
+let wasConnected = false;
+const connection = ref<ConnectionStatus>("offline");
+
+function onServerEvent(event: ServerEvent): void {
+  if (authenticated.value !== true) return;
+  appStore.applyEvent(event);
+  sessionStore.applyEvent(event);
+}
+
+function onRealtimeStatus(status: ConnectionStatus): void {
+  if (authenticated.value !== true) return;
+  connection.value = status;
+  if (status === "live") {
+    // Initial connect or reconnect: reload the stores so we catch up to
+    // events that may have fired while the socket was down. Reopening the
+    // current session re-fetches messages/approvals/context consistently.
+    const reload = async (): Promise<void> => {
+      const expectedGeneration = authGeneration;
+      try {
+        await appStore.load();
+        if (expectedGeneration !== authGeneration || authenticated.value !== true) return;
+        if (sessionStore.sessionId) {
+          const id = sessionStore.sessionId;
+          await sessionStore.open(id);
+        }
+      } catch {
+        // transient failure — data stays as-is, next reconnect will retry
+      }
+    };
+    void reload();
+    wasConnected = true;
+  }
+}
+
+function connectRealtime(): void {
+  if (realtime) {
+    realtime.close();
+    realtime = null;
+  }
+  wasConnected = false;
+  const expectedGeneration = authGeneration;
+  realtime = new Realtime({
+    onEvent: (event) => {
+      if (expectedGeneration === authGeneration) onServerEvent(event);
+    },
+    onStatus: (status) => {
+      if (expectedGeneration === authGeneration) onRealtimeStatus(status);
+    },
+    onUnauthorized: () => {
+      if (expectedGeneration === authGeneration) endAuthSession();
+    },
+  });
+  realtime.connect();
+}
+
+// ---------------------------------------------------------------------------
+// Layout data from stores → component props via adapters
+// ---------------------------------------------------------------------------
+
+const projectOptions = computed(() => toProjectOptions(appStore.projects));
+const sessionTree = computed(() =>
+  toLayoutSessionTree(appStore.sessionTree(appStore.selectedProjectId)),
+);
+const selectedSessionId = computed(() => sessionStore.sessionId);
+const contextStats = computed(() => toLayoutContext(sessionStore.context));
+const childSessions = computed(() => toChildSessions(sessionStore.children));
+const auditEntries = computed(() => toAuditEntries(sessionStore.audit));
+const toolEntries = computed(() => toToolEntries(appStore.config));
+
+// ---------------------------------------------------------------------------
+// Sidebar actions
+// ---------------------------------------------------------------------------
+
+async function onSelectProject(id: string): Promise<void> {
+  if (id === appStore.selectedProjectId || !appStore.projects.some((project) => project.id === id)) return;
+  sessionStore.close();
+  appStore.selectedProjectId = id;
+  projectError.value = "";
+  shellNotice.value = "";
+  void router.push({ name: "home" });
+}
+
+watch(() => sessionStore.session?.project_id, (projectId) => {
+  if (projectId && appStore.projects.some((project) => project.id === projectId)) {
+    appStore.selectedProjectId = projectId;
+  }
+});
+
+function onSelectSession(id: string): void {
+  if (window.innerWidth <= 760) leftOpen.value = false;
+  void router.push(`/s/${id}`);
+}
+
+// Track if a project creation is in progress to disable UI
+const isCreatingProject = ref(false);
+const isCreateFormVisible = ref(false);
+
+async function onCreateProject(input: { name: string; rootPath: string }): Promise<void> {
+  if (isCreatingProject.value) return;
+  projectError.value = "";
+  isCreatingProject.value = true;
+  const expectedGeneration = authGeneration;
+  try {
+    await appStore.createProject(input.name, input.rootPath);
+    if (expectedGeneration !== authGeneration) return;
+    // On success, close the form.
+    isCreateFormVisible.value = false;
+  } catch (cause) {
+    if (expectedGeneration !== authGeneration) return;
+    // Surface the failure instead of swallowing it: the user must know that the
+    // project was not created (the form stays open with its values untouched).
+    projectError.value = cause instanceof Error ? cause.message : String(cause);
+  } finally {
+    if (expectedGeneration === authGeneration) isCreatingProject.value = false;
+  }
+}
+
+function onNewSession(): void {
+  sessionStore.close();
+  if (window.innerWidth <= 760) leftOpen.value = false;
+  void router.push({ name: "home" });
+}
+
+function onOpenSettings(): void {
+  // Settings / model-management (3.3) is not implemented yet. Be honest about it
+  // rather than navigating somewhere that silently does nothing.
+  shellNotice.value =
+    "Настройки и управление моделями будут доступны в следующем этапе (3.3).";
+}
+
+function endAuthSession(): void {
+  authGeneration += 1;
+  authenticated.value = false;
+  resetAuthCache();
+  clearAuth();
+  newSessionProfile.value = null;
+  realtime?.close();
+  realtime = null;
+  connection.value = "offline";
+  wasConnected = false;
+  sessionStore.close();
+  appStore.reset();
+  projectError.value = "";
+  shellNotice.value = "";
+  isCreatingProject.value = false;
+  isCreateFormVisible.value = false;
+  void router.replace({ name: "login" });
+}
+
+async function onSignOut(): Promise<void> {
+  const request = logout();
+  endAuthSession();
+  try {
+    await request;
+  } catch {
+    return;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// RightPanel navigation
+// ---------------------------------------------------------------------------
+
+function onOpenChildSession(id: string): void {
+  void router.push(`/s/${id}`);
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
+async function bootstrap(): Promise<void> {
+  const expectedGeneration = authGeneration;
+  try {
+    await appStore.load();
+  } catch {
+    // If loading fails (network), the UI still renders; sidebars will retry on
+    // the next realtime reconnect.
+  }
+  if (expectedGeneration === authGeneration && authenticated.value === true) connectRealtime();
+}
+
+async function enterAuthenticatedWorkspace(): Promise<void> {
+  const expectedGeneration = authGeneration;
+  authenticated.value = true;
+  confirmAuthenticated();
+  if (route.name === "login") {
+    const next = route.query.next;
+    const destination = typeof next === "string" && next.startsWith("/")
+      && !next.startsWith("//") && next.split(/[?#]/)[0] !== "/login"
+      ? next : { name: "home" };
+    await router.replace(destination);
+  }
+  if (expectedGeneration === authGeneration) await bootstrap();
+}
+
+async function init(): Promise<void> {
+  const expectedGeneration = authGeneration;
+  readSidebarState();
+
+  // Check for a one-time login link first.
+  let state = null;
+  try {
+    state = await loginFromFragment();
+  } catch {
+    // Invalid or expired link; fall through to regular check.
+  }
+  if (expectedGeneration !== authGeneration) return;
+  if (state && state.authenticated) {
+    await enterAuthenticatedWorkspace();
+    return;
+  }
+  if (state) {
+    // Link was consumed but not authenticated.
+    authenticated.value = false;
+    resetAuthCache();
+    void router.replace({ name: "login" });
+    return;
+  }
+
+  // Regular session check.
+  try {
+    const session = await refreshAuth();
+    if (expectedGeneration !== authGeneration) return;
+    authenticated.value = session.authenticated;
+  } catch {
+    if (expectedGeneration !== authGeneration) return;
+    authenticated.value = false;
+  }
+  if (authenticated.value) {
+    await enterAuthenticatedWorkspace();
+  } else {
+    resetAuthCache();
+    if (route.name !== "login") void router.replace({ name: "login" });
+  }
+}
+
+onMounted(() => {
+  void init();
+});
+
+onBeforeUnmount(() => {
+  authGeneration += 1;
+  appStore.reset();
+  sessionStore.close();
+  realtime?.close();
+  realtime = null;
 });
 </script>
 
 <template>
-  <div v-if="authenticated === false" class="login-required">
-    <h1>Нужна ссылка для входа</h1>
-    <p>Откройте одноразовую ссылку из консоли агента или выпустите новую командой:</p>
-    <pre>uv run agent auth link</pre>
-    <p v-if="error" class="error">{{ error }}</p>
+  <div v-if="authenticated === null" class="app-loading">
+    <p>Загрузка…</p>
   </div>
-  <div v-else-if="authenticated" class="layout">
-    <aside>
-      <div class="brand">
-        <span>Python Agent</span>
-        <i :class="connected ? 'online' : 'offline'" :title="connected ? 'WebSocket подключён' : 'WebSocket отключён'" />
-        <button class="link" type="button" @click="signOut">Выйти</button>
+
+  <div v-else-if="authenticated === false" class="app-login">
+    <RouterView />
+  </div>
+
+  <AppShell
+    v-else
+    v-model:left-open="leftOpen"
+    v-model:right-open="rightOpen"
+  >
+    <template #topbar>
+      <Topbar
+        :connection="connection"
+        @toggle-theme="toggleTheme"
+        @search="() => {}"
+      />
+    </template>
+
+    <template #left>
+      <LeftSidebar
+        :projects="projectOptions"
+        :selected-project-id="appStore.selectedProjectId"
+        :tree="sessionTree"
+        :selected-session-id="selectedSessionId"
+        :is-creating-project="isCreatingProject"
+        :show-create-form="isCreateFormVisible"
+        @select-project="onSelectProject"
+        @select-session="onSelectSession"
+        @create-project="onCreateProject"
+        @new-session="onNewSession"
+        @open-settings="onOpenSettings"
+        @sign-out="onSignOut"
+        @open-create-form="isCreateFormVisible = true"
+        @close-create-form="isCreateFormVisible = false"
+      />
+    </template>
+
+    <template #main>
+      <div class="shell-main">
+        <div v-if="projectError || shellNotice" class="shell-banner" role="status">
+          <p v-if="projectError" class="shell-banner__error" data-testid="project-error">
+            {{ projectError }}
+          </p>
+          <p v-else-if="shellNotice" class="shell-banner__notice" data-testid="shell-notice">
+            {{ shellNotice }}
+          </p>
+        </div>
+        <div class="shell-main__view">
+          <RouterView />
+        </div>
       </div>
+    </template>
 
-      <small v-if="config">
-        LLM: {{ config.llm_destination }} · сеть:
-        {{ config.network_tools_enabled ? "включена" : "выключена" }} · runtime:
-        {{ config.execution_mode }}
-      </small>
-
-      <details>
-        <summary>Добавить проект</summary>
-        <form @submit.prevent="addProject">
-          <input v-model="projectName" placeholder="Название" required />
-          <input v-model="projectPath" placeholder="Абсолютный путь" required />
-          <button>Добавить</button>
-        </form>
-      </details>
-
-      <details open>
-        <summary>Новая сессия</summary>
-        <form @submit.prevent="createSession">
-          <select v-model="selectedProjectId" required>
-            <option disabled value="">Выберите проект</option>
-            <option v-for="project in projects" :key="project.id" :value="project.id">
-              {{ project.name }}
-            </option>
-          </select>
-          <select v-model="mode">
-            <option value="dev">Разработчик</option>
-            <option value="ask">Консультант</option>
-          </select>
-          <select v-model="selectedLlmProfile" required>
-            <option
-              v-for="profile in config?.llm_profiles ?? []"
-              :key="profile.name"
-              :value="profile.name"
-              :disabled="!profile.configured"
-            >
-              {{ profile.name }} · {{ profile.model }}
-            </option>
-          </select>
-          <textarea v-model="newPrompt" placeholder="Задача" rows="4" required />
-          <button>Создать и запустить</button>
-        </form>
-      </details>
-
-      <nav>
-        <button
-          v-for="session in sessions"
-          :key="session.id"
-          class="session"
-          :class="{ selected: session.id === selectedId }"
-          @click="selectSession(session.id)"
-        >
-          <span>{{ session.title }}</span>
-          <small :data-status="session.status">{{ session.status }}</small>
-        </button>
-      </nav>
-    </aside>
-
-    <main>
-      <p v-if="error" class="error">{{ error }}</p>
-      <div v-if="!current" class="empty">Выберите или создайте сессию</div>
-      <template v-else>
-        <header>
-          <div>
-            <h1>{{ current.title }}</h1>
-            <span>{{ current.mode }} · {{ current.llm_profile }} · {{ current.status }}</span>
-          </div>
-          <button v-if="['running', 'pending', 'awaiting_confirmation'].includes(current.status)" class="danger" @click="api.stop(current.id)">Остановить</button>
-        </header>
-
-        <section v-if="contextStats" class="approvals">
-          <article>
-            <strong>Контекст и приватность</strong>
-            <span>
-              ~{{ contextStats.approximate_tokens }} токенов · пропущено сообщений:
-              {{ contextStats.omitted_messages }} · LLM: {{ config?.llm_destination }}
-            </span>
-          </article>
-        </section>
-
-        <section v-if="children.length" class="approvals">
-          <article>
-            <strong>Дочерние агенты</strong>
-            <button v-for="child in children" :key="child.id" @click="selectSession(child.id)">
-              {{ child.title }} · {{ child.status }}
-            </button>
-          </article>
-        </section>
-
-        <section v-if="approvals.length" class="approvals">
-          <article v-for="item in approvals" :key="item.id">
-            <strong>Требуется подтверждение: {{ item.tool_name }}</strong>
-            <span>Риск: {{ item.risk_level }}</span>
-            <pre>{{ JSON.stringify(item.arguments, null, 2) }}</pre>
-            <div class="actions">
-              <button @click="decide(item, 'approve')">Разрешить</button>
-              <button class="danger" @click="decide(item, 'reject')">Отклонить</button>
-            </div>
-          </article>
-        </section>
-
-        <section class="messages">
-          <article v-for="message in messages.filter((item) => item.role !== 'system')" :key="message.id" :class="message.role">
-            <b>{{ message.role }}</b>
-            <pre>{{ message.content }}</pre>
-          </article>
-          <article v-if="streaming" class="assistant streaming">
-            <b>assistant</b>
-            <pre>{{ streaming }}</pre>
-          </article>
-        </section>
-
-        <details v-if="audit.length">
-          <summary>Исходящие обращения ({{ audit.length }})</summary>
-          <article v-for="item in audit" :key="item.id">
-            <b>{{ item.category }} · {{ item.status }}</b>
-            <span>{{ item.destination }} · {{ item.payload_bytes }} байт</span>
-            <small>SHA-256: {{ item.payload_sha256 }}</small>
-          </article>
-        </details>
-
-        <form class="composer" @submit.prevent="sendMessage">
-          <textarea v-model="newMessage" rows="3" placeholder="Продолжить диалог" :disabled="!canSend" />
-          <button :disabled="!canSend || !newMessage.trim()">Отправить</button>
-        </form>
-      </template>
-    </main>
-  </div>
+    <template #right>
+      <RightPanel
+        :context="contextStats"
+        :children="childSessions"
+        :audit="auditEntries"
+        :tools="toolEntries"
+        @open-session="onOpenChildSession"
+      />
+    </template>
+  </AppShell>
 </template>
+
+<style scoped>
+.app-loading,
+.app-login {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.shell-main {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.shell-main__view {
+  flex: 1;
+  min-height: 0;
+}
+
+.shell-banner {
+  flex-shrink: 0;
+  margin: 8px 16px 0;
+}
+
+.shell-banner__error {
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.shell-banner__notice {
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  color: var(--text-muted);
+  font-size: 13px;
+}
+</style>

@@ -21,6 +21,8 @@ class _ToolCallAccumulator:
     type: str | None = None
     name: str | None = None
     arguments: str = ""
+    # Provider state of the call in the functions dialect; sent back with the history.
+    state_id: str | None = None
 
 
 class SSEDecoder:
@@ -145,6 +147,12 @@ class ChatStreamAccumulator:
         raw_index = part.get("index")
         index = raw_index if isinstance(raw_index, int) else 0
         entry = self._tool_calls.get(index)
+        state_id = part.get("functions_state_id")
+        if set(part) <= {"index", "functions_state_id"}:
+            # A late state ID belongs to a call that already started; it never opens one.
+            if entry is not None and isinstance(state_id, str) and state_id:
+                entry.state_id = state_id
+            return
         if entry is None:
             entry = _ToolCallAccumulator(index=index)
             self._tool_calls[index] = entry
@@ -162,23 +170,24 @@ class ChatStreamAccumulator:
             arguments = function.get("arguments")
             if isinstance(arguments, str):
                 entry.arguments += arguments
+        if isinstance(state_id, str) and state_id:
+            entry.state_id = state_id
         events.append(StreamEvent(kind="tool_call", index=index))
 
     def result(self) -> LLMResponse:
         """Build the final LLMResponse from all collected chunks."""
         content = "".join(self._content) or None
         reasoning = "".join(self._reasoning) or None
-        tool_calls = [
-            {
+        tool_calls: list[dict[str, Any]] = []
+        for _, entry in sorted(self._tool_calls.items(), key=lambda item: item[0]):
+            call: dict[str, Any] = {
                 "id": entry.id,
                 "type": entry.type or "function",
-                "function": {
-                    "name": entry.name or "",
-                    "arguments": entry.arguments,
-                },
+                "function": {"name": entry.name or "", "arguments": entry.arguments},
             }
-            for _, entry in sorted(self._tool_calls.items(), key=lambda item: item[0])
-        ]
+            if entry.state_id is not None:
+                call["functions_state_id"] = entry.state_id
+            tool_calls.append(call)
         usage = self._usage or {}
         prompt_tokens = token_count(usage, "prompt_tokens")
         completion_tokens = token_count(usage, "completion_tokens")

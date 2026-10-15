@@ -1,4 +1,5 @@
 import { request, setCsrfToken } from "./api";
+import { clearDrafts } from "./draftStorage";
 
 export interface AuthState {
   authenticated: boolean;
@@ -6,13 +7,16 @@ export interface AuthState {
   csrf_token?: string;
 }
 
-function remember(state: AuthState): AuthState {
-  setCsrfToken(state.csrf_token ?? "");
+let generation = 0;
+
+function remember(state: AuthState, expectedGeneration: number): AuthState {
+  if (expectedGeneration === generation) setCsrfToken(state.csrf_token ?? "");
   return state;
 }
 
 /** Exchange a one-time `#login=<code>` link for a session cookie, then drop it from the URL. */
 export async function loginFromFragment(): Promise<AuthState | null> {
+  const expectedGeneration = generation;
   const match = /(?:^#|&)login=([^&]+)/.exec(location.hash);
   if (!match) return null;
   history.replaceState(null, "", location.pathname + location.search);
@@ -21,14 +25,23 @@ export async function loginFromFragment(): Promise<AuthState | null> {
       method: "POST",
       body: JSON.stringify({ code: decodeURIComponent(match[1]) }),
     }),
+    expectedGeneration,
   );
 }
 
 export async function refreshAuth(): Promise<AuthState> {
-  return remember(await request<AuthState>("/auth/session"));
+  const expectedGeneration = generation;
+  return remember(await request<AuthState>("/auth/session"), expectedGeneration);
+}
+
+export function clearAuth(): void {
+  generation += 1;
+  setCsrfToken("");
+  clearDrafts();
 }
 
 export async function logout(): Promise<void> {
+  const expectedGeneration = generation;
   await request("/auth/logout", { method: "POST" });
-  setCsrfToken("");
+  if (expectedGeneration === generation) clearAuth();
 }

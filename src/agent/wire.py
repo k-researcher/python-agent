@@ -9,10 +9,13 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from agent.llm_functions_dialect import to_functions_request
 from agent.model_config import ResolvedModel
 from agent.reasoning import ReasoningDecision, wire_parameters
 
 ESTIMATOR_VERSION = "chat-json-v1"
+# A request in another dialect has another size; its calibration must stay apart.
+DIALECT_VERSIONS = {"functions": "functions-v1"}
 _EXCLUDED_FIELDS = frozenset({"model", "max_tokens", "stream", "stream_options"})
 
 
@@ -32,7 +35,10 @@ def wire_version(model: ResolvedModel) -> str:
     """Return ESTIMATOR_VERSION plus the sha256 hex of the normalized endpoint."""
     normalized = endpoint_of(model).lower()
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-    return f"{ESTIMATOR_VERSION}:{digest}"
+    dialect = DIALECT_VERSIONS.get(model.dialect)
+    if dialect is None:
+        return f"{ESTIMATOR_VERSION}:{digest}"
+    return f"{ESTIMATOR_VERSION}+{dialect}:{digest}"
 
 
 def build_wire_request(
@@ -60,8 +66,26 @@ def build_wire_request(
     if stream:
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
+    if model.dialect == "functions":
+        # Convert before serialization: the size estimate, the hash and the sent bytes
+        # all describe the request in the provider dialect.
+        payload = to_functions_request(payload)
+    else:
+        _drop_dialect_fields(payload["messages"])
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return WireRequest(payload=payload, body=body, wire_version=wire_version(model))
+
+
+def _drop_dialect_fields(messages: list[dict[str, Any]]) -> None:
+    """Remove the state ID of the functions dialect from stored tool calls.
+
+    A history can hold calls from a functions-dialect provider; a strict chat provider
+    refuses unknown fields in tool calls.
+    """
+    for message in messages:
+        for call in message.get("tool_calls") or []:
+            if isinstance(call, dict):
+                call.pop("functions_state_id", None)
 
 
 def estimate_wire(request: WireRequest) -> int:
@@ -73,7 +97,7 @@ def estimate_wire(request: WireRequest) -> int:
         json.dumps(projection, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
     messages = projection.get("messages", [])
-    tools = projection.get("tools", [])
+    tools = projection.get("tools") or projection.get("functions") or []
     return math.ceil(json_chars / 4) + 8 + 4 * len(messages) + 8 * len(tools)
 
 

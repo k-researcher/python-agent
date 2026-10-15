@@ -50,6 +50,7 @@ from agent.session_fence import (
     release,
     renew,
     stop_generation,
+    stop_generation_scoped,
 )
 from agent.session_service import create_session_record
 from agent.tool_batch import BatchCall, BatchResult, is_parallel_safe, run_batch
@@ -253,6 +254,48 @@ class AgentSupervisor:
 
         for child_id in children:
             await self.stop(child_id)
+
+    async def stop_scoped(self, session_id: str, expected_generation: int) -> bool:
+        """Stop only the expected run generation; return True when it was stopped.
+
+        The task of the expected generation is captured before the database write. The
+        write checks the generation; on a mismatch nothing changes. After the commit the
+        captured task is cancelled at once, before any event, and the method waits for it
+        also when an event fails or the caller is cancelled. A task of a newer generation
+        is never touched. There is no cascade to children.
+        """
+        captured = self._tasks_of_generation(session_id, expected_generation)
+        async with session_factory() as db:
+            if not await stop_generation_scoped(db, session_id, expected_generation):
+                return False
+            session = await db.get(Session, session_id)
+            if session is not None:
+                session.status = SessionStatus.stopped.value
+            cancelled = await self._cancel_unfinished_tool_calls(db, session_id)
+            await db.commit()
+            # No await between the commit and cancel(): the expected task stops even when
+            # a newer generation registers itself while the events below are sent.
+            targets = captured | self._tasks_of_generation(session_id, expected_generation)
+            for task in targets:
+                task.cancel()
+            try:
+                await emit_event(
+                    db, "session.status", {"status": SessionStatus.stopped.value}, session_id
+                )
+                if cancelled:
+                    await emit_event(
+                        db, "approval.cancelled", {"tool_call_ids": cancelled}, session_id
+                    )
+            finally:
+                await asyncio.gather(*targets, return_exceptions=True)
+        return True
+
+    def _tasks_of_generation(self, session_id: str, generation: int) -> set[asyncio.Task[None]]:
+        """Return the unfinished current task of the session when it runs ``generation``."""
+        task = self._tasks.get(session_id)
+        if task is None or task.done() or self._task_generation.get(session_id) != generation:
+            return set()
+        return {task}
 
     @staticmethod
     async def _cancel_unfinished_tool_calls(db: Any, session_id: str) -> list[str]:
