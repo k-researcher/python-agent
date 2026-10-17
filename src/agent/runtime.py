@@ -6,6 +6,7 @@ import json
 import logging
 import uuid
 from contextlib import suppress
+from contextvars import ContextVar
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
@@ -53,9 +54,11 @@ from agent.session_fence import (
     stop_generation_scoped,
 )
 from agent.session_service import create_session_record
+from agent.skill_prompt import load_skill_set
 from agent.tool_batch import BatchCall, BatchResult, is_parallel_safe, run_batch
 from agent.tools import ToolRegistry
 from agent.tools.base import ToolContext, ToolError
+from agent.tools.skill_tools import ReadSkillTool
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +126,9 @@ class AgentSupervisor:
     def __init__(self, settings: Settings, registry: ToolRegistry | None = None) -> None:
         self.settings = settings
         self.registry = registry or ToolRegistry(settings=settings)
+        self._run_registry: ContextVar[ToolRegistry | None] = ContextVar(
+            "session_tool_registry", default=None
+        )
         # Optional override for the default model's client (used by tests and fakes).
         self.llm: LLMClient | None = None
         self._llm_clients: dict[str, LLMClient] = {}
@@ -534,7 +540,26 @@ class AgentSupervisor:
             logger.exception("Model configuration is invalid; the last valid one stays in use")
         return self._last_models
 
+    @property
+    def _tools(self) -> ToolRegistry:
+        """Return the tools bound to this run, or the base registry outside a run."""
+        return self._run_registry.get() or self.registry
+
     async def _run(self, session_id: str) -> None:
+        async with session_factory() as db:
+            project = await db.scalar(select(Project).join(Session).where(Session.id == session_id))
+        registry = self.registry
+        if project is not None:
+            skills = load_skill_set(Path(project.root_path), None)
+            if skills.skills:
+                registry = registry.with_tools((ReadSkillTool(skills),))
+        token = self._run_registry.set(registry)
+        try:
+            await self._run_session(session_id)
+        finally:
+            self._run_registry.reset(token)
+
+    async def _run_session(self, session_id: str) -> None:
         # One catalogue snapshot for the whole execution: a YAML or UI change applies to the
         # next execution, not between two steps of a running one.
         models: ResolvedModelRegistry | None = None
@@ -611,7 +636,7 @@ class AgentSupervisor:
                 if models is None:
                     models = await self._models(db)
                 model = select_model(models, session.llm_profile, strict=False)
-                definitions = self.registry.definitions(session.mode, model_ids=models.ids())
+                definitions = self._tools.definitions(session.mode, model_ids=models.ids())
                 decisions = {
                     candidate.id: self._reasoning_for(session, candidate)
                     for candidate in models.models.values()
@@ -747,11 +772,9 @@ class AgentSupervisor:
                                 "Tool arguments are not valid JSON"
                                 + (" (the reply was cut off)" if truncated else "")
                             )
-                        self.registry.validate(
-                            name, session.mode, arguments, model_ids=models.ids()
-                        )
-                        risk = self.registry.risk(name, session.mode)
-                        confirmation = self.registry.requires_confirmation(name, session.mode)
+                        self._tools.validate(name, session.mode, arguments, model_ids=models.ids())
+                        risk = self._tools.risk(name, session.mode)
+                        confirmation = self._tools.requires_confirmation(name, session.mode)
                     except Exception as exc:
                         call = ToolCall(
                             id=call_id,
@@ -919,7 +942,7 @@ class AgentSupervisor:
         if call.status != ToolCallStatus.pending.value or call.approval is not None:
             return False
         try:
-            return is_parallel_safe(self.registry.get(call.name, session.mode))
+            return is_parallel_safe(self._tools.get(call.name, session.mode))
         except Exception:
             return False
 
@@ -949,7 +972,7 @@ class AgentSupervisor:
             context = self._tool_context(session)
 
             async def execute(item: BatchCall) -> Any:
-                return await self.registry.execute(item.name, session.mode, context, item.arguments)
+                return await self._tools.execute(item.name, session.mode, context, item.arguments)
 
             results = await run_batch(
                 [BatchCall(call.id, call.name, dict(call.arguments)) for call in claimed],
@@ -966,7 +989,7 @@ class AgentSupervisor:
             return False
         context = self._tool_context(session)
         try:
-            output = await self.registry.execute(
+            output = await self._tools.execute(
                 call.name, session.mode, context, dict(call.arguments)
             )
             result = {"success": True, "output": output}

@@ -41,6 +41,15 @@ class ToolRegistry:
             )
         self._tools = {tool.name: tool for tool in tools}
 
+    def with_tools(self, tools: tuple[Tool, ...]) -> ToolRegistry:
+        """Create an isolated registry without replacing existing tool names."""
+        combined = dict(self._tools)
+        for tool in tools:
+            if tool.name in combined:
+                raise ToolError(f"Tool name is already registered: {tool.name}")
+            combined[tool.name] = tool
+        return ToolRegistry(settings=self.settings, tools=tuple(combined.values()))
+
     def _enabled(self, tool: Tool) -> bool:
         if tool.network_capability and not self.settings.allow_network_tools:
             return False

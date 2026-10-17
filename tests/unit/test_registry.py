@@ -11,6 +11,34 @@ def test_read_only_tool_does_not_require_confirmation() -> None:
     assert registry.requires_confirmation("read_file", "dev") is False
 
 
+def test_run_registry_keeps_settings_and_does_not_modify_base() -> None:
+    from agent.skill_prompt import SkillSet
+    from agent.tools.skill_tools import ReadSkillTool
+
+    settings = Settings(allow_network_tools=False)
+    registry = ToolRegistry(settings=settings)
+    scoped = registry.with_tools((ReadSkillTool(SkillSet(skills=(), errors=())),))
+
+    assert scoped is not registry
+    assert scoped.settings is settings
+    assert scoped.requires_confirmation("read_skill", "ask") is False
+    with pytest.raises(ToolError):
+        registry.get("read_skill", "ask")
+    with pytest.raises(ToolError):
+        scoped.get("write_file", "ask")
+    with pytest.raises(ToolError):
+        scoped.get("http_request", "dev")
+
+
+def test_run_registry_refuses_to_replace_an_existing_tool() -> None:
+    registry = ToolRegistry()
+    original = registry.get("read_file", "dev")
+
+    with pytest.raises(ToolError, match="already registered"):
+        registry.with_tools((original,))
+    assert registry.get("read_file", "dev") is original
+
+
 @pytest.mark.parametrize("name", ["write_file", "edit_file", "remove_file", "shell"])
 def test_side_effect_tools_require_confirmation(name: str) -> None:
     registry = ToolRegistry()
