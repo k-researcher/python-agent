@@ -1,0 +1,15 @@
+id = "limit-cost"
+class = "limit"
+fix_commit = "46e67de"
+prompt = """
+Опиши, как в этом проекте устроен учёт стоимости LLM-попыток: откуда берётся
+информация о каждой попытке, как вычисляется точная стоимость одного вызова и как
+из накопленных значений выводится суммарная стоимость сессии. Упомяни, какие
+случаи считаются неизвестными и как это влияет на итог. Ответь по-русски, по коду
+текущего состояния репозитория.
+"""
+expected_facts = ["exact_cost", "summarize_session_usage", "usage_ledger", "SessionUsageSummary"]
+budget = { max_cost = "0.03" }
+expect_stop_reason = "cost_exhausted"
+max_steps = 30
+max_seconds = 1200
