@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
+from types import TracebackType
 
 from sqlalchemy import select
 
@@ -23,6 +25,8 @@ from agent.tool_sources import ToolSource, load_tool_sources
 from agent.tools.base import ToolError
 from agent.tools.mcp_tools import build_mcp_tools
 from agent.tools.registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 
 async def _may_connect(session_id: str, project_root: Path, source: ToolSource) -> bool:
@@ -57,12 +61,40 @@ async def _close_client(client: StdioMcpClient) -> None:
             await asyncio.shield(closing)
         except asyncio.CancelledError:
             cancelled = True
+        except Exception:
+            break
     try:
         closing.result()
     except Exception:
+        if cancelled:
+            raise asyncio.CancelledError from None
         raise ToolError("Trusted MCP client could not be closed") from None
     if cancelled:
         raise asyncio.CancelledError
+
+
+def _close_on_exit(
+    client: StdioMcpClient,
+) -> Callable[
+    [type[BaseException] | None, BaseException | None, TracebackType | None],
+    Awaitable[bool],
+]:
+    """Close the client on exit; a close failure never hides an exception in flight."""
+
+    async def close(
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        try:
+            await _close_client(client)
+        except ToolError:
+            if exc is None:
+                raise
+            logger.warning("Trusted MCP client could not be closed")
+        return False
+
+    return close
 
 
 @asynccontextmanager
@@ -91,7 +123,7 @@ async def source_registry(
                     sandbox=replace(policy_from_settings(settings), mode="required"),
                     session_id=session_id,
                 )
-                stack.push_async_callback(_close_client, client)
+                stack.push_async_exit(_close_on_exit(client))
                 await client.start()
                 tools = await build_mcp_tools(client, mcp_tool_policy(source), source=source)
                 for tool in tools:

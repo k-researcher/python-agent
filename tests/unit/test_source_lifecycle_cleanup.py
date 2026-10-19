@@ -270,3 +270,128 @@ async def test_sandbox_unavailable_is_redacted_and_never_falls_back(
     client.start.assert_awaited_once_with()
     client.list_tools.assert_not_awaited()
     harness.assert_closed()
+
+
+async def test_close_failure_is_redacted_and_other_clients_still_close(
+    lifecycle_factory: Callable[..., LifecycleHarness],
+) -> None:
+    harness = lifecycle_factory(source_count=2)
+    first_client, second_client = harness.clients
+    secret = "close-secret-value"
+
+    async def fail_close() -> None:
+        harness.events.append("close:source-1")
+        second_client.reaped = True
+        raise RuntimeError(f"private-server-1 --token=command-secret {secret}")
+
+    second_client.close.side_effect = fail_close
+
+    with pytest.raises(ToolError) as caught:
+        async with harness.context() as registry:
+            assert isinstance(registry, ToolRegistry)
+
+    assert str(caught.value) == "Trusted MCP client could not be closed"
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__
+    rendered = "".join(traceback.format_exception(caught.value))
+    for sensitive in ("private-server-1", "command-secret", secret):
+        assert sensitive not in rendered
+    assert harness.events[-2:] == ["close:source-1", "close:source-0"]
+    harness.assert_closed()
+    assert first_client.reaped
+
+
+async def test_close_failure_after_cancellation_keeps_cancellation(
+    lifecycle_factory: Callable[..., LifecycleHarness],
+) -> None:
+    harness = lifecycle_factory()
+    client = harness.clients[0]
+    discovery_started = asyncio.Event()
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def discover() -> list[object]:
+        discovery_started.set()
+        await asyncio.Event().wait()
+        return []
+
+    async def fail_close() -> None:
+        close_started.set()
+        await release_close.wait()
+        client.reaped = True
+        raise RuntimeError("close failed after cancellation")
+
+    async def run() -> None:
+        async with harness.context():
+            pytest.fail("Cancelled discovery must not yield a registry")
+
+    client.list_tools.side_effect = discover
+    client.close.side_effect = fail_close
+    task = asyncio.create_task(run())
+    try:
+        await asyncio.wait_for(discovery_started.wait(), timeout=2)
+        assert task.cancel()
+        await asyncio.wait_for(close_started.wait(), timeout=2)
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=2)
+        assert task.cancelled()
+        harness.assert_closed()
+    finally:
+        release_close.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=2)
+
+
+async def test_close_failure_keeps_original_body_exception(
+    lifecycle_factory: Callable[..., LifecycleHarness],
+) -> None:
+    harness = lifecycle_factory()
+    client = harness.clients[0]
+    original = RuntimeError("original body failure")
+    client.close.side_effect = RuntimeError("close failed")
+
+    with pytest.raises(RuntimeError) as caught:
+        async with harness.context():
+            raise original
+
+    assert caught.value is original
+    client.close.assert_awaited_once_with()
+
+
+async def test_close_failure_during_cancelled_close_keeps_cancellation(
+    lifecycle_factory: Callable[..., LifecycleHarness],
+) -> None:
+    harness = lifecycle_factory()
+    client = harness.clients[0]
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    async def fail_close() -> None:
+        close_started.set()
+        await release_close.wait()
+        client.reaped = True
+        raise RuntimeError("close failed after cancellation")
+
+    async def run() -> None:
+        async with harness.context():
+            pass
+
+    client.close.side_effect = fail_close
+    task = asyncio.create_task(run())
+    try:
+        await asyncio.wait_for(close_started.wait(), timeout=2)
+        assert task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(task), timeout=2)
+        assert task.cancelled()
+        harness.assert_closed()
+    finally:
+        release_close.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=2)
