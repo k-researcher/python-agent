@@ -1025,7 +1025,8 @@ class AgentSupervisor:
             if fence is not None:
                 await fence_check(db, fence)
                 await db.commit()
-            else:
+            # A waited child runs under the fence of its parent, so check its own Stop too.
+            if fence is None or fence.session_id != session.id:
                 await db.refresh(session, attribute_names=["status", "stop_requested"])
                 if session.stop_requested or session.status == SessionStatus.stopped.value:
                     return False
@@ -1199,16 +1200,32 @@ class AgentSupervisor:
                 parent.id,
             )
 
+        stopped = False
         if wait:
+            # Register the waited run, so that a Stop of the child cancels it.
+            task = asyncio.create_task(self._run(child_id), name=f"agent-child-{child_id}")
+            self._tasks[child_id] = task
             try:
-                await asyncio.wait_for(
-                    self._run(child_id), timeout=self.settings.max_child_wait_seconds
+                done, _pending = await asyncio.wait(
+                    {task}, timeout=self.settings.max_child_wait_seconds
                 )
-            except TimeoutError as exc:
-                await self.stop(child_id)
-                raise RuntimeError("Child agent exceeded its wait timeout") from exc
-            except Exception as exc:
-                await self._mark_error(child_id, exc)
+                if not done:
+                    await self.stop(child_id)
+                    raise RuntimeError("Child agent exceeded its wait timeout")
+            except asyncio.CancelledError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            finally:
+                if self._tasks.get(child_id) is task:
+                    del self._tasks[child_id]
+            # A Stop cancels the run before it records the stopped status.
+            stopped = task.cancelled()
+            failure = None if stopped else task.exception()
+            if isinstance(failure, Exception):
+                await self._mark_error(child_id, failure)
+            elif failure is not None:
+                raise failure
         else:
             await self.start(child_id)
 
@@ -1222,9 +1239,12 @@ class AgentSupervisor:
                     .limit(1)
                 )
             ).scalar_one_or_none()
+            status = child_record.status if child_record else "missing"
+            if stopped and status not in TERMINAL_STATUSES:
+                status = SessionStatus.stopped.value
             return {
                 "session_id": child_id,
-                "status": child_record.status if child_record else "missing",
+                "status": status,
                 "llm_profile": child_record.llm_profile if child_record else selected_profile,
                 "response": final_message.content if final_message else None,
             }
