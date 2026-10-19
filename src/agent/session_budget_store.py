@@ -7,6 +7,7 @@ never commits; the caller owns the transaction and the enforcement loop.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -15,10 +16,25 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.config import Settings
+from agent.model_config import PricingSpec
 from agent.models import Session
 from agent.schemas import SessionBudgetRequest
 from agent.session_budget import BudgetLimits, BudgetUsage, check_budget
+from agent.usage import UsageRecord, exact_cost
 from agent.usage_ledger import summarize_session_usage
+
+
+class BudgetExceeded(Exception):
+    """A durable session budget boundary was rejected in runtime.
+
+    Raised to abort the current inference attempt or tool call. It is not an
+    LLM error, a tool error, a retry condition or a fallback: it propagates
+    unchanged to the run loop, which stops the session.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def budget_limits(settings: Settings, session: Session) -> BudgetLimits:
@@ -222,6 +238,51 @@ async def budget_block_reason(
         return check_budget(budget_limits(settings, session), usage, now).reason
     usage = await load_budget_usage(db, session, now)
     return check_budget(budget_limits(settings, session), usage, now).reason
+
+
+async def check_attempt_budget(
+    db: AsyncSession,
+    settings: Settings,
+    session: Session,
+    *,
+    request_bytes: int,
+    max_output_tokens: int,
+    pricing: PricingSpec | None,
+    now: datetime,
+) -> None:
+    """Raise BudgetExceeded before one HTTP attempt when the attempt cannot fit the budget.
+
+    The decision uses the durable ledger (session-wide tokens and money) because the
+    attempt audit row is written only after this check. The worst case of the attempt is
+    ``request_bytes`` input tokens (an upper bound over the actual prompt) plus
+    ``max_output_tokens`` output tokens; its cost is priced with ``exact_cost``. Both are
+    unknown -- missing usage counts, a missing or invalid pricing -- refuse the attempt
+    while a money ceiling is configured.
+    """
+    summary = await summarize_session_usage(db, session.id)
+    limits = budget_limits(settings, session)
+    usage = await load_budget_usage(db, session, now)
+    decision = check_budget(limits, replace(usage, steps=0), now)
+    if decision.reason is not None:
+        raise BudgetExceeded(decision.reason)
+
+    if limits.max_tokens is not None:
+        if summary.has_unknown_tokens or not _valid_bytes(request_bytes):
+            raise BudgetExceeded("token_usage_unknown")
+        reserved = int(request_bytes + max_output_tokens)
+        if summary.known_tokens > limits.max_tokens - reserved:
+            raise BudgetExceeded("tokens_exhausted")
+
+    if limits.max_cost is not None:
+        amount = exact_cost(UsageRecord(request_bytes, max_output_tokens), pricing)
+        if summary.has_unknown_cost or amount is None:
+            raise BudgetExceeded("cost_unknown")
+        if summary.known_cost > limits.max_cost - amount:
+            raise BudgetExceeded("cost_exhausted")
+
+
+def _valid_bytes(value: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:

@@ -4,11 +4,13 @@ import asyncio
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from math import ceil
 from typing import Any
 
 from agent.attempt_audit import cancel_attempt, finish_attempt, start_attempt
 from agent.calibration_store import Calibration, load_calibration
+from agent.config import Settings
 from agent.context_budget import input_budget, overflow_target
 from agent.context_manager import ContextBudgetError, ContextManager, ContextResult
 from agent.context_state import (
@@ -24,7 +26,9 @@ from agent.events import StreamPublisher, emit_event
 from agent.llm import AttemptRecord, LLMClient, LLMError, LLMResponse
 from agent.llm_errors import LLMErrorKind, is_context_overflow
 from agent.model_config import ResolvedModel, ResolvedModelRegistry
+from agent.models import Session as SessionRow
 from agent.reasoning import ReasoningDecision
+from agent.session_budget_store import BudgetExceeded, check_attempt_budget
 from agent.summary_runner import summary_effort
 from agent.token_calibration import CalibrationKey
 from agent.wire import (
@@ -125,8 +129,10 @@ class ContextInference:
         models: ResolvedModelRegistry,
         client_for: Callable[[ResolvedModel], LLMClient],
         reasoning_for: Callable[[ResolvedModel], ReasoningDecision],
+        settings: Settings | None = None,
     ) -> None:
         self.session_id = session_id
+        self.settings = settings
         self.manager = ContextManager(reserved_tokens)
         self.reserved_tokens = reserved_tokens
         self.definitions = definitions
@@ -155,6 +161,19 @@ class ContextInference:
             nonlocal audit_id
             if record.status == "started":
                 await ensure_active(self.session_id)
+                if self.settings is not None:
+                    async with session_factory() as db:
+                        session = await db.get(SessionRow, self.session_id)
+                        if session is not None:
+                            await check_attempt_budget(
+                                db,
+                                self.settings,
+                                session,
+                                request_bytes=len(request.body),
+                                max_output_tokens=int(request.payload["max_tokens"]),
+                                pricing=model.pricing,
+                                now=datetime.now(UTC),
+                            )
                 if self.state.http_attempts >= MAX_HTTP_ATTEMPTS:
                     raise LLMError("HTTP attempt limit exhausted")
                 if purpose == "summary":
@@ -219,6 +238,8 @@ class ContextInference:
                 on_delta=delta if publisher else None,
             )
         except BaseException as error:
+            if isinstance(error, BudgetExceeded):
+                raise
             await attempt(
                 replace(
                     initial,

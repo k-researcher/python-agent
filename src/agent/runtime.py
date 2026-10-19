@@ -7,6 +7,8 @@ import logging
 import uuid
 from contextlib import suppress
 from contextvars import ContextVar
+from dataclasses import replace
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
@@ -42,6 +44,14 @@ from agent.models import (
 from agent.queue import RedisTaskQueue
 from agent.reasoning import ReasoningDecision, decide, lower_effort
 from agent.sandbox import policy_from_settings
+from agent.session_budget import check_budget
+from agent.session_budget_store import (
+    BudgetExceeded,
+    budget_limits,
+    load_budget_usage,
+    mark_budget_stop,
+    record_step,
+)
 from agent.session_fence import (
     CURRENT_FENCE,
     FenceLostError,
@@ -492,6 +502,18 @@ class AgentSupervisor:
                 raise
             except FenceLostError:
                 logger.warning("Session %s: the run lost its fence and stops", session_id)
+            except BudgetExceeded as error:
+                # Belt and braces: a budget boundary that escaped the run loop must stop
+                # without session.error, never become a tool error or a retry.
+                current_fence = CURRENT_FENCE.get()
+                async with session_factory() as db:
+                    await self._stop_session_by_budget(
+                        db,
+                        session_id,
+                        current_fence.generation if current_fence is not None else 0,
+                        error.reason,
+                        current_fence,
+                    )
             except Exception as exc:
                 try:
                     await self._mark_error(session_id, exc)
@@ -535,6 +557,76 @@ class AgentSupervisor:
                     session_id,
                 )
 
+    async def _stop_session_by_budget(
+        self,
+        db: Any,
+        session_id: str,
+        generation: int,
+        reason: str,
+        fence: RunFence | None = None,
+    ) -> None:
+        """Stop the session for a budget reason: durable reason, conditionally stopped status.
+
+        The fence of the current run guards every write here. Committed even when a stopped
+        status was already recorded (a repeated stop just keeps the earlier status). No
+        ``stop_generation`` call: it would advance the generation and hide the stop reason
+        from the API.
+        """
+        if fence is not None:
+            await fence_check(db, fence)
+        await mark_budget_stop(db, session_id, generation, reason)
+        await db.execute(
+            update(Session)
+            .where(Session.id == session_id, Session.status.not_in(TERMINAL_STATUSES))
+            .values(status=SessionStatus.stopped.value)
+        )
+        cancelled = await self._cancel_unfinished_tool_calls(db, session_id)
+        await db.commit()
+        await emit_event(
+            db,
+            "session.status",
+            {"status": SessionStatus.stopped.value, "reason": reason},
+            session_id,
+        )
+        if cancelled:
+            await emit_event(db, "approval.cancelled", {"tool_call_ids": cancelled}, session_id)
+
+    async def _enforce_budget_before_step(self, db: Any, session_id: str, generation: int) -> bool:
+        """Allow or deny the next inference step; deny stops the session. Return False on stop."""
+        session = await db.get(Session, session_id)
+        if session is None:
+            return False
+        now = datetime.now(UTC)
+        usage = await load_budget_usage(db, session, now)
+        decision = check_budget(budget_limits(self.settings, session), usage, now)
+        if not decision.allowed:
+            await self._stop_session_by_budget(
+                db, session_id, generation, decision.reason or "budget_exceeded"
+            )
+            return False
+        await record_step(db, session_id, generation)
+        return True
+
+    async def _check_tool_budget(self, db: Any, session_id: str) -> None:
+        """Refuse a tool call when the session-level ceilings leave no room.
+
+        Tool execution is not an inference step, so the step counter is not consulted
+        (``steps=0``): tools of the last allowed step still run, while the next inference
+        boundary is denied by the step check.
+        """
+        session = await db.get(Session, session_id)
+        if session is None:
+            raise BudgetExceeded("session_missing")
+        now = datetime.now(UTC)
+        usage = await load_budget_usage(db, session, now)
+        decision = check_budget(
+            budget_limits(self.settings, session),
+            replace(usage, steps=0),
+            now,
+        )
+        if not decision.allowed:
+            raise BudgetExceeded(decision.reason or "budget_exceeded")
+
     async def _models(self, db: Any) -> ResolvedModelRegistry:
         """Read the catalogue; keep the last valid one if the new one is invalid."""
         try:
@@ -573,7 +665,7 @@ class AgentSupervisor:
         # One catalogue snapshot for the whole execution: a YAML or UI change applies to the
         # next execution, not between two steps of a running one.
         models: ResolvedModelRegistry | None = None
-        for _step in range(self.settings.max_inference_steps):
+        while True:
             async with session_factory() as db:
                 query = (
                     select(Session)
@@ -623,7 +715,13 @@ class AgentSupervisor:
                     if pending_approval:
                         return
 
-                resume_state = await self._resume_tool_calls(db, session)
+                try:
+                    resume_state = await self._resume_tool_calls(db, session)
+                except BudgetExceeded as error:
+                    await self._stop_session_by_budget(
+                        db, session_id, session.run_generation or 0, error.reason
+                    )
+                    return
                 if resume_state in {"waiting", "stopped"}:
                     return
                 if resume_state == "processed":
@@ -642,6 +740,18 @@ class AgentSupervisor:
                 if claimed.rowcount == 0:
                     return
                 await emit_event(db, "session.status", {"status": session.status}, session.id)
+
+                # The generation of the current run: inference step accounting lives per
+                # run, while tokens and money stay session-wide.
+                generation = session.run_generation or 0
+                try:
+                    allowed = await self._enforce_budget_before_step(db, session_id, generation)
+                except BudgetExceeded as error:
+                    await self._stop_session_by_budget(db, session_id, generation, error.reason)
+                    return
+                if not allowed:
+                    return
+                await db.commit()
 
                 if models is None:
                     models = await self._models(db)
@@ -669,8 +779,15 @@ class AgentSupervisor:
                         models,
                         partial(self._llm_for, models),
                         reasoning_for,
+                        settings=self.settings,
                     )
-                    outcome = await inference.run(model)
+                    try:
+                        outcome = await inference.run(model)
+                    except BudgetExceeded as error:
+                        await self._stop_session_by_budget(
+                            db, session_id, session.run_generation or 0, error.reason
+                        )
+                        return
                     response = outcome.response
                     reasoning_effort = outcome.reasoning.effective
                     await db.refresh(session, attribute_names=["status", "stop_requested"])
@@ -841,10 +958,6 @@ class AgentSupervisor:
                     )
                     return
 
-        raise RuntimeError(
-            f"Agent exceeded the maximum of {self.settings.max_inference_steps} inference steps"
-        )
-
     async def _resume_tool_calls(self, db: Any, session: Session) -> str:
         processed = False
         waiting = False
@@ -982,6 +1095,9 @@ class AgentSupervisor:
         """
         claimed: list[ToolCall] = []
         for call in group:
+            # Every member is checked before it is claimed; a refusal aborts the whole
+            # group before any tool body runs.
+            await self._check_tool_budget(db, session.id)
             if not await self._claim_tool_call(db, call):
                 break
             claimed.append(call)
@@ -1038,6 +1154,7 @@ class AgentSupervisor:
         return True
 
     async def _execute_tool_call(self, db: Any, session: Session, call: ToolCall) -> bool:
+        await self._check_tool_budget(db, session.id)
         if not await self._claim_tool_call(db, call):
             return False
         try:
@@ -1062,6 +1179,8 @@ class AgentSupervisor:
                 output = await tool.execute(context, dict(call.arguments))
             result = {"success": True, "output": output}
         except FenceLostError:
+            raise
+        except BudgetExceeded:
             raise
         except Exception as exc:
             result = {"success": False, "error": str(exc)}
