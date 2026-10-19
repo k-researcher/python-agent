@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from agent.model_config import PricingSpec
-from agent.usage import UsageRecord, cost, total, usage_from_response
+from agent.usage import UsageRecord, cost, exact_cost, total, usage_from_response, valid_token_count
 
 
 def test_full_usage_from_response() -> None:
@@ -104,3 +106,25 @@ def test_total_empty() -> None:
     result, has_unknown = total([])
     assert result == Decimal(0)
     assert has_unknown is False
+
+
+def test_exact_cost_preserves_submicro_consumption() -> None:
+    pricing = PricingSpec(input_per_mtok=0.0001, output_per_mtok=0)
+    assert exact_cost(UsageRecord(1, 0), pricing) == Decimal("0.0000000001")
+    assert cost(UsageRecord(1, 0), pricing) == Decimal("0.000000")
+
+
+@pytest.mark.parametrize("invalid", [True, False, -1, 1.0, "1", 2**31, 2**63, None])
+def test_invalid_token_counts_are_unknown(invalid: object) -> None:
+    assert valid_token_count(invalid) is None
+    pricing = PricingSpec(input_per_mtok=1, output_per_mtok=1)
+    assert exact_cost(UsageRecord(invalid, 0), pricing) is None
+
+
+def test_largest_database_token_count_is_valid() -> None:
+    assert valid_token_count(2**31 - 1) == 2**31 - 1
+
+
+def test_exact_cost_does_not_double_count_reasoning() -> None:
+    pricing = PricingSpec(input_per_mtok=1, output_per_mtok=2)
+    assert exact_cost(UsageRecord(100, 50, reasoning_tokens=20), pricing) == Decimal("0.0002")

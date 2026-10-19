@@ -178,6 +178,7 @@ class ContextInference:
                             "factor": calibration.factor,
                         },
                         record,
+                        pricing=model.pricing,
                     )
                 )
                 try:

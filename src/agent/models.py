@@ -306,6 +306,8 @@ class OutboundAudit(Base):
     factor: Mapped[float | None] = mapped_column(Float(precision=53), nullable=True)
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pricing_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    cost_amount: Mapped[str | None] = mapped_column(String(100), nullable=True)
     error_kind: Mapped[str | None] = mapped_column(String(30), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
