@@ -239,6 +239,7 @@ class ToolCall(Base):
     arguments: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     risk_level: Mapped[str] = mapped_column(String(50))
+    source_revision: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(50), default=ToolCallStatus.pending.value)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

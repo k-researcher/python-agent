@@ -127,15 +127,27 @@ class StdioMcpClient:
             prefix, overrides = prepared
             command = [*prefix, *self._command]
             environment.update(overrides)
-        self._process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=str(self._cwd),
-            env=environment,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=True,
+        spawning = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(self._cwd),
+                env=environment,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
         )
+        cancelled = False
+        while not spawning.done():
+            try:
+                await asyncio.shield(spawning)
+            except asyncio.CancelledError:
+                cancelled = True
+        self._process = spawning.result()
+        if cancelled:
+            await self.close()
+            raise asyncio.CancelledError
         self._broken = None
         self._reader_task = asyncio.create_task(self._read_loop())
         try:
@@ -193,6 +205,18 @@ class StdioMcpClient:
 
     async def close(self) -> None:
         """Terminate the server and release its resources."""
+        closing = asyncio.create_task(self._close())
+        cancelled = False
+        while not closing.done():
+            try:
+                await asyncio.shield(closing)
+            except asyncio.CancelledError:
+                cancelled = True
+        closing.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close(self) -> None:
         process = self._process
         if process is None:
             return
@@ -223,6 +247,13 @@ class StdioMcpClient:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reader_task
             self._reader_task = None
+
+        replies = tuple(self._reply_tasks)
+        for reply in replies:
+            reply.cancel()
+        if replies:
+            await asyncio.gather(*replies, return_exceptions=True)
+        self._reply_tasks.clear()
 
         # Fail any requests still waiting for a response.
         self._fail_pending(McpError(None, "server closed"))

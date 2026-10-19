@@ -7,12 +7,15 @@ The mapping uses a policy for safety and limits.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from agent.mcp_client import McpError
+from agent.source_revision import schema_hash, source_revision
+from agent.tool_sources import ToolSource
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 
 _SERVER_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -66,6 +69,8 @@ class McpBackedTool(Tool):
         name: str,
         description: str,
         input_schema: dict[str, Any],
+        *,
+        source: ToolSource | None = None,
     ) -> None:
         self.name = _build_full_name(policy.server_id, name)
         self.description = f"[MCP {policy.server_id}] {str(description)[:_MAX_DESCRIPTION_CHARS]}"
@@ -74,11 +79,60 @@ class McpBackedTool(Tool):
         self.parallel_safe = False
         self._client = client
         self._original_name = name
+        self._source = source
+        self._policy = policy
         self._max_result_chars = policy.max_result_chars
         if isinstance(input_schema, dict) and input_schema.get("type") == "object":
-            self.input_schema = input_schema
+            self.input_schema = copy.deepcopy(input_schema)
         else:
             self.input_schema = {"type": "object"}
+
+        if source is not None:
+            self.approval_revision()
+
+    @property
+    def source(self) -> ToolSource | None:
+        return self._source
+
+    def approval_revision(self) -> str:
+        """Bind approval to the trusted source and exact exposed tool snapshot."""
+        source = self._source
+        if source is None:
+            raise ToolError("MCP tool has no trusted source")
+        if (
+            not source.enabled
+            or self._policy.server_id != source.source_id
+            or self.risk_level != source.risk_level
+            or self.allowed_modes != source.allowed_modes
+            or self._max_result_chars != source.max_result_chars
+            or self.name != _build_full_name(source.source_id, self._original_name)
+            or (
+                self._policy.allowed_tools is not None
+                and self._original_name not in self._policy.allowed_tools
+            )
+        ):
+            raise ToolError("MCP policy does not match its trusted source")
+        try:
+            return schema_hash(
+                {
+                    "source": source_revision(source),
+                    "name": self.name,
+                    "remote_name": self._original_name,
+                    "description": self.description,
+                    "parameters": self.parameters(),
+                    "allowed_tools": (
+                        sorted(self._policy.allowed_tools)
+                        if self._policy.allowed_tools is not None
+                        else None
+                    ),
+                }
+            )
+        except (ValueError, RecursionError) as exc:
+            raise ToolError("Invalid MCP approval snapshot") from exc
+
+    def parameters(self, model_ids: list[str] | None = None) -> dict[str, Any]:
+        """Return a deep snapshot so callers cannot mutate the internal schema."""
+        return copy.deepcopy(self.input_schema)
 
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -120,7 +174,9 @@ class McpBackedTool(Tool):
         }
 
 
-async def build_mcp_tools(client: McpToolClient, policy: McpToolPolicy) -> list[McpBackedTool]:
+async def build_mcp_tools(
+    client: McpToolClient, policy: McpToolPolicy, *, source: ToolSource | None = None
+) -> list[McpBackedTool]:
     """Build agent tools from the client's remote tools."""
     if not _SERVER_ID_PATTERN.match(policy.server_id):
         raise ValueError(f"Invalid server id: {policy.server_id}")
@@ -144,6 +200,7 @@ async def build_mcp_tools(client: McpToolClient, policy: McpToolPolicy) -> list[
                 name=name,
                 description=remote.description,
                 input_schema=remote.input_schema,
+                source=source,
             )
         )
     return built

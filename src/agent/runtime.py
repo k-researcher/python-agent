@@ -23,6 +23,7 @@ from agent.context_manager import ContextManager
 from agent.database import session_factory
 from agent.events import StreamPublisher, emit_event
 from agent.llm import LLMClient, LLMResponse
+from agent.mcp_audit import execute_mcp_attempt
 from agent.message_tree import append_message
 from agent.model_config import ModelConfigError, ResolvedModel, ResolvedModelRegistry
 from agent.model_registry import effective_registry, select_model
@@ -46,6 +47,7 @@ from agent.session_fence import (
     FenceLostError,
     RunFence,
     claim,
+    fence_check,
     install_commit_guard,
     new_generation,
     release,
@@ -55,9 +57,12 @@ from agent.session_fence import (
 )
 from agent.session_service import create_session_record
 from agent.skill_prompt import load_skill_set
+from agent.source_execution import capture_source_revision, validate_source_execution
+from agent.source_lifecycle import source_registry
 from agent.tool_batch import BatchCall, BatchResult, is_parallel_safe, run_batch
 from agent.tools import ToolRegistry
-from agent.tools.base import ToolContext, ToolError
+from agent.tools.base import Tool, ToolContext, ToolError
+from agent.tools.mcp_tools import McpBackedTool
 from agent.tools.skill_tools import ReadSkillTool
 
 logger = logging.getLogger(__name__)
@@ -553,11 +558,16 @@ class AgentSupervisor:
             skills = load_skill_set(Path(project.root_path), None)
             if skills.skills:
                 registry = registry.with_tools((ReadSkillTool(skills),))
-        token = self._run_registry.set(registry)
-        try:
-            await self._run_session(session_id)
-        finally:
-            self._run_registry.reset(token)
+        if project is None:
+            return
+        async with source_registry(
+            self.settings, session_id, Path(project.root_path).resolve(strict=True), registry
+        ) as registry:
+            token = self._run_registry.set(registry)
+            try:
+                await self._run_session(session_id)
+            finally:
+                self._run_registry.reset(token)
 
     async def _run_session(self, session_id: str) -> None:
         # One catalogue snapshot for the whole execution: a YAML or UI change applies to the
@@ -775,6 +785,7 @@ class AgentSupervisor:
                         self._tools.validate(name, session.mode, arguments, model_ids=models.ids())
                         risk = self._tools.risk(name, session.mode)
                         confirmation = self._tools.requires_confirmation(name, session.mode)
+                        revision = capture_source_revision(self._tools.get(name, session.mode))
                     except Exception as exc:
                         call = ToolCall(
                             id=call_id,
@@ -801,6 +812,7 @@ class AgentSupervisor:
                         name=name,
                         arguments=arguments,
                         risk_level=risk.value,
+                        source_revision=revision,
                         status=(
                             ToolCallStatus.awaiting_confirmation.value
                             if confirmation
@@ -939,10 +951,15 @@ class AgentSupervisor:
         return followers
 
     def _may_run_in_parallel(self, session: Session, call: ToolCall) -> bool:
-        if call.status != ToolCallStatus.pending.value or call.approval is not None:
+        if (
+            call.status != ToolCallStatus.pending.value
+            or call.approval is not None
+            or call.source_revision is not None
+        ):
             return False
         try:
-            return is_parallel_safe(self._tools.get(call.name, session.mode))
+            tool = self._tools.get(call.name, session.mode)
+            return capture_source_revision(tool) is None and is_parallel_safe(tool)
         except Exception:
             return False
 
@@ -970,29 +987,81 @@ class AgentSupervisor:
             claimed.append(call)
         if claimed:
             context = self._tool_context(session)
+            executable: list[ToolCall] = []
+            tools: dict[str, Tool] = {}
+            for call in claimed:
+                try:
+                    tool = self._tools.get(call.name, session.mode)
+                    if capture_source_revision(tool) is not None:
+                        raise ToolError("Source-backed tools require sequential execution")
+                    await validate_source_execution(db, session.id, tool, call.source_revision)
+                except Exception as exc:
+                    await self._store_tool_result(
+                        db, session, call, {"success": False, "error": str(exc)}
+                    )
+                else:
+                    executable.append(call)
+                    tools[call.id] = tool
 
             async def execute(item: BatchCall) -> Any:
-                return await self._tools.execute(item.name, session.mode, context, item.arguments)
+                return await tools[item.call_id].execute(context, item.arguments)
 
             results = await run_batch(
-                [BatchCall(call.id, call.name, dict(call.arguments)) for call in claimed],
+                [BatchCall(call.id, call.name, dict(call.arguments)) for call in executable],
                 execute,
                 max_concurrency=PARALLEL_TOOL_LIMIT,
                 timeout_seconds=None,
             )
-            for call, outcome in zip(claimed, results, strict=True):
+            for call, outcome in zip(executable, results, strict=True):
                 await self._store_tool_result(db, session, call, _batch_result(outcome))
         return len(claimed) == len(group)
+
+    async def _source_execution_ready(
+        self, db: Any, session: Session, call: ToolCall, tool: Tool
+    ) -> bool:
+        try:
+            await validate_source_execution(db, session.id, tool, call.source_revision)
+            fence = CURRENT_FENCE.get()
+            if fence is not None:
+                await fence_check(db, fence)
+                await db.commit()
+            else:
+                await db.refresh(session, attribute_names=["status", "stop_requested"])
+                if session.stop_requested or session.status == SessionStatus.stopped.value:
+                    return False
+                if isinstance(tool, McpBackedTool):
+                    await db.commit()
+        except FenceLostError:
+            await db.rollback()
+            raise
+        return True
 
     async def _execute_tool_call(self, db: Any, session: Session, call: ToolCall) -> bool:
         if not await self._claim_tool_call(db, call):
             return False
-        context = self._tool_context(session)
         try:
-            output = await self._tools.execute(
-                call.name, session.mode, context, dict(call.arguments)
-            )
+            tool = self._tools.get(call.name, session.mode)
+            if not await self._source_execution_ready(db, session, call, tool):
+                return False
+            context = self._tool_context(session)
+            if isinstance(tool, McpBackedTool):
+
+                async def before_send() -> None:
+                    if not await self._source_execution_ready(db, session, call, tool):
+                        raise ToolError("Session stopped before MCP egress")
+
+                output = await execute_mcp_attempt(
+                    tool,
+                    context,
+                    dict(call.arguments),
+                    tool_call_id=call.id,
+                    before_send=before_send,
+                )
+            else:
+                output = await tool.execute(context, dict(call.arguments))
             result = {"success": True, "output": output}
+        except FenceLostError:
+            raise
         except Exception as exc:
             result = {"success": False, "error": str(exc)}
         await self._store_tool_result(db, session, call, result)

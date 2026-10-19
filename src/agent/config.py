@@ -80,6 +80,7 @@ class Settings(BaseSettings):
 
     raw_llm_log: bool = False
     knowledge_base_enabled: bool = False
+    tool_sources_file: Path | None = None
     allow_network_tools: bool = False
     # OS sandbox for shell commands: "off", "auto" (use it when the system has one) or
     # "required" (refuse to run a command without it). See agent.sandbox.
