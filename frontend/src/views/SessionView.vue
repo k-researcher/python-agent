@@ -11,7 +11,7 @@ import { useAppStore } from "../stores/app";
 import ChatTimeline from "../components/chat/ChatTimeline.vue";
 import Composer from "../components/chat/Composer.vue";
 import AgentSettings from "../components/chat/AgentSettings.vue";
-import type { SendPayload } from "../components/chat/types";
+import type { RejectPayload, SendPayload } from "../components/chat/types";
 import { toChatTimelineItems } from "../uiAdapters";
 import { sessionStatusLabel } from "../components/layout/status";
 
@@ -159,6 +159,22 @@ async function onStop(): Promise<void> {
   }
 }
 
+async function onApprove(approvalId: string): Promise<void> {
+  try {
+    await sessionStore.resolve(approvalId, "approve");
+  } catch (cause) {
+    sendError.value = cause instanceof Error ? cause.message : String(cause);
+  }
+}
+
+async function onReject(payload: RejectPayload): Promise<void> {
+  try {
+    await sessionStore.resolve(payload.approvalId, "reject", payload.comment || undefined);
+  } catch (cause) {
+    sendError.value = cause instanceof Error ? cause.message : String(cause);
+  }
+}
+
 function onOpenChild(id: string): void {
   void router.push(`/s/${id}`);
 }
@@ -189,6 +205,8 @@ function onOpenChild(id: string): void {
         v-if="timelineItems.length > 0 || sessionStore.streaming"
         :items="timelineItems"
         data-testid="chat-timeline"
+        @approve="onApprove"
+        @reject="onReject"
       />
       <p v-else class="session-empty" data-testid="session-empty">
         Сообщений пока нет — начните диалог.

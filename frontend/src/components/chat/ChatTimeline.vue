@@ -7,13 +7,19 @@
 // the spec routes the shortcuts to a single, unambiguous approval target.
 
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import type { TimelineItem } from "./types";
+import type { RejectPayload, TimelineItem } from "./types";
 import MarkdownView from "./MarkdownView.vue";
 import MessageItem from "./MessageItem.vue";
 import ReasoningBlock from "./ReasoningBlock.vue";
 import ToolCallCard from "./ToolCallCard.vue";
 
 const props = defineProps<{ items: TimelineItem[] }>();
+
+// Forward approval decisions of tool cards to the view.
+const emit = defineEmits<{
+  (e: "approve", approvalId: string): void;
+  (e: "reject", payload: RejectPayload): void;
+}>();
 
 const scroller = ref<HTMLElement | null>(null);
 const summaryOpen = ref<Set<number>>(new Set());
@@ -105,6 +111,8 @@ function isSummaryOpen(index: number): boolean {
           <ToolCallCard
             :call="item.call"
             :hotkeys="firstPendingToolIndex === index"
+            @approve="(id: string) => emit('approve', id)"
+            @reject="(payload: RejectPayload) => emit('reject', payload)"
           />
         </div>
 

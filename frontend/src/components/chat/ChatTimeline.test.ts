@@ -185,6 +185,15 @@ describe("ChatTimeline", () => {
     expect(cards[2].props("hotkeys")).toBe(false);
   });
 
+  it("forwards approve and reject decisions of a tool card", () => {
+    const wrapper = mountTimeline([{ kind: "tool", call: pendingCall("t1", "ap1") }]);
+    const card = wrapper.findComponent(ToolCallCard);
+    card.vm.$emit("approve", "ap1");
+    card.vm.$emit("reject", { approvalId: "ap1", comment: "не нужно" });
+    expect(wrapper.emitted("approve")).toEqual([["ap1"]]);
+    expect(wrapper.emitted("reject")).toEqual([[{ approvalId: "ap1", comment: "не нужно" }]]);
+  });
+
   it("disables hotkeys everywhere when no call awaits approval", () => {
     const wrapper = mountTimeline([
       { kind: "tool", call: { ...pendingCall("t1", "ap1"), status: "completed", approval: null } },
