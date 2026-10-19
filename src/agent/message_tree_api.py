@@ -20,7 +20,7 @@ from __future__ import annotations
 from typing import Annotated
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -170,6 +170,7 @@ async def fork_endpoint(
     session_id: str,
     message_id: int,
     payload: ForkRequest,
+    request: Request,
     db: DbSession,
 ) -> Session:
     try:
@@ -177,7 +178,13 @@ async def fork_endpoint(
         if source is None:
             raise TreeError("Session not found", 404)
         title = payload.title or f"{source.title} (ветка)"
-        session = await fork(db, session_id, message_id, title=title)
+        session = await fork(
+            db,
+            session_id,
+            message_id,
+            title=title,
+            actor_user_id=getattr(request.state, "actor_user_id", None),
+        )
         await db.commit()
         await db.refresh(session)
     except TreeError as exc:

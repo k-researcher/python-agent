@@ -7,7 +7,15 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -151,7 +159,9 @@ async def list_sessions(
 
 
 @router.post("/sessions", response_model=SessionRead, status_code=201)
-async def create_session(payload: SessionCreate, db: AsyncSession = Depends(get_db)) -> Session:
+async def create_session(
+    payload: SessionCreate, request: Request, db: AsyncSession = Depends(get_db)
+) -> Session:
     project = await db.get(Project, payload.project_id)
     if project is None:
         raise HTTPException(404, "Project not found")
@@ -165,6 +175,7 @@ async def create_session(payload: SessionCreate, db: AsyncSession = Depends(get_
             payload.mode,
             llm_profile=payload.llm_profile,
             title=payload.title,
+            actor_user_id=getattr(request.state, "actor_user_id", None),
             configuration={"depth": 0}
             | ({"reasoning_effort": payload.reasoning_effort} if payload.reasoning_effort else {}),
         )

@@ -1119,6 +1119,7 @@ class AgentSupervisor:
                 llm_profile=selected_profile,
                 title=f"Child: {prompt.strip().replace(chr(10), ' ')[:110]}",
                 parent_id=parent.id,
+                actor_user_id=parent.created_by_user_id,
                 configuration={"depth": depth + 1},
             )
             child_id = child.id

@@ -24,6 +24,7 @@ async def create_session_record(
     llm_profile: str | None = None,
     title: str | None = None,
     parent_id: str | None = None,
+    actor_user_id: str | None = None,
     configuration: dict[str, Any] | None = None,
 ) -> Session:
     model = select_model(await effective_registry(db, settings), llm_profile, role=mode)
@@ -50,6 +51,7 @@ async def create_session_record(
     session = Session(
         project_id=project.id,
         parent_id=parent_id,
+        created_by_user_id=actor_user_id,
         mode=mode,
         llm_profile=selected_profile,
         title=title or prompt.strip().replace("\n", " ")[:120],

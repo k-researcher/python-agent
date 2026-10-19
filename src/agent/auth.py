@@ -99,18 +99,25 @@ async def consume_login_code(
                 AuthBootstrapCode.expires_at > now,
             )
             .values(consumed_at=now)
+            .execution_options(synchronize_session=False)
         ),
     )
     if claimed.rowcount != 1:
         await db.rollback()
         return None
 
+    user_id = (
+        await db.execute(
+            select(AuthBootstrapCode.user_id).where(AuthBootstrapCode.code_hash == _digest(code))
+        )
+    ).scalar_one()
     raw_id = secrets.token_urlsafe(32)
     csrf_token = secrets.token_urlsafe(32)
     expires_at = now + timedelta(seconds=settings.auth_session_ttl_seconds)
     db.add(
         AuthSession(
             id_hash=_digest(raw_id),
+            user_id=user_id,
             csrf_token=csrf_token,
             user_agent=user_agent[:512],
             created_at=now,
