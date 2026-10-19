@@ -158,6 +158,7 @@ class Session(Base):
     owner_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     configuration: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    budget_state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow

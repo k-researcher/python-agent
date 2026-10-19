@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ProjectCreate(BaseModel):
@@ -20,6 +21,44 @@ class ProjectRead(BaseModel):
     created_at: datetime
 
 
+class SessionBudgetRequest(BaseModel):
+    """Optional per-session limits; each value must be positive and finite."""
+
+    max_steps: int | None = Field(default=None, gt=0)
+    max_tokens: int | None = Field(default=None, gt=0)
+    max_cost: str | None = None
+    deadline_seconds: float | None = Field(default=None, gt=0)
+
+    @field_validator("max_cost")
+    @classmethod
+    def _validate_max_cost(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            parsed = Decimal(value)
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("max_cost must be a decimal string") from exc
+        if not parsed.is_finite() or parsed <= 0:
+            raise ValueError("max_cost must be a positive finite decimal")
+        return value
+
+
+class SessionBudgetRead(BaseModel):
+    """Durable limits and consumed usage of a session budget."""
+
+    max_steps: int
+    max_tokens: int | None
+    max_cost: str | None
+    deadline_seconds: float | None
+    steps: int
+    known_tokens: int
+    known_cost: str
+    has_unknown_tokens: bool
+    has_unknown_cost: bool
+    started_at: datetime | None
+    stop_reason: str | None
+
+
 class SessionCreate(BaseModel):
     project_id: str
     prompt: str = Field(min_length=1, max_length=2_000_000)
@@ -28,6 +67,7 @@ class SessionCreate(BaseModel):
     reasoning_effort: str | None = Field(default=None, max_length=20)
     title: str | None = Field(default=None, max_length=300)
     auto_start: bool = True
+    budget: SessionBudgetRequest | None = None
 
 
 class SessionRead(BaseModel):
@@ -43,6 +83,8 @@ class SessionRead(BaseModel):
     status: str
     error: str | None
     archived: bool
+    # Populated by agent.api; the message-tree fork route returns it as None.
+    budget: SessionBudgetRead | None = None
     created_at: datetime
     updated_at: datetime
 

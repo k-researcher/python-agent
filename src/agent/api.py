@@ -54,8 +54,15 @@ from agent.schemas import (
     OutboundAuditRead,
     ProjectCreate,
     ProjectRead,
+    SessionBudgetRead,
     SessionCreate,
     SessionRead,
+)
+from agent.session_budget_store import (
+    budget_block_reason,
+    budget_limits,
+    load_budget_usage,
+    resolve_budget_limits,
 )
 from agent.session_service import create_session_record
 
@@ -63,6 +70,49 @@ router = APIRouter(prefix="/api")
 settings: Settings = get_settings()
 supervisor = AgentSupervisor(settings)
 logger = logging.getLogger(__name__)
+
+
+async def _session_read(db: AsyncSession, session: Session) -> SessionRead:
+    """Build the API view of a session with its durable budget state."""
+    limits = budget_limits(settings, session)
+    usage = await load_budget_usage(db, session, datetime.now(UTC))
+    state = session.budget_state or {}
+    current = "run_generation" in state and (state.get("run_generation") or 0) == (
+        session.run_generation or 0
+    )
+    budget = SessionBudgetRead(
+        max_steps=limits.max_steps,
+        max_tokens=limits.max_tokens,
+        max_cost=str(limits.max_cost) if limits.max_cost is not None else None,
+        deadline_seconds=limits.deadline_seconds,
+        steps=usage.steps,
+        known_tokens=usage.known_tokens,
+        known_cost=str(usage.known_cost),
+        has_unknown_tokens=usage.has_unknown_tokens,
+        has_unknown_cost=usage.has_unknown_cost,
+        started_at=usage.started_at,
+        stop_reason=state.get("stop_reason") if current else None,
+    )
+    return SessionRead(
+        id=session.id,
+        project_id=session.project_id,
+        parent_id=session.parent_id,
+        mode=session.mode,
+        llm_profile=session.llm_profile,
+        configuration=dict(session.configuration or {}),
+        title=session.title,
+        status=session.status,
+        error=session.error,
+        archived=session.archived,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        budget=budget,
+    )
+
+
+async def _session_blocked(db: AsyncSession, session: Session, *, new_run: bool) -> str | None:
+    """Return why the budget blocks this session, or None when it may proceed."""
+    return await budget_block_reason(db, settings, session, datetime.now(UTC), new_run=new_run)
 
 
 @router.get("/health")
@@ -153,18 +203,25 @@ async def create_project(payload: ProjectCreate, db: AsyncSession = Depends(get_
 @router.get("/sessions", response_model=list[SessionRead])
 async def list_sessions(
     archived: bool = Query(default=False), db: AsyncSession = Depends(get_db)
-) -> list[Session]:
+) -> list[SessionRead]:
     query = select(Session).where(Session.archived == archived).order_by(Session.updated_at.desc())
-    return list((await db.execute(query)).scalars())
+    sessions = list((await db.execute(query)).scalars())
+    return [await _session_read(db, session) for session in sessions]
 
 
 @router.post("/sessions", response_model=SessionRead, status_code=201)
 async def create_session(
     payload: SessionCreate, request: Request, db: AsyncSession = Depends(get_db)
-) -> Session:
+) -> SessionRead:
     project = await db.get(Project, payload.project_id)
     if project is None:
         raise HTTPException(404, "Project not found")
+
+    if payload.budget is not None:
+        try:
+            resolve_budget_limits(settings, payload.budget)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
 
     try:
         session = await create_session_record(
@@ -178,29 +235,31 @@ async def create_session(
             actor_user_id=getattr(request.state, "actor_user_id", None),
             configuration={"depth": 0}
             | ({"reasoning_effort": payload.reasoning_effort} if payload.reasoning_effort else {}),
+            budget=payload.budget,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     await emit_event(db, "session.created", {"status": session.status}, session.id)
     if payload.auto_start:
         await supervisor.start(session.id)
-    return session
+    return await _session_read(db, session)
 
 
 @router.get("/sessions/{session_id}", response_model=SessionRead)
-async def get_session(session_id: str, db: AsyncSession = Depends(get_db)) -> Session:
+async def get_session(session_id: str, db: AsyncSession = Depends(get_db)) -> SessionRead:
     session = await db.get(Session, session_id)
     if session is None:
         raise HTTPException(404, "Session not found")
-    return session
+    return await _session_read(db, session)
 
 
 @router.get("/sessions/{session_id}/children", response_model=list[SessionRead])
-async def list_children(session_id: str, db: AsyncSession = Depends(get_db)) -> list[Session]:
+async def list_children(session_id: str, db: AsyncSession = Depends(get_db)) -> list[SessionRead]:
     if await db.get(Session, session_id) is None:
         raise HTTPException(404, "Session not found")
     query = select(Session).where(Session.parent_id == session_id).order_by(Session.created_at)
-    return list((await db.execute(query)).scalars())
+    sessions = list((await db.execute(query)).scalars())
+    return [await _session_read(db, session) for session in sessions]
 
 
 @router.get("/sessions/{session_id}/outbound-audit", response_model=list[OutboundAuditRead])
@@ -345,6 +404,12 @@ async def _dispatch_session_run(db: AsyncSession, session_id: str, generation: i
 async def add_message(
     session_id: str, payload: MessageCreate, db: AsyncSession = Depends(get_db)
 ) -> Message:
+    session = await db.get(Session, session_id)
+    if session is None:
+        raise HTTPException(404, "Session not found")
+    reason = await _session_blocked(db, session, new_run=True)
+    if reason is not None:
+        raise HTTPException(409, f"The session budget is exhausted: {reason}")
     session = await _claim_session_run(db, session_id, allow_initial_pending=True)
 
     if payload.reasoning_effort is not None:
@@ -388,6 +453,12 @@ async def add_message(
 
 @router.post("/sessions/{session_id}/start", status_code=202)
 async def start_session(session_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, bool]:
+    session = await db.get(Session, session_id)
+    if session is None:
+        raise HTTPException(404, "Session not found")
+    reason = await _session_blocked(db, session, new_run=True)
+    if reason is not None:
+        raise HTTPException(409, f"The session budget is exhausted: {reason}")
     session = await _claim_session_run(db, session_id, allow_initial_pending=True)
     await db.commit()
     return {"started": await _dispatch_session_run(db, session.id, session.run_generation)}
@@ -461,7 +532,22 @@ async def list_approvals(
 
 
 @router.post("/approvals/{approval_id}")
-async def resolve_approval(approval_id: str, payload: ApprovalDecision) -> dict[str, str]:
+async def resolve_approval(
+    approval_id: str, payload: ApprovalDecision, db: AsyncSession = Depends(get_db)
+) -> dict[str, str]:
+    session = (
+        await db.execute(
+            select(Session)
+            .join(ToolCall, ToolCall.session_id == Session.id)
+            .join(Approval, Approval.tool_call_id == ToolCall.id)
+            .where(Approval.id == approval_id)
+        )
+    ).scalar_one_or_none()
+    if session is None:
+        raise HTTPException(404, "Approval not found")
+    reason = await _session_blocked(db, session, new_run=False)
+    if reason is not None:
+        raise HTTPException(409, f"The session budget is exhausted: {reason}")
     try:
         session_id = await supervisor.resolve_approval(
             approval_id, payload.decision, payload.comment
