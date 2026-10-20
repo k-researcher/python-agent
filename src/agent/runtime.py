@@ -20,11 +20,11 @@ from sqlalchemy.orm import attributes, selectinload
 
 from agent.checkpoints import load_context_rows
 from agent.config import Settings
-from agent.context_inference import ContextInference
+from agent.context_inference import TRANSIENT_KINDS, ContextInference
 from agent.context_manager import ContextManager
 from agent.database import session_factory
 from agent.events import StreamPublisher, emit_event
-from agent.llm import LLMClient, LLMResponse
+from agent.llm import LLMClient, LLMError, LLMResponse
 from agent.mcp_audit import execute_mcp_attempt
 from agent.message_tree import append_message
 from agent.model_config import ModelConfigError, ResolvedModel, ResolvedModelRegistry
@@ -94,6 +94,16 @@ def _batch_result(outcome: BatchResult) -> dict[str, Any]:
     if outcome.ok:
         return {"success": True, "output": outcome.output}
     return {"success": False, "error": outcome.error}
+
+
+# A cut-off reply or a broken stream is retried this many times in a row before the run fails.
+MAX_CUT_OFF_REPLIES = 2
+MAX_STREAM_RETRIES = 2
+CUT_OFF_NOTICE = (
+    "Служебное уведомление агента: предыдущий ответ модели обрезан лимитом вывода и не "
+    "использован, инструменты из него не запускались. Сделай шаг меньше: запиши большой файл "
+    "по частям (write_file, затем edit_file) или раздели правку на несколько вызовов."
+)
 
 
 def _cut_in_reasoning(response: LLMResponse) -> bool:
@@ -665,6 +675,7 @@ class AgentSupervisor:
         # One catalogue snapshot for the whole execution: a YAML or UI change applies to the
         # next execution, not between two steps of a running one.
         models: ResolvedModelRegistry | None = None
+        cut_offs = 0
         while True:
             async with session_factory() as db:
                 query = (
@@ -764,6 +775,7 @@ class AgentSupervisor:
                 await db.commit()
 
                 retried = False
+                stream_retries = 0
                 while True:
 
                     def reasoning_for(
@@ -788,6 +800,28 @@ class AgentSupervisor:
                             db, session_id, session.run_generation or 0, error.reason
                         )
                         return
+                    except LLMError as error:
+                        # The stream broke after the first fragment: no tool ran and nothing
+                        # was stored, so drop the partial reply and send the step again.
+                        if (
+                            not error.started
+                            or error.kind not in TRANSIENT_KINDS
+                            or stream_retries >= MAX_STREAM_RETRIES
+                        ):
+                            raise
+                        stream_retries += 1
+                        await StreamPublisher(session.id).reset()
+                        await emit_event(
+                            db,
+                            "inference.retry",
+                            {
+                                "reason": "stream_interrupted",
+                                "model_id": model.id,
+                                "retry": stream_retries,
+                            },
+                            session.id,
+                        )
+                        continue
                     response = outcome.response
                     reasoning_effort = outcome.reasoning.effective
                     await db.refresh(session, attribute_names=["status", "stop_requested"])
@@ -847,12 +881,26 @@ class AgentSupervisor:
                             reasoning_effort=reasoning_effort,
                         )
                     )
+                    cut_offs += 1
+                    if cut_offs > MAX_CUT_OFF_REPLIES:
+                        await db.commit()
+                        raise ToolError(
+                            "The model reply was cut off by the output limit, so it was not "
+                            "used and no tool ran. Ask for smaller steps, for example write a "
+                            "large file in parts."
+                        )
+                    # Tell the model and let it take a smaller step in the next inference.
+                    await append_message(db, session.id, role="user", content=CUT_OFF_NOTICE)
                     await db.commit()
-                    raise ToolError(
-                        "The model reply was cut off by the output limit, so it was not used "
-                        "and no tool ran. Ask for smaller steps, for example write a large "
-                        "file in parts."
+                    await StreamPublisher(session.id).reset()
+                    await emit_event(
+                        db,
+                        "inference.retry",
+                        {"reason": "output_limit", "model_id": outcome.model.id, "retry": cut_offs},
+                        session.id,
                     )
+                    continue
+                cut_offs = 0
 
                 assistant = await append_message(
                     db,

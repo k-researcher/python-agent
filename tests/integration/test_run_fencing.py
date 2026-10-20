@@ -172,6 +172,7 @@ def test_cut_off_tool_call_runs_no_tool(tmp_path: Path) -> None:
         assert approvals == []
         assert not (tmp_path / "big.txt").exists()
         assert all(message["role"] != "tool" for message in messages)
-        assert fake.calls == 1
+        # Two notices give the model two more steps; the third cut ends the run.
+        assert fake.calls == 3
     finally:
         supervisor.llm = original
