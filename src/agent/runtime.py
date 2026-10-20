@@ -6,6 +6,9 @@ import json
 import logging
 import uuid
 from contextlib import suppress
+from contextvars import ContextVar
+from dataclasses import replace
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
@@ -17,11 +20,12 @@ from sqlalchemy.orm import attributes, selectinload
 
 from agent.checkpoints import load_context_rows
 from agent.config import Settings
-from agent.context_inference import ContextInference
+from agent.context_inference import TRANSIENT_KINDS, ContextInference
 from agent.context_manager import ContextManager
 from agent.database import session_factory
 from agent.events import StreamPublisher, emit_event
-from agent.llm import LLMClient, LLMResponse
+from agent.llm import LLMClient, LLMError, LLMResponse
+from agent.mcp_audit import execute_mcp_attempt
 from agent.message_tree import append_message
 from agent.model_config import ModelConfigError, ResolvedModel, ResolvedModelRegistry
 from agent.model_registry import effective_registry, select_model
@@ -40,11 +44,20 @@ from agent.models import (
 from agent.queue import RedisTaskQueue
 from agent.reasoning import ReasoningDecision, decide, lower_effort
 from agent.sandbox import policy_from_settings
+from agent.session_budget import check_budget
+from agent.session_budget_store import (
+    BudgetExceeded,
+    budget_limits,
+    load_budget_usage,
+    mark_budget_stop,
+    record_step,
+)
 from agent.session_fence import (
     CURRENT_FENCE,
     FenceLostError,
     RunFence,
     claim,
+    fence_check,
     install_commit_guard,
     new_generation,
     release,
@@ -53,9 +66,14 @@ from agent.session_fence import (
     stop_generation_scoped,
 )
 from agent.session_service import create_session_record
+from agent.skill_prompt import load_skill_set
+from agent.source_execution import capture_source_revision, validate_source_execution
+from agent.source_lifecycle import source_registry
 from agent.tool_batch import BatchCall, BatchResult, is_parallel_safe, run_batch
 from agent.tools import ToolRegistry
-from agent.tools.base import ToolContext, ToolError
+from agent.tools.base import Tool, ToolContext, ToolError
+from agent.tools.mcp_tools import McpBackedTool
+from agent.tools.skill_tools import ReadSkillTool
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +94,16 @@ def _batch_result(outcome: BatchResult) -> dict[str, Any]:
     if outcome.ok:
         return {"success": True, "output": outcome.output}
     return {"success": False, "error": outcome.error}
+
+
+# A cut-off reply or a broken stream is retried this many times in a row before the run fails.
+MAX_CUT_OFF_REPLIES = 2
+MAX_STREAM_RETRIES = 2
+CUT_OFF_NOTICE = (
+    "Служебное уведомление агента: предыдущий ответ модели обрезан лимитом вывода и не "
+    "использован, инструменты из него не запускались. Сделай шаг меньше: запиши большой файл "
+    "по частям (write_file, затем edit_file) или раздели правку на несколько вызовов."
+)
 
 
 def _cut_in_reasoning(response: LLMResponse) -> bool:
@@ -123,6 +151,9 @@ class AgentSupervisor:
     def __init__(self, settings: Settings, registry: ToolRegistry | None = None) -> None:
         self.settings = settings
         self.registry = registry or ToolRegistry(settings=settings)
+        self._run_registry: ContextVar[ToolRegistry | None] = ContextVar(
+            "session_tool_registry", default=None
+        )
         # Optional override for the default model's client (used by tests and fakes).
         self.llm: LLMClient | None = None
         self._llm_clients: dict[str, LLMClient] = {}
@@ -481,6 +512,18 @@ class AgentSupervisor:
                 raise
             except FenceLostError:
                 logger.warning("Session %s: the run lost its fence and stops", session_id)
+            except BudgetExceeded as error:
+                # Belt and braces: a budget boundary that escaped the run loop must stop
+                # without session.error, never become a tool error or a retry.
+                current_fence = CURRENT_FENCE.get()
+                async with session_factory() as db:
+                    await self._stop_session_by_budget(
+                        db,
+                        session_id,
+                        current_fence.generation if current_fence is not None else 0,
+                        error.reason,
+                        current_fence,
+                    )
             except Exception as exc:
                 try:
                     await self._mark_error(session_id, exc)
@@ -524,6 +567,76 @@ class AgentSupervisor:
                     session_id,
                 )
 
+    async def _stop_session_by_budget(
+        self,
+        db: Any,
+        session_id: str,
+        generation: int,
+        reason: str,
+        fence: RunFence | None = None,
+    ) -> None:
+        """Stop the session for a budget reason: durable reason, conditionally stopped status.
+
+        The fence of the current run guards every write here. Committed even when a stopped
+        status was already recorded (a repeated stop just keeps the earlier status). No
+        ``stop_generation`` call: it would advance the generation and hide the stop reason
+        from the API.
+        """
+        if fence is not None:
+            await fence_check(db, fence)
+        await mark_budget_stop(db, session_id, generation, reason)
+        await db.execute(
+            update(Session)
+            .where(Session.id == session_id, Session.status.not_in(TERMINAL_STATUSES))
+            .values(status=SessionStatus.stopped.value)
+        )
+        cancelled = await self._cancel_unfinished_tool_calls(db, session_id)
+        await db.commit()
+        await emit_event(
+            db,
+            "session.status",
+            {"status": SessionStatus.stopped.value, "reason": reason},
+            session_id,
+        )
+        if cancelled:
+            await emit_event(db, "approval.cancelled", {"tool_call_ids": cancelled}, session_id)
+
+    async def _enforce_budget_before_step(self, db: Any, session_id: str, generation: int) -> bool:
+        """Allow or deny the next inference step; deny stops the session. Return False on stop."""
+        session = await db.get(Session, session_id)
+        if session is None:
+            return False
+        now = datetime.now(UTC)
+        usage = await load_budget_usage(db, session, now)
+        decision = check_budget(budget_limits(self.settings, session), usage, now)
+        if not decision.allowed:
+            await self._stop_session_by_budget(
+                db, session_id, generation, decision.reason or "budget_exceeded"
+            )
+            return False
+        await record_step(db, session_id, generation)
+        return True
+
+    async def _check_tool_budget(self, db: Any, session_id: str) -> None:
+        """Refuse a tool call when the session-level ceilings leave no room.
+
+        Tool execution is not an inference step, so the step counter is not consulted
+        (``steps=0``): tools of the last allowed step still run, while the next inference
+        boundary is denied by the step check.
+        """
+        session = await db.get(Session, session_id)
+        if session is None:
+            raise BudgetExceeded("session_missing")
+        now = datetime.now(UTC)
+        usage = await load_budget_usage(db, session, now)
+        decision = check_budget(
+            budget_limits(self.settings, session),
+            replace(usage, steps=0),
+            now,
+        )
+        if not decision.allowed:
+            raise BudgetExceeded(decision.reason or "budget_exceeded")
+
     async def _models(self, db: Any) -> ResolvedModelRegistry:
         """Read the catalogue; keep the last valid one if the new one is invalid."""
         try:
@@ -534,11 +647,36 @@ class AgentSupervisor:
             logger.exception("Model configuration is invalid; the last valid one stays in use")
         return self._last_models
 
+    @property
+    def _tools(self) -> ToolRegistry:
+        """Return the tools bound to this run, or the base registry outside a run."""
+        return self._run_registry.get() or self.registry
+
     async def _run(self, session_id: str) -> None:
+        async with session_factory() as db:
+            project = await db.scalar(select(Project).join(Session).where(Session.id == session_id))
+        registry = self.registry
+        if project is not None:
+            skills = load_skill_set(Path(project.root_path), None)
+            if skills.skills:
+                registry = registry.with_tools((ReadSkillTool(skills),))
+        if project is None:
+            return
+        async with source_registry(
+            self.settings, session_id, Path(project.root_path).resolve(strict=True), registry
+        ) as registry:
+            token = self._run_registry.set(registry)
+            try:
+                await self._run_session(session_id)
+            finally:
+                self._run_registry.reset(token)
+
+    async def _run_session(self, session_id: str) -> None:
         # One catalogue snapshot for the whole execution: a YAML or UI change applies to the
         # next execution, not between two steps of a running one.
         models: ResolvedModelRegistry | None = None
-        for _step in range(self.settings.max_inference_steps):
+        cut_offs = 0
+        while True:
             async with session_factory() as db:
                 query = (
                     select(Session)
@@ -588,7 +726,13 @@ class AgentSupervisor:
                     if pending_approval:
                         return
 
-                resume_state = await self._resume_tool_calls(db, session)
+                try:
+                    resume_state = await self._resume_tool_calls(db, session)
+                except BudgetExceeded as error:
+                    await self._stop_session_by_budget(
+                        db, session_id, session.run_generation or 0, error.reason
+                    )
+                    return
                 if resume_state in {"waiting", "stopped"}:
                     return
                 if resume_state == "processed":
@@ -608,10 +752,22 @@ class AgentSupervisor:
                     return
                 await emit_event(db, "session.status", {"status": session.status}, session.id)
 
+                # The generation of the current run: inference step accounting lives per
+                # run, while tokens and money stay session-wide.
+                generation = session.run_generation or 0
+                try:
+                    allowed = await self._enforce_budget_before_step(db, session_id, generation)
+                except BudgetExceeded as error:
+                    await self._stop_session_by_budget(db, session_id, generation, error.reason)
+                    return
+                if not allowed:
+                    return
+                await db.commit()
+
                 if models is None:
                     models = await self._models(db)
                 model = select_model(models, session.llm_profile, strict=False)
-                definitions = self.registry.definitions(session.mode, model_ids=models.ids())
+                definitions = self._tools.definitions(session.mode, model_ids=models.ids())
                 decisions = {
                     candidate.id: self._reasoning_for(session, candidate)
                     for candidate in models.models.values()
@@ -619,6 +775,7 @@ class AgentSupervisor:
                 await db.commit()
 
                 retried = False
+                stream_retries = 0
                 while True:
 
                     def reasoning_for(
@@ -634,8 +791,37 @@ class AgentSupervisor:
                         models,
                         partial(self._llm_for, models),
                         reasoning_for,
+                        settings=self.settings,
                     )
-                    outcome = await inference.run(model)
+                    try:
+                        outcome = await inference.run(model)
+                    except BudgetExceeded as error:
+                        await self._stop_session_by_budget(
+                            db, session_id, session.run_generation or 0, error.reason
+                        )
+                        return
+                    except LLMError as error:
+                        # The stream broke after the first fragment: no tool ran and nothing
+                        # was stored, so drop the partial reply and send the step again.
+                        if (
+                            not error.started
+                            or error.kind not in TRANSIENT_KINDS
+                            or stream_retries >= MAX_STREAM_RETRIES
+                        ):
+                            raise
+                        stream_retries += 1
+                        await StreamPublisher(session.id).reset()
+                        await emit_event(
+                            db,
+                            "inference.retry",
+                            {
+                                "reason": "stream_interrupted",
+                                "model_id": model.id,
+                                "retry": stream_retries,
+                            },
+                            session.id,
+                        )
+                        continue
                     response = outcome.response
                     reasoning_effort = outcome.reasoning.effective
                     await db.refresh(session, attribute_names=["status", "stop_requested"])
@@ -695,12 +881,26 @@ class AgentSupervisor:
                             reasoning_effort=reasoning_effort,
                         )
                     )
+                    cut_offs += 1
+                    if cut_offs > MAX_CUT_OFF_REPLIES:
+                        await db.commit()
+                        raise ToolError(
+                            "The model reply was cut off by the output limit, so it was not "
+                            "used and no tool ran. Ask for smaller steps, for example write a "
+                            "large file in parts."
+                        )
+                    # Tell the model and let it take a smaller step in the next inference.
+                    await append_message(db, session.id, role="user", content=CUT_OFF_NOTICE)
                     await db.commit()
-                    raise ToolError(
-                        "The model reply was cut off by the output limit, so it was not used "
-                        "and no tool ran. Ask for smaller steps, for example write a large "
-                        "file in parts."
+                    await StreamPublisher(session.id).reset()
+                    await emit_event(
+                        db,
+                        "inference.retry",
+                        {"reason": "output_limit", "model_id": outcome.model.id, "retry": cut_offs},
+                        session.id,
                     )
+                    continue
+                cut_offs = 0
 
                 assistant = await append_message(
                     db,
@@ -747,11 +947,10 @@ class AgentSupervisor:
                                 "Tool arguments are not valid JSON"
                                 + (" (the reply was cut off)" if truncated else "")
                             )
-                        self.registry.validate(
-                            name, session.mode, arguments, model_ids=models.ids()
-                        )
-                        risk = self.registry.risk(name, session.mode)
-                        confirmation = self.registry.requires_confirmation(name, session.mode)
+                        self._tools.validate(name, session.mode, arguments, model_ids=models.ids())
+                        risk = self._tools.risk(name, session.mode)
+                        confirmation = self._tools.requires_confirmation(name, session.mode)
+                        revision = capture_source_revision(self._tools.get(name, session.mode))
                     except Exception as exc:
                         call = ToolCall(
                             id=call_id,
@@ -778,6 +977,7 @@ class AgentSupervisor:
                         name=name,
                         arguments=arguments,
                         risk_level=risk.value,
+                        source_revision=revision,
                         status=(
                             ToolCallStatus.awaiting_confirmation.value
                             if confirmation
@@ -805,10 +1005,6 @@ class AgentSupervisor:
                         db, "approval.required", {"status": session.status}, session.id
                     )
                     return
-
-        raise RuntimeError(
-            f"Agent exceeded the maximum of {self.settings.max_inference_steps} inference steps"
-        )
 
     async def _resume_tool_calls(self, db: Any, session: Session) -> str:
         processed = False
@@ -916,10 +1112,15 @@ class AgentSupervisor:
         return followers
 
     def _may_run_in_parallel(self, session: Session, call: ToolCall) -> bool:
-        if call.status != ToolCallStatus.pending.value or call.approval is not None:
+        if (
+            call.status != ToolCallStatus.pending.value
+            or call.approval is not None
+            or call.source_revision is not None
+        ):
             return False
         try:
-            return is_parallel_safe(self.registry.get(call.name, session.mode))
+            tool = self._tools.get(call.name, session.mode)
+            return capture_source_revision(tool) is None and is_parallel_safe(tool)
         except Exception:
             return False
 
@@ -942,34 +1143,93 @@ class AgentSupervisor:
         """
         claimed: list[ToolCall] = []
         for call in group:
+            # Every member is checked before it is claimed; a refusal aborts the whole
+            # group before any tool body runs.
+            await self._check_tool_budget(db, session.id)
             if not await self._claim_tool_call(db, call):
                 break
             claimed.append(call)
         if claimed:
             context = self._tool_context(session)
+            executable: list[ToolCall] = []
+            tools: dict[str, Tool] = {}
+            for call in claimed:
+                try:
+                    tool = self._tools.get(call.name, session.mode)
+                    if capture_source_revision(tool) is not None:
+                        raise ToolError("Source-backed tools require sequential execution")
+                    await validate_source_execution(db, session.id, tool, call.source_revision)
+                except Exception as exc:
+                    await self._store_tool_result(
+                        db, session, call, {"success": False, "error": str(exc)}
+                    )
+                else:
+                    executable.append(call)
+                    tools[call.id] = tool
 
             async def execute(item: BatchCall) -> Any:
-                return await self.registry.execute(item.name, session.mode, context, item.arguments)
+                return await tools[item.call_id].execute(context, item.arguments)
 
             results = await run_batch(
-                [BatchCall(call.id, call.name, dict(call.arguments)) for call in claimed],
+                [BatchCall(call.id, call.name, dict(call.arguments)) for call in executable],
                 execute,
                 max_concurrency=PARALLEL_TOOL_LIMIT,
                 timeout_seconds=None,
             )
-            for call, outcome in zip(claimed, results, strict=True):
+            for call, outcome in zip(executable, results, strict=True):
                 await self._store_tool_result(db, session, call, _batch_result(outcome))
         return len(claimed) == len(group)
 
+    async def _source_execution_ready(
+        self, db: Any, session: Session, call: ToolCall, tool: Tool
+    ) -> bool:
+        try:
+            await validate_source_execution(db, session.id, tool, call.source_revision)
+            fence = CURRENT_FENCE.get()
+            if fence is not None:
+                await fence_check(db, fence)
+                await db.commit()
+            # A waited child runs under the fence of its parent, so check its own Stop too.
+            if fence is None or fence.session_id != session.id:
+                await db.refresh(session, attribute_names=["status", "stop_requested"])
+                if session.stop_requested or session.status == SessionStatus.stopped.value:
+                    return False
+                if isinstance(tool, McpBackedTool):
+                    await db.commit()
+        except FenceLostError:
+            await db.rollback()
+            raise
+        return True
+
     async def _execute_tool_call(self, db: Any, session: Session, call: ToolCall) -> bool:
+        await self._check_tool_budget(db, session.id)
         if not await self._claim_tool_call(db, call):
             return False
-        context = self._tool_context(session)
         try:
-            output = await self.registry.execute(
-                call.name, session.mode, context, dict(call.arguments)
-            )
+            tool = self._tools.get(call.name, session.mode)
+            if not await self._source_execution_ready(db, session, call, tool):
+                return False
+            context = self._tool_context(session)
+            if isinstance(tool, McpBackedTool):
+
+                async def before_send() -> None:
+                    if not await self._source_execution_ready(db, session, call, tool):
+                        raise ToolError("Session stopped before MCP egress")
+
+                output = await execute_mcp_attempt(
+                    tool,
+                    context,
+                    dict(call.arguments),
+                    tool_call_id=call.id,
+                    before_send=before_send,
+                )
+            else:
+                output = await tool.execute(context, dict(call.arguments))
             result = {"success": True, "output": output}
+        except FenceLostError:
+            raise
+        except BudgetExceeded:
+            raise
         except Exception as exc:
             result = {"success": False, "error": str(exc)}
         await self._store_tool_result(db, session, call, result)
@@ -1096,6 +1356,7 @@ class AgentSupervisor:
                 llm_profile=selected_profile,
                 title=f"Child: {prompt.strip().replace(chr(10), ' ')[:110]}",
                 parent_id=parent.id,
+                actor_user_id=parent.created_by_user_id,
                 configuration={"depth": depth + 1},
             )
             child_id = child.id
@@ -1106,16 +1367,32 @@ class AgentSupervisor:
                 parent.id,
             )
 
+        stopped = False
         if wait:
+            # Register the waited run, so that a Stop of the child cancels it.
+            task = asyncio.create_task(self._run(child_id), name=f"agent-child-{child_id}")
+            self._tasks[child_id] = task
             try:
-                await asyncio.wait_for(
-                    self._run(child_id), timeout=self.settings.max_child_wait_seconds
+                done, _pending = await asyncio.wait(
+                    {task}, timeout=self.settings.max_child_wait_seconds
                 )
-            except TimeoutError as exc:
-                await self.stop(child_id)
-                raise RuntimeError("Child agent exceeded its wait timeout") from exc
-            except Exception as exc:
-                await self._mark_error(child_id, exc)
+                if not done:
+                    await self.stop(child_id)
+                    raise RuntimeError("Child agent exceeded its wait timeout")
+            except asyncio.CancelledError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            finally:
+                if self._tasks.get(child_id) is task:
+                    del self._tasks[child_id]
+            # A Stop cancels the run before it records the stopped status.
+            stopped = task.cancelled()
+            failure = None if stopped else task.exception()
+            if isinstance(failure, Exception):
+                await self._mark_error(child_id, failure)
+            elif failure is not None:
+                raise failure
         else:
             await self.start(child_id)
 
@@ -1129,9 +1406,12 @@ class AgentSupervisor:
                     .limit(1)
                 )
             ).scalar_one_or_none()
+            status = child_record.status if child_record else "missing"
+            if stopped and status not in TERMINAL_STATUSES:
+                status = SessionStatus.stopped.value
             return {
                 "session_id": child_id,
-                "status": child_record.status if child_record else "missing",
+                "status": status,
                 "llm_profile": child_record.llm_profile if child_record else selected_profile,
                 "response": final_message.content if final_message else None,
             }

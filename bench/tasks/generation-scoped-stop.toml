@@ -1,0 +1,27 @@
+id = "generation-scoped-stop"
+class = "medium"
+fix_commit = "419953b15b7088b5d2f1368eb08d966d1ae1453d"
+prompt = """\
+Остановка сессии сейчас действует на «текущий» запуск, но из-за гонок между Stop и стартом
+новой генерации может быть остановлен не тот запуск: поздний Stop перехватывает более новую
+генерацию, а задача нужной генерации остаётся работать.
+
+Нужен останов строго конкретной генерации запуска: он должен выполняться одним условным
+обновлением, которое применяется только когда сессия всё ещё находится на ожидаемой
+генерации, никакой Stop ещё не запрошен и сессия не завершена. Задача этой генерации должна
+захватываться до записи, отменяться сразу после коммита и до любых событий, причём останов
+должен дожидаться завершения задачи даже при сбое событий или отмене самого запроса. Задача
+более новой генерации не должна трогаться.
+Наблюдается в рантайме и в механизме сессионного забора при остановке запусков.
+Интерфейс: в agent.session_fence нужна функция
+`async def stop_generation_scoped(db: AsyncSession, session_id: str, expected_generation: int) -> bool`
+(без commit), а в AgentSupervisor — метод
+`async def stop_scoped(self, session_id: str, expected_generation: int) -> bool`.
+"""
+tests = [
+    "tests/integration/test_runtime_start.py",
+    "tests/integration/test_session_fence.py",
+]
+check = "pytest -q tests/integration/test_runtime_start.py tests/integration/test_session_fence.py"
+max_steps = 60
+max_seconds = 1800

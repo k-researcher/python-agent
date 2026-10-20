@@ -155,6 +155,71 @@ class KbReadTool(KnowledgeTool):
         }
 
 
+class KbListTool(KnowledgeTool):
+    name = "kb_list"
+    description = "List knowledge base documents with pagination and optional metadata filters."
+    risk_level = RiskLevel.network_access
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+            "count": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+            "metadata": {"type": "object"},
+        },
+        "additionalProperties": False,
+    }
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        del context
+        offset = max(0, int(arguments.get("offset", 0)))
+        count = max(1, min(100, int(arguments.get("count", 20))))
+        metadata_filter = arguments.get("metadata")
+        if metadata_filter is not None and not isinstance(metadata_filter, dict):
+            raise ToolError("metadata must be an object")
+
+        async with session_factory() as db:
+            query = select(KnowledgeDocument).order_by(KnowledgeDocument.created_at.desc())
+            documents = list((await db.execute(query)).scalars())
+
+        filtered = documents
+        if metadata_filter:
+            filtered = [
+                document
+                for document in filtered
+                if document.document_metadata
+                and all(
+                    document.document_metadata.get(key) == value
+                    for key, value in metadata_filter.items()
+                )
+            ]
+
+        total = len(filtered)
+        page = filtered[offset : offset + count]
+        return {
+            "total": total,
+            "offset": offset,
+            "count": len(page),
+            "documents": [
+                {
+                    "id": document.id,
+                    "title": _document_title(document),
+                    "metadata": document.document_metadata,
+                    "created_at": (
+                        document.created_at.isoformat() if document.created_at else None
+                    ),
+                }
+                for document in page
+            ],
+        }
+
+
+def _document_title(document: KnowledgeDocument) -> str:
+    """Return a short title for a knowledge document."""
+    text = document.content or ""
+    stripped = text.strip().replace("\n", " ")
+    return stripped[:200] or document.keywords[:200]
+
+
 class KbSaveTool(KnowledgeTool):
     name = "kb_save"
     description = "Save an approved exact text fragment to the knowledge base."
@@ -275,6 +340,7 @@ def knowledge_tools(settings: Settings) -> tuple[Tool, ...]:
     return (
         KbSearchTool(settings),
         KbReadTool(settings),
+        KbListTool(settings),
         KbSaveTool(settings),
         KbEditTool(settings),
         KbDeleteTool(settings),

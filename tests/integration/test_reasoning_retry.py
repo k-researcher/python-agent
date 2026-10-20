@@ -102,25 +102,26 @@ def test_cut_reasoning_is_retried_once_at_a_lower_level(tmp_path: Path) -> None:
 
 
 @pytest.mark.usefixtures("reasoning_models")
-def test_second_cut_is_an_error_without_a_third_request(tmp_path: Path) -> None:
+def test_second_cut_gets_a_notice_and_a_new_step(tmp_path: Path) -> None:
     fake = ScriptedLLM([CUT, CUT, ANSWER])
     status, _ = _run(tmp_path, fake, "high")
-    assert status == "error"
-    assert fake.efforts == ["high", "low"]
+    # The lower level is tried once; the next cut becomes a notice and a new step.
+    assert status == "completed"
+    assert fake.efforts == ["high", "low", "high"]
 
 
 @pytest.mark.usefixtures("reasoning_models")
 def test_no_retry_below_the_lowest_level(tmp_path: Path) -> None:
     fake = ScriptedLLM([CUT, ANSWER])
     status, _ = _run(tmp_path, fake, "none")
-    assert status == "error"
-    assert fake.efforts == ["none"]
+    assert status == "completed"
+    assert fake.efforts == ["none", "none"]
 
 
 @pytest.mark.usefixtures("reasoning_models")
-def test_cut_reply_with_text_is_not_retried(tmp_path: Path) -> None:
+def test_cut_reply_with_text_keeps_the_reasoning_level(tmp_path: Path) -> None:
     cut_text = LLMResponse("partial text", [], "length", 10, 100, reasoning="thought")
     fake = ScriptedLLM([cut_text, ANSWER])
     status, _ = _run(tmp_path, fake, "high")
-    assert status == "error"
-    assert fake.efforts == ["high"]
+    assert status == "completed"
+    assert fake.efforts == ["high", "high"]

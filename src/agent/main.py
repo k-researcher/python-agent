@@ -70,6 +70,7 @@ async def browser_auth(request: Request, call_next: RequestResponseEndpoint) -> 
         )
     if not check.ok:
         return JSONResponse({"detail": check.detail}, status_code=check.status)
+    request.state.actor_user_id = check.auth.user_id if check.auth is not None else None
     return await call_next(request)
 
 

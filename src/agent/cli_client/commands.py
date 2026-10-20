@@ -41,6 +41,8 @@ REJECTED_TOKEN_HINT = "API сервер отклонил токен. Прове�
 NO_SERVER_HINT = "Запустите в другом окне: pyagent"
 START_SERVER_PROMPT = "Агент не запущен. Запустить сейчас? (д/н) "
 NON_INTERACTIVE_REJECT_COMMENT = "Подтверждение недоступно без терминала"
+READ_ONLY_APPROVE_COMMENT = "Одобрено флагом --yes-read-only"
+READ_ONLY_REJECT_COMMENT = "Флаг --yes-read-only разрешает только чтение"
 INTERRUPTED_REJECT_COMMENT = "Отменено по Ctrl+C"
 CONNECTION_LOST_TEXT = "Связь с агентом потеряна."
 TURN_STOPPED_TEXT = "Ответ остановлен. Для выхода нажмите Ctrl+C ещё раз."
@@ -283,11 +285,13 @@ async def _render_approvals(
     interactive: bool,
     session_id: str,
     processed: set[str],
+    yes_read_only: bool = False,
 ) -> None:
     """Fetch and resolve every pending approval for a session.
 
     ``processed`` keeps the approval ids of this turn, so a repeated
     ``approval.required`` event does not ask for or resolve the same item twice.
+    With ``yes_read_only``, read-only approvals are approved without a prompt.
     """
     try:
         approvals = await api.approvals(session_id)
@@ -302,7 +306,14 @@ async def _render_approvals(
         processed.add(approval_id)
         renderer.approval(approval)
         interrupted = False
-        if interactive:
+        if yes_read_only and approval.get("risk_level") == "read_only":
+            decision: str = "approve"
+            comment: str | None = READ_ONLY_APPROVE_COMMENT
+        elif yes_read_only:
+            # The flag turns off questions: everything that is not read-only is refused.
+            out.write(f"{READ_ONLY_REJECT_COMMENT}; инструмент отклонён.\n")
+            decision, comment = "reject", READ_ONLY_REJECT_COMMENT
+        elif interactive:
             try:
                 with _ctrl_c_raises():
                     decision, comment = prompt_approval(read, approval)
@@ -332,6 +343,7 @@ async def _check_status(
     interactive: bool,
     session_id: str,
     processed: set[str],
+    yes_read_only: bool = False,
 ) -> str | None:
     """Return the turn outcome when the session no longer runs, None while it runs."""
     try:
@@ -344,7 +356,9 @@ async def _check_status(
         _render_status(renderer, status, session.get("error"))
         return status
     if status == "awaiting_confirmation":
-        await _render_approvals(api, renderer, out, read, interactive, session_id, processed)
+        await _render_approvals(
+            api, renderer, out, read, interactive, session_id, processed, yes_read_only
+        )
     return None
 
 
@@ -357,6 +371,7 @@ async def _handle_event(
     interactive: bool,
     session_id: str,
     processed: set[str],
+    yes_read_only: bool = False,
 ) -> str | None:
     """Render one event; return the terminal status when the event ends the turn."""
     event_type = event.get("type", "")
@@ -374,7 +389,9 @@ async def _handle_event(
         )
     elif event_type == "approval.required":
         renderer.end_stream()
-        await _render_approvals(api, renderer, out, read, interactive, session_id, processed)
+        await _render_approvals(
+            api, renderer, out, read, interactive, session_id, processed, yes_read_only
+        )
     elif event_type == "session.status":
         status = str(payload.get("status", ""))
         if status in TERMINAL_STATUSES:
@@ -390,6 +407,7 @@ async def _process_turn(
     read: Callable[[str], str],
     interactive: bool,
     session_id: str,
+    yes_read_only: bool = False,
 ) -> str:
     """Follow one session turn until it ends.
 
@@ -399,7 +417,9 @@ async def _process_turn(
     a dead server ends the turn instead of a wait without end.
     """
     processed: set[str] = set()
-    outcome = await _check_status(api, renderer, out, read, interactive, session_id, processed)
+    outcome = await _check_status(
+        api, renderer, out, read, interactive, session_id, processed, yes_read_only
+    )
     if outcome is not None:
         return outcome
     while True:
@@ -416,7 +436,15 @@ async def _process_turn(
                 except TimeoutError:
                     break
                 outcome = await _handle_event(
-                    event, api, renderer, out, read, interactive, session_id, processed
+                    event,
+                    api,
+                    renderer,
+                    out,
+                    read,
+                    interactive,
+                    session_id,
+                    processed,
+                    yes_read_only,
                 )
                 if outcome is not None:
                     return outcome
@@ -425,7 +453,9 @@ async def _process_turn(
             return CONNECTION_LOST
         finally:
             await stream.aclose()
-        outcome = await _check_status(api, renderer, out, read, interactive, session_id, processed)
+        outcome = await _check_status(
+            api, renderer, out, read, interactive, session_id, processed, yes_read_only
+        )
         if outcome is not None:
             return outcome
         if ended:
@@ -512,12 +542,14 @@ async def cmd_run(
     interactive: bool,
     project_root: Path,
     task: str,
+    yes_read_only: bool = False,
 ) -> int:
     """Run a single task in the current project and print the result.
 
     Returns: EXIT_OK (0) on completed, EXIT_TASK_FAILED (1) on error/stopped,
     EXIT_NO_CONNECTION (2) when the server, the token or the connection is missing,
     EXIT_INTERRUPTED (130) on Ctrl+C. Ctrl+C also stops the session.
+    With ``yes_read_only``, read-only approvals are approved without a prompt.
     """
     renderer = Renderer(out, Style.detect(out))
 
@@ -538,7 +570,13 @@ async def cmd_run(
 
     try:
         outcome = await _process_turn(
-            api, renderer, out, read, interactive=interactive, session_id=session_id
+            api,
+            renderer,
+            out,
+            read,
+            interactive=interactive,
+            session_id=session_id,
+            yes_read_only=yes_read_only,
         )
     except TurnInterrupted:
         await _try_stop(api, session_id)

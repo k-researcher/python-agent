@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -76,10 +77,16 @@ class Settings(BaseSettings):
     context_window: int = Field(default=128_000, ge=4096)
     context_reserved_tokens: int = Field(default=12_000, ge=1024)
     max_inference_steps: int = Field(default=100, ge=1, le=1000)
+    # Server ceilings for session budgets. None disables the limit; client values are
+    # capped by these when present.
+    max_session_tokens: int | None = Field(default=None, ge=1)
+    max_session_cost: Decimal | None = Field(default=None, gt=0)
+    max_session_seconds: float | None = Field(default=None, gt=0)
     max_tool_result_chars: int = Field(default=30_000, ge=1000, le=1_000_000)
 
     raw_llm_log: bool = False
     knowledge_base_enabled: bool = False
+    tool_sources_file: Path | None = None
     allow_network_tools: bool = False
     # OS sandbox for shell commands: "off", "auto" (use it when the system has one) or
     # "required" (refuse to run a command without it). See agent.sandbox.
@@ -118,6 +125,13 @@ class Settings(BaseSettings):
     # An empty value removes the language rule from the prompts.
     response_language: str = Field(default="ru", max_length=20)
     frontend_dist: Path = PROJECT_ROOT / "frontend" / "dist"
+
+    @field_validator("max_session_cost")
+    @classmethod
+    def _max_session_cost_finite(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and not value.is_finite():
+            raise ValueError("max_session_cost must be a finite decimal")
+        return value
 
     def prepare_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent.sandbox import SandboxPolicy, SandboxUnavailableError
+from agent.sandbox import prepare as prepare_sandbox
+
 # JSON-RPC 2.0 reserved error codes.
 _METHOD_NOT_FOUND = -32601
 _MAX_LINE_BYTES = 4 * 1024 * 1024
@@ -51,18 +54,29 @@ class StdioMcpClient:
         cwd: Path,
         env: dict[str, str] | None = None,
         request_timeout: float = 30.0,
+        sandbox: SandboxPolicy | None = None,
+        session_id: str | None = None,
     ) -> None:
         """Bind to a server command but do not start it.
 
         Raise ValueError when the command list is empty.
         The default environment keeps only PATH, HOME, and LANG.
+        Session integrations must supply a required sandbox policy and session ID.
+        Omitting the policy preserves the standalone client's existing behavior.
         """
         if not command:
             raise ValueError("command must not be empty")
+        if sandbox is not None:
+            if sandbox.mode != "required":
+                raise ValueError("sandbox mode must be 'required'")
+            if not session_id or not session_id.strip():
+                raise ValueError("session_id must be a non-empty string")
         self._command = list(command)
         self._cwd = cwd
         self._env = dict(env) if env is not None else self._default_env()
         self._request_timeout = request_timeout
+        self._sandbox = sandbox
+        self._session_id = session_id
 
         self._process: asyncio.subprocess.Process | None = None
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
@@ -103,15 +117,37 @@ class StdioMcpClient:
         """Spawn the server and perform the initialize handshake."""
         if self._process is not None:
             return
-        self._process = await asyncio.create_subprocess_exec(
-            *self._command,
-            cwd=str(self._cwd),
-            env=self._env,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=True,
+        command = self._command
+        environment = dict(self._env)
+        if self._sandbox is not None:
+            assert self._session_id is not None
+            prepared = prepare_sandbox(self._sandbox, self._cwd, self._session_id)
+            if prepared is None:
+                raise SandboxUnavailableError("sandbox preparation refused the command")
+            prefix, overrides = prepared
+            command = [*prefix, *self._command]
+            environment.update(overrides)
+        spawning = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(self._cwd),
+                env=environment,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
         )
+        cancelled = False
+        while not spawning.done():
+            try:
+                await asyncio.shield(spawning)
+            except asyncio.CancelledError:
+                cancelled = True
+        self._process = spawning.result()
+        if cancelled:
+            await self.close()
+            raise asyncio.CancelledError
         self._broken = None
         self._reader_task = asyncio.create_task(self._read_loop())
         try:
@@ -169,6 +205,18 @@ class StdioMcpClient:
 
     async def close(self) -> None:
         """Terminate the server and release its resources."""
+        closing = asyncio.create_task(self._close())
+        cancelled = False
+        while not closing.done():
+            try:
+                await asyncio.shield(closing)
+            except asyncio.CancelledError:
+                cancelled = True
+        closing.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close(self) -> None:
         process = self._process
         if process is None:
             return
@@ -199,6 +247,13 @@ class StdioMcpClient:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reader_task
             self._reader_task = None
+
+        replies = tuple(self._reply_tasks)
+        for reply in replies:
+            reply.cancel()
+        if replies:
+            await asyncio.gather(*replies, return_exceptions=True)
+        self._reply_tasks.clear()
 
         # Fail any requests still waiting for a response.
         self._fail_pending(McpError(None, "server closed"))

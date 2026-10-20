@@ -158,6 +158,7 @@ class Session(Base):
     owner_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     configuration: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    budget_state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -239,6 +240,7 @@ class ToolCall(Base):
     arguments: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     risk_level: Mapped[str] = mapped_column(String(50))
+    source_revision: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(50), default=ToolCallStatus.pending.value)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -305,6 +307,8 @@ class OutboundAudit(Base):
     factor: Mapped[float | None] = mapped_column(Float(precision=53), nullable=True)
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pricing_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    cost_amount: Mapped[str | None] = mapped_column(String(100), nullable=True)
     error_kind: Mapped[str | None] = mapped_column(String(30), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

@@ -2,16 +2,25 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+from pydantic import ValidationError
 from sqlalchemy import CursorResult, select, update
 from sqlalchemy.exc import IntegrityError
 
 from agent.database import session_factory
 from agent.llm import AttemptRecord
+from agent.model_config import PricingSpec
 from agent.models import OutboundAudit, TokenCalibration, utcnow
 from agent.token_calibration import ALPHA, MAX_FACTOR, MIN_FACTOR, CalibrationKey
+from agent.usage import UsageRecord, exact_cost, valid_token_count
 
 
-async def start_attempt(session_id: str, fields: dict[str, Any], record: AttemptRecord) -> int:
+async def start_attempt(
+    session_id: str,
+    fields: dict[str, Any],
+    record: AttemptRecord,
+    *,
+    pricing: PricingSpec | None = None,
+) -> int:
     async with session_factory() as db:
         audit = OutboundAudit(
             session_id=session_id,
@@ -19,6 +28,7 @@ async def start_attempt(session_id: str, fields: dict[str, Any], record: Attempt
             status="started",
             payload_bytes=record.payload_bytes,
             payload_sha256=record.payload_sha256,
+            pricing_snapshot=pricing.model_dump() if pricing is not None else None,
             **fields,
         )
         db.add(audit)
@@ -29,6 +39,23 @@ async def start_attempt(session_id: str, fields: dict[str, Any], record: Attempt
 async def finish_attempt(audit_id: int, record: AttemptRecord, key: CalibrationKey) -> None:
     async with session_factory() as db:
         status = "cancelled" if record.error_kind == "cancelled" else record.status
+        audit = await db.get(OutboundAudit, audit_id)
+        if audit is None or audit.status != "started":
+            return
+        prompt_tokens = valid_token_count(record.prompt_tokens)
+        completion_tokens = valid_token_count(record.completion_tokens)
+        try:
+            pricing = (
+                PricingSpec.model_validate(audit.pricing_snapshot)
+                if audit.pricing_snapshot is not None
+                else None
+            )
+        except ValidationError:
+            pricing = None
+        amount = exact_cost(UsageRecord(prompt_tokens, completion_tokens), pricing)
+        cost_amount = str(amount) if amount is not None else None
+        if cost_amount is not None and len(cost_amount) > 100:
+            cost_amount = None
         transitioned = cast(
             CursorResult[Any],
             await db.execute(
@@ -39,8 +66,9 @@ async def finish_attempt(audit_id: int, record: AttemptRecord, key: CalibrationK
                 )
                 .values(
                     status=status,
-                    prompt_tokens=record.prompt_tokens,
-                    completion_tokens=record.completion_tokens,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cost_amount=cost_amount,
                     error_kind=record.error_kind,
                     finished_at=utcnow(),
                 )
@@ -51,7 +79,7 @@ async def finish_attempt(audit_id: int, record: AttemptRecord, key: CalibrationK
         audit = await db.get(OutboundAudit, audit_id)
         assert audit is not None
         raw = audit.raw_estimate or 0
-        actual = record.prompt_tokens
+        actual = prompt_tokens
         if record.status == "completed" and raw > 0 and actual is not None and actual > 0:
             for _attempt in range(5):
                 row = await db.scalar(

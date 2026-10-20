@@ -12,6 +12,7 @@ from agent.tools.check_tools import RunChecksTool
 from agent.tools.git_tools import GitDiffTool, GitLogTool, GitShowTool, GitStatusTool
 from agent.tools.knowledge import knowledge_tools
 from agent.tools.patch_tools import ApplyPatchTool, EditByLinesTool
+from agent.tools.session_tools import ReadSessionTool
 from agent.tools.todo_tools import TodoReadTool, TodoWriteTool
 from agent.tools.web_fetch import WebFetchTool
 
@@ -35,11 +36,21 @@ class ToolRegistry:
                 RunChecksTool(),
                 TodoWriteTool(),
                 TodoReadTool(),
+                ReadSessionTool(),
                 *advanced_tools(self.settings),
                 WebFetchTool(self.settings),
                 *knowledge_tools(self.settings),
             )
         self._tools = {tool.name: tool for tool in tools}
+
+    def with_tools(self, tools: tuple[Tool, ...]) -> ToolRegistry:
+        """Create an isolated registry without replacing existing tool names."""
+        combined = dict(self._tools)
+        for tool in tools:
+            if tool.name in combined:
+                raise ToolError(f"Tool name is already registered: {tool.name}")
+            combined[tool.name] = tool
+        return ToolRegistry(settings=self.settings, tools=tuple(combined.values()))
 
     def _enabled(self, tool: Tool) -> bool:
         if tool.network_capability and not self.settings.allow_network_tools:
