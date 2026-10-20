@@ -53,6 +53,8 @@ SYSTEM_READ_FILES = (
     "/private/etc/group",
     "/private/etc/protocols",
     "/private/etc/services",
+    # Xcode tools refuse to start when they cannot read the accepted license.
+    "/Library/Preferences/com.apple.dt.Xcode.plist",
 )
 
 # Parts of the allowed trees that hold user data or third-party configuration.
@@ -97,9 +99,21 @@ def runtime_paths() -> tuple[str, ...]:
     interpreter and from the system developer tools link, not from project files.
     """
     paths = {sys.base_prefix, os.path.realpath(sys.base_prefix)}
-    if os.path.islink(XCODE_SELECT_LINK):
-        paths.add(os.path.realpath(XCODE_SELECT_LINK))
+    developer = developer_dir()
+    if developer is not None:
+        paths.add(developer)
+        # The tools of an Xcode app load frameworks from the app outside its developer directory.
+        contents = Path(developer).parent
+        if contents.name == "Contents" and contents.parent.suffix == ".app":
+            paths.add(str(contents))
     return tuple(sorted(path for path in paths if path))
+
+
+def developer_dir() -> str | None:
+    """Return the developer tools directory that the system link selects, or None."""
+    if os.path.islink(XCODE_SELECT_LINK):
+        return os.path.realpath(XCODE_SELECT_LINK)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +292,10 @@ def prepare(
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_ATTR_NOSYSTEM": "1",
     }
+    developer = developer_dir()
+    if developer is not None:
+        # The tools cannot read the system selection link inside the sandbox.
+        environment["DEVELOPER_DIR"] = developer
     return [SANDBOX_EXEC, "-p", text], environment
 
 
@@ -293,8 +311,9 @@ def trusted_path(read_paths: Sequence[str]) -> str:
     the shared user temporary directory.
     """
     parts: list[str] = []
-    if os.path.islink(XCODE_SELECT_LINK):
-        parts.append(os.path.join(os.path.realpath(XCODE_SELECT_LINK), "usr", "bin"))
+    developer = developer_dir()
+    if developer is not None:
+        parts.append(os.path.join(developer, "usr", "bin"))
     parts.extend(os.path.join(path, "bin") for path in read_paths)
     parts.extend(SYSTEM_BIN)
     unique: list[str] = []

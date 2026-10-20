@@ -21,6 +21,10 @@ all operations, but only inside the current project.
 2. Read and write access: the project directory and the temporary directory of the session.
 3. Read-only access: a short list of system paths, the interpreter of the agent process and
    the active developer tools directory. The paths `/usr/local` and `/System/Volumes/*` are closed.
+   When the developer tools are an Xcode app, the `Contents` directory of the app and the
+   accepted Xcode license file are also readable, and `DEVELOPER_DIR` names the tools. SwiftPM
+   then works with `swift build --disable-sandbox --build-system native` (the same for
+   `swift test`): its own sandbox cannot start inside this one.
 4. The network is closed. Process information of other processes, shared memory and POSIX
    semaphores are closed. `sysctl` is open for listed names only. The command input is closed.
 5. Only the agent process and the trusted setting `AGENT_SHELL_SANDBOX_READ_PATHS` select the
