@@ -811,3 +811,51 @@ def test_validate_simple_ok(tmp_path: Path) -> None:
     )
     reasons = bench._validate_task(task, repo=repo)
     assert reasons == []
+
+
+def test_recovery_waits_for_the_new_run_after_stop(tmp_path: Path) -> None:
+    # Status sequence: running at 6 steps, stopped by the runner, still stopped once after
+    # the continue message, then running and completed.
+    states = iter(["running", "stopped", "stopped", "running", "completed"])
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        calls.append(f"{request.method} {path}")
+        if path == "/api/sessions/s1" and request.method == "GET":
+            status = next(states, "completed")
+            budget = {"steps": 6, "known_tokens": 1, "known_cost": "0", "stop_reason": None}
+            return httpx.Response(200, json={"id": "s1", "status": status, "budget": budget})
+        if path in {"/api/sessions/s1/messages", "/api/sessions/s1/approvals"}:
+            if request.method == "POST":
+                return httpx.Response(201, json={})
+            return httpx.Response(200, json=[])
+        if path == "/api/sessions/s1/stop":
+            return httpx.Response(200, json={})
+        if path == "/api/projects":
+            return httpx.Response(201, json={"id": "p1"})
+        if path == "/api/sessions":
+            return httpx.Response(201, json={"id": "s1", "status": "pending"})
+        raise AssertionError(f"unexpected {request.method} {path}")
+
+    client = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(handler))
+    api = bench.BenchApi(client, "http://test", "csrf")
+    task = bench.Task(
+        id="rec",
+        task_class=bench.CLASS_RECOVERY,
+        fix_commit="abc",
+        prompt="fix",
+        tests=("tests/test_x.py",),
+        check="pytest -q tests/test_x.py",
+        interrupt_after_steps=6,
+    )
+
+    async def passing_check(_snapshot: Path, _task: bench.Task) -> bool:
+        return True
+
+    result = _run(
+        bench.run_case(api, task, 1, tmp_path, "main", poll_interval=0.0, run_check=passing_check)
+    )
+    assert result.status == "completed"
+    assert result.passed is True
+    assert calls.count("POST /api/sessions/s1/messages") == 1

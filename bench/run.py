@@ -1094,6 +1094,12 @@ async def run_case(
                     await asyncio.sleep(poll_interval)
                 await api.send_message(session_id, "Продолжи работу с того места, где остановился.")
                 interrupt_done = True
+                # The stop above left status "stopped": wait until the new run takes over.
+                deadline = time.monotonic() + STOP_WAIT_SECONDS
+                while status == "stopped" and time.monotonic() < deadline:
+                    await asyncio.sleep(poll_interval)
+                    session = await api.session(session_id)
+                    status = str(session.get("status", status))
 
         if status in {"completed", "error", "stopped"}:
             break
