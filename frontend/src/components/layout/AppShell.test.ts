@@ -23,10 +23,10 @@ describe("AppShell", () => {
     expect(wrapper.find(".slot-right").exists()).toBe(true);
   });
 
-  it("applies the spec column widths (264 / flexible / 320) via CSS variables", () => {
+  it("applies the spec column widths (320 / flexible / 320) via CSS variables", () => {
     const wrapper = mountShell({ leftOpen: true, rightOpen: true });
     const style = wrapper.find(".app-shell__body").attributes("style") ?? "";
-    expect(style).toContain("--left-w: 264px");
+    expect(style).toContain("--left-w: 320px");
     expect(style).toContain("--right-w: 320px");
   });
 

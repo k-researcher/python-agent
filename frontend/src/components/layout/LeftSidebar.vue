@@ -432,6 +432,7 @@ function isSelected(item: VisNode): boolean {
 .left-sidebar__section--projects {
   flex: 0 1 auto;
   max-height: 40%;
+  overflow-x: hidden;
   overflow-y: auto;
 }
 
