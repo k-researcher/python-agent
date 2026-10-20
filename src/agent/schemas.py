@@ -1,10 +1,19 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
+
+
+def _assume_utc(value: datetime) -> datetime:
+    """SQLite drops the time zone: a stored value without one is UTC."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+# Response time stamps always carry the time zone, so a browser does not read them as local time.
+UtcDatetime = Annotated[datetime, AfterValidator(_assume_utc)]
 
 
 class ProjectCreate(BaseModel):
@@ -18,7 +27,7 @@ class ProjectRead(BaseModel):
     id: str
     name: str
     root_path: str
-    created_at: datetime
+    created_at: UtcDatetime
 
 
 class SessionBudgetRequest(BaseModel):
@@ -55,7 +64,7 @@ class SessionBudgetRead(BaseModel):
     known_cost: str
     has_unknown_tokens: bool
     has_unknown_cost: bool
-    started_at: datetime | None
+    started_at: UtcDatetime | None
     stop_reason: str | None
 
 
@@ -85,8 +94,8 @@ class SessionRead(BaseModel):
     archived: bool
     # Populated by agent.api; the message-tree fork route returns it as None.
     budget: SessionBudgetRead | None = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
 
 
 class MessageCreate(BaseModel):
@@ -113,7 +122,7 @@ class MessageRead(BaseModel):
     source_hash: str | None
     summary_version: int | None
     summary_model: str | None
-    created_at: datetime
+    created_at: UtcDatetime
 
 
 class ApprovalDecision(BaseModel):
@@ -129,7 +138,7 @@ class ApprovalRead(BaseModel):
     risk_level: str
     status: str
     comment: str | None
-    created_at: datetime
+    created_at: UtcDatetime
 
 
 class EventRead(BaseModel):
@@ -139,7 +148,7 @@ class EventRead(BaseModel):
     session_id: str | None
     type: str
     payload: dict[str, Any]
-    created_at: datetime
+    created_at: UtcDatetime
 
 
 class OutboundAuditRead(BaseModel):
@@ -154,7 +163,7 @@ class OutboundAuditRead(BaseModel):
     payload_sha256: str
     status: str
     detail: str | None
-    created_at: datetime
+    created_at: UtcDatetime
 
 
 class KnowledgeDocumentRead(BaseModel):
@@ -166,5 +175,5 @@ class KnowledgeDocumentRead(BaseModel):
     keywords: str
     document_metadata: dict[str, Any]
     source_session_id: str | None
-    created_at: datetime
-    updated_at: datetime
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
