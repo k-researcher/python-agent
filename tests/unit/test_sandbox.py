@@ -274,3 +274,65 @@ def test_profile_uses_checked_temp_path_without_resolution(tmp_path: Path) -> No
     text = profile(tmp_path / "project", link, [])
     assert f'(subpath "{link}")' in text
     assert f'(subpath "{real}")' not in text
+
+
+def _xcode_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    developer = tmp_path / "Xcode.app" / "Contents" / "Developer"
+    developer.mkdir(parents=True)
+    link = tmp_path / "xcode_select_link"
+    link.symlink_to(developer)
+    monkeypatch.setattr(sandbox, "XCODE_SELECT_LINK", str(link))
+    return developer.resolve()
+
+
+def test_runtime_paths_include_the_xcode_app_contents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    developer = _xcode_link(tmp_path, monkeypatch)
+    paths = sandbox.runtime_paths()
+    assert str(developer) in paths
+    assert str(developer.parent) in paths
+
+
+def test_prepare_names_the_developer_directory(
+    layout: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _, temp_root = layout
+    developer = _xcode_link(project.parent, monkeypatch)
+    monkeypatch.setattr(sandbox, "available", lambda: True)
+    prepared = prepare(SandboxPolicy(mode="required", temp_root=temp_root), project, "s1")
+    assert prepared is not None
+    assert prepared[1]["DEVELOPER_DIR"] == str(developer)
+
+
+def test_profile_reads_the_xcode_license(tmp_path: Path) -> None:
+    text = profile(tmp_path / "p", tmp_path / "t", [])
+    assert '(literal "/Library/Preferences/com.apple.dt.Xcode.plist")' in text
+
+
+@needs_sandbox
+@pytest.mark.skipif(sandbox.developer_dir() is None, reason="no developer tools")
+def test_swift_package_tests_run_in_the_sandbox(layout: tuple[Path, Path, Path]) -> None:
+    project, _, temp_root = layout
+    (project / "Sources" / "Core").mkdir(parents=True)
+    (project / "Tests" / "CoreTests").mkdir(parents=True)
+    (project / "Package.swift").write_text(
+        "// swift-tools-version: 6.0\n"
+        "import PackageDescription\n"
+        'let package = Package(name: "Probe", targets: [.target(name: "Core"), '
+        '.testTarget(name: "CoreTests", dependencies: ["Core"])])\n',
+        encoding="utf-8",
+    )
+    (project / "Sources" / "Core" / "Core.swift").write_text(
+        "public func twice(_ value: Int) -> Int { value * 2 }\n", encoding="utf-8"
+    )
+    (project / "Tests" / "CoreTests" / "CoreTests.swift").write_text(
+        "import Testing\n@testable import Core\n@Test func doubles() { #expect(twice(2) == 4) }\n",
+        encoding="utf-8",
+    )
+    arguments = {
+        "command": "swift test --disable-sandbox --build-system native",
+        "timeout_seconds": 300,
+    }
+    result = asyncio.run(ShellTool().execute(_context(project, temp_root), arguments))
+    assert result["exit_code"] == 0, result["stderr"]

@@ -123,3 +123,10 @@ def test_child_agent_schema_lists_configured_model_profiles() -> None:
 
     profile_schema = definition["function"]["parameters"]["properties"]["llm_profile"]
     assert profile_schema["enum"] == ["deep", "fast"]
+
+
+def test_shell_operators_are_refused_before_approval() -> None:
+    registry = ToolRegistry()
+    with pytest.raises(ToolError, match="Shell operators are not supported: &&"):
+        registry.validate("shell", "dev", {"command": "pytest -q && ruff check"})
+    registry.validate("shell", "dev", {"command": "pytest -q tests"})

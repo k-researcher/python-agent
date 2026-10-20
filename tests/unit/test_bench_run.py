@@ -190,6 +190,16 @@ def test_approval_policy() -> None:
     ok, reason = bench.approve_call("shell", {"command": "pytest && rm x"})
     assert ok is False and (reason or "").startswith("shell command")
     assert bench.approve_call("shell", {"command": "pytest -q tests"}) == (True, None)
+    # Оператор внутри кавычек — часть аргумента, команда одобряется.
+    assert bench.approve_call("shell", {"command": 'python -c "import a; a.run()"'}) == (
+        True,
+        None,
+    )
+    # Запрещённая программа в любой позиции — отклоняется.
+    ok, _reason = bench.approve_call("shell", {"command": "git rm -f a.py"})
+    assert ok is False
+    ok, _reason = bench.approve_call("shell", {"command": "/bin/rm a.py"})
+    assert ok is False
     # Запрещённые инструменты — отклоняются.
     for tool in ("http_request", "web_fetch", "ssh_exec", "db_execute"):
         ok, reason = bench.approve_call(tool, {"url": "http://x"})

@@ -20,6 +20,8 @@ from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 
 MAX_TEXT_BYTES = 1_000_000
 MAX_COMMAND_OUTPUT = 100_000
+# Without a shell these tokens reach the program as plain arguments; reject them instead.
+SHELL_OPERATOR_TOKENS = frozenset({"&&", "||", ";", "|", "&", ">", ">>", "<", "2>", "2>&1"})
 
 
 def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
@@ -393,7 +395,11 @@ class RemoveFileTool(Tool):
 
 class ShellTool(Tool):
     name = "shell"
-    description = "Run one command without shell expansion in the selected project."
+    description = (
+        "Run one program with its arguments in the project root, without a shell. "
+        "Operators such as &&, ||, ;, |, > and < are not supported, and cd is not needed: "
+        "make one call for each command and use paths relative to the project root."
+    )
     risk_level = RiskLevel.process_execution
     allowed_modes = frozenset({"dev"})
     input_schema = {
@@ -406,7 +412,25 @@ class ShellTool(Tool):
         "additionalProperties": False,
     }
 
+    def check_arguments(self, arguments: dict[str, Any]) -> None:
+        try:
+            command = shlex.split(str(arguments["command"]))
+        except ValueError as exc:
+            raise ToolError(f"Command cannot be parsed: {exc}") from None
+        operators = sorted({token for token in command if token in SHELL_OPERATOR_TOKENS})
+        if operators:
+            raise ToolError(
+                f"Shell operators are not supported: {' '.join(operators)}. "
+                "The command runs without a shell: make one call for each command."
+            )
+        if command and command[0] == "cd":
+            raise ToolError(
+                "cd is not supported: the command already runs in the project root. "
+                "Use paths relative to the project root."
+            )
+
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.check_arguments(arguments)
         command = shlex.split(str(arguments["command"]))
         if not command:
             raise ToolError("Command is empty")

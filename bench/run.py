@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -100,8 +101,11 @@ ALWAYS_DENY = frozenset(
     {"http_request", "web_fetch", "web_search", "ssh_exec", "db_execute", "db_select", "run_agent"}
 )
 
-# Операторы оболочки, запрещённые в shell-командах (как в dogfood.py).
-SHELL_OPERATORS = re.compile(r"[|;&<>$`\n]|\b(?:rm|sudo|chmod|chown|mkfs)\b")
+# Shell агента запускает одну программу без оболочки. Команду разбираем на токены так же,
+# как инструмент: оператор внутри кавычек (python -c "a; b") остаётся частью аргумента.
+SHELL_OPERATOR_TOKENS = frozenset({"&&", "||", ";", "|", "&", ">", ">>", "<", "2>", "2>&1"})
+# Программы, которые политика bench не запускает ни в какой позиции команды.
+DENIED_PROGRAMS = frozenset({"rm", "sudo", "chmod", "chown", "mkfs"})
 
 
 class BenchError(RuntimeError):
@@ -465,7 +469,13 @@ def _is_outside_path(value: str) -> bool:
 
 
 def _has_shell_operators(command: str) -> bool:
-    return bool(SHELL_OPERATORS.search(command))
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return True
+    return any(
+        token in SHELL_OPERATOR_TOKENS or Path(token).name in DENIED_PROGRAMS for token in tokens
+    )
 
 
 def approve_call(tool_name: str, arguments: dict[str, Any]) -> tuple[bool, str | None]:

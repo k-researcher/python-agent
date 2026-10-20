@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// Presentational shell: Topbar on top, three columns below (264 / flexible / 320).
+// Presentational shell: Topbar on top, three columns below (320 / flexible / 320).
 // Panels are shown/hidden through props; on narrow screens the toggle buttons
 // appear at the edges and emit update:* so the parent controls the state.
 
@@ -54,7 +54,7 @@ function toggleRight(): void {
     <div
       class="app-shell__body"
       :style="{
-        '--left-w': leftOpen ? '264px' : '0px',
+        '--left-w': leftOpen ? '320px' : '0px',
         '--right-w': rightOpen ? '320px' : '0px',
       }"
     >
@@ -207,7 +207,7 @@ function toggleRight(): void {
     top: 52px;
     left: 0;
     bottom: 0;
-    width: min(264px, 100vw);
+    width: min(320px, 100vw);
     z-index: 25;
     box-shadow: var(--shadow);
   }

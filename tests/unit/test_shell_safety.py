@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.tools.base import ToolContext
+from agent.tools.base import ToolContext, ToolError
 from agent.tools.builtin import MAX_COMMAND_OUTPUT, ShellTool
 
 
@@ -64,3 +64,31 @@ async def test_cancelled_shell_kills_spawned_children(tmp_path: Path) -> None:
         await asyncio.sleep(0.05)
     os.kill(child_pid, 9)
     raise AssertionError("grandchild process survived cancellation")
+
+
+@pytest.mark.parametrize(
+    ("command", "message"),
+    [
+        ("pytest -q && ruff check", "Shell operators are not supported: &&"),
+        ("git log | head", "Shell operators are not supported: |"),
+        ("pytest -q > out.txt", "Shell operators are not supported: >"),
+        ("cd src", "cd is not supported"),
+        ("echo 'not closed", "Command cannot be parsed"),
+    ],
+)
+async def test_shell_refuses_commands_that_need_a_shell(
+    tmp_path: Path, command: str, message: str
+) -> None:
+    with pytest.raises(ToolError, match=message):
+        await ShellTool().execute(
+            ToolContext(session_id="test", project_root=tmp_path), {"command": command}
+        )
+
+
+async def test_shell_keeps_quoted_operators_as_an_argument(tmp_path: Path) -> None:
+    command = f"{sys.executable} -c \"print('a && b; c | d')\""
+    result = await ShellTool().execute(
+        ToolContext(session_id="test", project_root=tmp_path), {"command": command}
+    )
+
+    assert result["stdout"].strip() == "a && b; c | d"
