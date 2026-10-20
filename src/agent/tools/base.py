@@ -51,6 +51,10 @@ class Tool(ABC):
         """JSON Schema sent to the model; override when it depends on live configuration."""
         return self.input_schema
 
+    def check_arguments(self, arguments: dict[str, Any]) -> None:
+        """Reject arguments that match the schema but cannot run; called before any approval."""
+        return None
+
     @abstractmethod
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError

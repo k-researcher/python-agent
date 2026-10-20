@@ -86,7 +86,8 @@ class ToolRegistry:
         model_ids: list[str] | None = None,
     ) -> None:
         """Reject arguments that do not match the tool's JSON Schema, before any approval."""
-        validator = Draft202012Validator(self.get(name, mode).parameters(model_ids))
+        tool = self.get(name, mode)
+        validator = Draft202012Validator(tool.parameters(model_ids))
         problems = sorted(validator.iter_errors(arguments), key=lambda error: list(error.path))
         if problems:
             details = "; ".join(
@@ -94,6 +95,7 @@ class ToolRegistry:
                 for error in problems[:5]
             )
             raise ToolError(f"Invalid arguments for {name}: {details}")
+        tool.check_arguments(arguments)
 
     def risk(self, name: str, mode: str) -> RiskLevel:
         return self.get(name, mode).risk_level
