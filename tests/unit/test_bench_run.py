@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -508,3 +509,305 @@ def test_all_bench_tasks_load() -> None:
     classes = {task.task_class for task in tasks}
     assert classes == {"simple", "medium", "read", "safety", "recovery", "limit"}
     assert all(task.canary for task in tasks if task.task_class == "safety")
+
+
+# --------------------------------------------------------------------------
+# 9. П. 1–4: запись JSONL по мере выполнения, прогресс, 409-пропуск,
+# -------------------------------------------------------- изоляция ошибок, --validate
+# --------------------------------------------------------------------------
+
+
+def _options(tmp_path: Path, *, only: tuple[str, ...] = ()) -> bench.RunOptions:
+    server_log = tmp_path / "server.log"
+    server_log.write_text("http://127.0.0.1:8098/#login=code123\n", encoding="utf-8")
+    options = bench.RunOptions(
+        base_url="http://127.0.0.1:8098",
+        server_log=server_log,
+        tasks_dir=tmp_path / "tasks",
+        out_dir=tmp_path / "out",
+        work_dir=tmp_path / "work",
+        repeat=1,
+        parallel=1,
+        profile="main",
+        only=only,
+    )
+    options.tasks_dir.mkdir(exist_ok=True)
+    return options
+
+
+def _task_result(task_id: str, task_class: str, n: int, *, passed: bool = True) -> bench.CaseResult:
+    return bench.CaseResult(
+        task=task_id,
+        task_class=task_class,
+        n=n,
+        status="completed",
+        stop_reason=None,
+        passed=passed,
+        safety_violations=[],
+        steps=1,
+        known_tokens=2,
+        known_cost="0.001",
+        seconds=0.5,
+        rejections=[],
+        session_id="s1",
+    )
+
+
+def _write_read_task(tasks_dir: Path, task_id: str) -> None:
+    (tasks_dir / f"{task_id}.toml").write_text(
+        f"id = '{task_id}'\nclass = 'read'\nfix_commit = 'abc'\n"
+        "prompt = 'вопрос'\nexpected_facts = ['fact']\n",
+        encoding="utf-8",
+    )
+
+
+def _run_with_stubs(
+    tmp_path: Path,
+    runner: Any,
+    *,
+    task_ids: list[str],
+    progress: Any = None,
+) -> tuple[list[bench.CaseResult], str, Path]:
+    """Запустить run_all с заглушками runner/builder: без сети, git и uv.
+
+    Возвращает (результаты, run_id, путь к JSONL).
+    """
+    options = _options(tmp_path, only=tuple(task_ids))
+    for task_id in task_ids:
+        _write_read_task(options.tasks_dir, task_id)
+
+    def builder(_task: bench.Task, target: Path) -> Path:
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/auth/login":
+            return httpx.Response(200, json={"csrf_token": "c"}, request=request)
+        return httpx.Response(200, json={}, request=request)
+
+    results, run_id = _run(
+        bench.run_all(
+            options,
+            transport=httpx.MockTransport(handler=handler),
+            case_runner=runner,
+            snapshot_builder=builder,
+            progress=progress,
+        )
+    )
+    return results, run_id, options.out_dir / f"{run_id}.jsonl"
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_jsonl_written_after_first_case_with_case_runner_stub(tmp_path: Path) -> None:
+    """После первой завершённой задачи строка уже лежит в out/<run_id>.jsonl.
+
+    Явно вызываем make_results_writer (тот же код, что использует run_all) и
+    проверяем инкрементальность: одна запись — одна строка в файле.
+    """
+    out = tmp_path / "out"
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "run.jsonl"
+    writer = bench.make_results_writer(path)
+
+    _run(writer(_task_result("a", "read", 1)))
+    assert _read_jsonl(path) == [_task_result("a", "read", 1).as_json()]
+
+    _run(writer(_task_result("b", "read", 1)))
+    lines = _read_jsonl(path)
+    assert [line["task"] for line in lines] == ["a", "b"]
+    assert path.stat().st_size > 0  # flush() записал байты на диск
+
+
+def test_progress_line_after_each_case(tmp_path: Path) -> None:
+    """После первой задачи печатается строка прогресса с run_id в заголовке."""
+    captured: list[str] = []
+    progress = bench.Progress(2, write=lambda text: captured.append(text))
+    _run(progress.header("run_id=r1 tasks=2 results=/tmp/x.jsonl"))
+    _run(progress.report(1, _task_result("a", "read", 1, passed=True)))
+    _run(progress.report(2, _task_result("b", "read", 1, passed=False)))
+
+    assert captured[0] == "run_id=r1 tasks=2 results=/tmp/x.jsonl"
+    line1 = captured[1]
+    assert "[1/2] a #1: pass" in line1
+    assert "status=completed" in line1
+    assert "reason=completed" in line1
+    assert "steps=1" in line1 and "cost=0.001" in line1
+    assert "0.5s" in line1
+    assert "[2/2] b #1: fail" in captured[2]
+
+
+def test_approval_409_is_skipped_and_poll_continues(tmp_path: Path) -> None:
+    """Ответ 409 на POST /api/approvals/<id> — не ошибка: подтверждение пропускается."""
+    attempts = {"session_polls": 0, "resolve": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/auth/login":
+            return httpx.Response(200, json={"csrf_token": "c"}, request=request)
+        if path == "/api/projects":
+            return httpx.Response(201, json={"id": "p"}, request=request)
+        if path == "/api/sessions":
+            if request.method == "POST":
+                return httpx.Response(
+                    201,
+                    json={
+                        "id": "s1",
+                        "status": "running",
+                        "budget": {
+                            "steps": 0,
+                            "known_tokens": 0,
+                            "known_cost": "0",
+                            "max_steps": 60,
+                            "deadline_seconds": 1800,
+                            "stop_reason": None,
+                        },
+                    },
+                    request=request,
+                )
+            return httpx.Response(200, json=[], request=request)
+        if path == "/api/sessions/s1":
+            attempts["session_polls"] += 1
+            status = "completed" if attempts["session_polls"] > 1 else "running"
+            return httpx.Response(
+                200,
+                json={
+                    "id": "s1",
+                    "status": status,
+                    "budget": {
+                        "steps": 1,
+                        "known_tokens": 2,
+                        "known_cost": "0.001",
+                        "max_steps": 60,
+                        "deadline_seconds": 1800,
+                        "stop_reason": None,
+                    },
+                },
+                request=request,
+            )
+        if path == "/api/sessions/s1/messages":
+            return httpx.Response(
+                200,
+                json=[{"role": "assistant", "content": "answer with fact"}],
+                request=request,
+            )
+        if path == "/api/sessions/s1/approvals":
+            return httpx.Response(
+                200,
+                json=[{"id": "a1", "tool_name": "write_file", "arguments": {"path": "x.py"}}],
+                request=request,
+            )
+        if path == "/api/approvals/a1":
+            attempts["resolve"] += 1
+            # Сессия уже остановлена бюджетом → 409, но это не ошибка.
+            return httpx.Response(409, json={"detail": "budget exhausted"}, request=request)
+        raise AssertionError(f"unexpected {request.method} {path}")
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(base_url="http://127.0.0.1:8098", transport=transport)
+    csrf = _run(bench.login(client, "http://127.0.0.1:8098", "code"))
+    api = bench.BenchApi(client, "http://127.0.0.1:8098", csrf)
+    rejections: list[dict[str, str]] = []
+
+    # _handle_approvals не должен бросить исключение.
+    _run(bench._handle_approvals(api, "s1", rejections))
+    assert attempts["resolve"] == 1
+    assert rejections == []
+
+    # И весь цикл опроса доходит до completed.
+    task = bench.Task(
+        id="r",
+        task_class=bench.CLASS_READ,
+        fix_commit="abc",
+        prompt="вопрос",
+        expected_facts=("fact",),
+    )
+    result = _run(bench.run_case(api, task, 1, tmp_path, "main", poll_interval=0.01))
+    assert result.status == "completed"
+    assert result.passed is True
+
+
+def test_runner_exception_is_isolated_as_runner_error(tmp_path: Path) -> None:
+    """Исключение одной задачи не роняет прогон: status=runner_error, error=текст."""
+
+    async def failing_runner(
+        _api: Any, _task: bench.Task, _n: int, _snapshot: Path, _profile: str
+    ) -> bench.CaseResult:
+        raise RuntimeError("boom: approval chain broke")
+
+    results, run_id, jsonl_path = _run_with_stubs(
+        tmp_path,
+        failing_runner,
+        task_ids=["a"],
+        progress=bench.Progress(0, write=lambda text: None),
+    )
+    result = results[0]
+    assert result.status == "runner_error"
+    assert result.passed is False
+    assert "boom" in (result.error or "")
+
+    record = _read_jsonl(jsonl_path)[0]
+    assert record["status"] == "runner_error"
+    assert record["pass"] is False
+    assert "boom" in (record["error"] or "")
+    assert jsonl_path.name == f"{run_id}.jsonl"
+
+
+def test_validate_read_missing_expected_fact_is_bad(tmp_path: Path) -> None:
+    """--validate: для read отсутствующее в src имя expected_fact помечает задачу bad.
+
+    Проверяем через validate_tasks/_validate_task на маленьком git-репозитории.
+    """
+    repo, parent, fix = _make_git_repo(tmp_path)
+    # Временный репозиторий только с коммитом fix, содержащим src/module.py с VALUE=2.
+    good = bench.Task(
+        id="good",
+        task_class=bench.CLASS_READ,
+        fix_commit=fix,
+        prompt="p",
+        expected_facts=("VALUE",),
+    )
+    reasons = bench._validate_task(good, repo=repo)
+    assert reasons == []
+
+    bad = bench.Task(
+        id="bad",
+        task_class=bench.CLASS_READ,
+        fix_commit=fix,
+        prompt="p",
+        expected_facts=("NO_SUCH_NAME",),
+    )
+    reasons = bench._validate_task(bad, repo=repo)
+    assert any("expected_fact" in reason for reason in reasons)
+
+
+def test_validate_missing_test_file_is_bad(tmp_path: Path) -> None:
+    """--validate: для simple/medium отсутствующий в fix_commit файл теста → bad."""
+    repo, parent, fix = _make_git_repo(tmp_path)
+    task = bench.Task(
+        id="bad",
+        task_class=bench.CLASS_SIMPLE,
+        fix_commit=fix,
+        prompt="p",
+        tests=("tests/does_not_exist.py",),
+        check="pytest -q tests/does_not_exist.py",
+    )
+    reasons = bench._validate_task(task, repo=repo)
+    assert any("test" in reason and "missing" in reason for reason in reasons)
+
+
+def test_validate_simple_ok(tmp_path: Path) -> None:
+    """--validate: корректная simple-задача даёт ok (родитель и тест существуют)."""
+    repo, parent, fix = _make_git_repo(tmp_path)
+    task = bench.Task(
+        id="good",
+        task_class=bench.CLASS_SIMPLE,
+        fix_commit=fix,
+        prompt="p",
+        tests=("tests/test_module.py",),
+        check="pytest -q tests/test_module.py",
+    )
+    reasons = bench._validate_task(task, repo=repo)
+    assert reasons == []

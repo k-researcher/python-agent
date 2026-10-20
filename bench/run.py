@@ -66,6 +66,9 @@ KNOWN_CLASSES = frozenset(ORDERED_CLASSES)
 # Классы, снимок которых собирается целиком из fix_commit (без родителей и тестов отдельно).
 FIX_COMMIT_SNAPSHOT_CLASSES = frozenset({CLASS_READ, CLASS_SAFETY, CLASS_LIMIT})
 
+# Классы, валидация которых требует родителя fix_commit и файлов тестов в fix_commit.
+PARENT_SNAPSHOT_CLASSES = frozenset({CLASS_SIMPLE, CLASS_MEDIUM, CLASS_RECOVERY})
+
 # Классы, где требуется поле check.
 CHECK_CLASSES = frozenset({CLASS_SIMPLE, CLASS_MEDIUM, CLASS_RECOVERY})
 
@@ -103,6 +106,14 @@ SHELL_OPERATORS = re.compile(r"[|;&<>$`\n]|\b(?:rm|sudo|chmod|chown|mkfs)\b")
 
 class BenchError(RuntimeError):
     """Ошибка прогона задачи или конфигурации bench."""
+
+
+class _ApprovalConflict(BenchError):
+    """Ответ 409 на POST /api/approvals/<id>: сессия уже остановлена бюджетом.
+
+    Это не ошибка прогона: такое подтверждение просто пропускается, а цикл
+    опроса продолжается — он всё равно завершится по терминальному статусу.
+    """
 
 
 def _git() -> str:
@@ -341,6 +352,10 @@ class BenchApi:
                     detail = str(data.get("detail", ""))
             except ValueError:
                 detail = response.text
+            if response.status_code == 409 and path.startswith("/api/approvals/"):
+                raise _ApprovalConflict(
+                    f"{method} {path} returned 409" + (f": {detail[:500]}" if detail else "")
+                )
             raise BenchError(
                 f"{method} {path} returned {response.status_code}"
                 + (f": {detail[:500]}" if detail else "")
@@ -507,6 +522,75 @@ def _git_text(args: list[str], cwd: Path | None = None) -> str:
             f"{result.stderr[:500].decode(errors='replace')}"
         )
     return result.stdout.decode(errors="replace")
+
+
+def _git_exists(rev: str, *, repo: Path | None = None) -> bool:
+    """True, если git-объект rev разрешается (rev^{commit} существует).
+
+    Проверка существования именно коммита: append ^{commit} требует, чтобы
+    объект был коммитом. Вызывается через существующую функцию _git_run().
+    """
+    result = _git_run(["cat-file", "-e", f"{rev}^{{commit}}"], cwd=repo)
+    return result.returncode == 0
+
+
+def _git_file_exists(commit: str, path: str, *, repo: Path | None = None) -> bool:
+    """True, если в коммите существует файл (git cat-file -e <commit>:<path>)."""
+    result = _git_run(["cat-file", "-e", f"{commit}:{path}"], cwd=repo)
+    return result.returncode == 0
+
+
+def _git_grep(name: str, commit: str, *, repo: Path | None = None) -> bool:
+    """True, если имя встречается в каталоге src коммита (git grep -q)."""
+    result = _git_run(["grep", "-q", name, commit, "--", "src"], cwd=repo)
+    return result.returncode == 0
+
+
+def _validate_task(task: Task, *, repo: Path | None = None) -> list[str]:
+    """Проверить, что из задачи можно собрать корректный снимок.
+
+    Ничего не запускает на сервере: только проверки в локальном git-репозитории.
+    Возвращает список причин (пустой — задача валидна). Используется CLI --validate.
+    """
+    reasons: list[str] = []
+
+    if not _git_exists(task.fix_commit, repo=repo):
+        reasons.append(f"fix_commit {task.fix_commit} does not exist")
+
+    if task.task_class in PARENT_SNAPSHOT_CLASSES:
+        if _git_exists(task.fix_commit, repo=repo):
+            parent = _git_text(["rev-parse", f"{task.fix_commit}^"], cwd=repo).strip()
+            if not parent:
+                reasons.append(f"fix_commit {task.fix_commit} has no parent")
+            elif not _git_exists(parent, repo=repo):
+                reasons.append(f"parent {parent} does not exist")
+        for test_path in task.tests:
+            if not _git_file_exists(task.fix_commit, test_path, repo=repo):
+                reasons.append(f"test {test_path} is missing in fix_commit")
+
+    if (
+        task.task_class == CLASS_READ
+        and task.expected_facts
+        and _git_exists(task.fix_commit, repo=repo)
+    ):
+        for name in task.expected_facts:
+            if not _git_grep(name, task.fix_commit, repo=repo):
+                reasons.append(f"expected_fact {name!r} is missing from src of fix_commit")
+
+    if (
+        task.task_class == CLASS_SAFETY
+        and task.canary
+        and _git_exists(task.fix_commit, repo=repo)
+        and _git_grep(task.canary, task.fix_commit, repo=repo)
+    ):
+        reasons.append("canary is present in fix_commit")
+
+    return reasons
+
+
+def validate_tasks(tasks: list[Task], *, repo: Path | None = None) -> list[tuple[str, list[str]]]:
+    """Валидировать задачи; вернуть список (id, причины) — пустые причины означают ok."""
+    return [(task.id, _validate_task(task, repo=repo)) for task in tasks]
 
 
 def _verify_commit(commit: str, repo: Path | None = None) -> None:
@@ -790,6 +874,7 @@ class CaseResult:
     seconds: float
     rejections: list[dict[str, str]]
     session_id: str
+    error: str | None = None
 
     def as_json(self) -> dict[str, Any]:
         return {
@@ -806,7 +891,32 @@ class CaseResult:
             "seconds": round(self.seconds, 2),
             "rejections": self.rejections,
             "session_id": self.session_id,
+            "error": self.error,
         }
+
+
+def _runner_error_result(task: Task, n: int, exc: Exception) -> CaseResult:
+    """Превратить исключение одного прогона в результат со status="runner_error".
+
+    pass=false, текст ошибки сохраняется в поле error; при этом остальные задачи
+    прогона продолжаются (исключение не распространяется в asyncio.gather).
+    """
+    return CaseResult(
+        task=task.id,
+        task_class=task.task_class,
+        n=n,
+        status="runner_error",
+        stop_reason=None,
+        passed=False,
+        safety_violations=[],
+        steps=0,
+        known_tokens=0,
+        known_cost="0",
+        seconds=0.0,
+        rejections=[],
+        session_id="",
+        error=str(exc),
+    )
 
 
 def _budget_usage(session: dict[str, Any]) -> tuple[int, int, str]:
@@ -815,6 +925,43 @@ def _budget_usage(session: dict[str, Any]) -> tuple[int, int, str]:
     tokens = int(budget.get("known_tokens", 0) or 0)
     cost = str(budget.get("known_cost", "0") or "0")
     return steps, tokens, cost
+
+
+# --- Прогресс прогона -------------------------------------------------------
+
+
+class Progress:
+    """Обработчик прогресса прогона (пишет в stderr, сериализует строки)."""
+
+    def __init__(self, total: int, *, write: Callable[[str], None] | None = None) -> None:
+        self._total = total
+        self._writer = write if write is not None else lambda text: print(text, file=sys.stderr)
+        self._lock = asyncio.Lock()
+
+    async def header(self, text: str) -> None:
+        """Вывести строку-заголовок (run_id, число задач, путь к JSONL)."""
+        async with self._lock:
+            self._writer(text)
+
+    async def report(self, k: int, result: CaseResult) -> None:
+        """Вывести строку прогресса после завершения одной задачи.
+
+        Формат: [k/N] <task> #n: pass|fail status=<...> reason=<...>
+        steps=<...> cost=<...> <секунды>s.
+        """
+        outcome = "pass" if result.passed else "fail"
+        reason = (
+            result.safety_violations[0]
+            if result.safety_violations
+            else (result.stop_reason or result.status)
+        )
+        line = (
+            f"[{k}/{self._total}] {result.task} #{result.n}: {outcome} "
+            f"status={result.status} reason={reason} steps={result.steps} "
+            f"cost={result.known_cost} {result.seconds:.1f}s"
+        )
+        async with self._lock:
+            self._writer(line)
 
 
 async def _handle_approvals(
@@ -826,7 +973,12 @@ async def _handle_approvals(
         arguments = approval.get("arguments", {}) or {}
         decision, reason = approve_call(tool, arguments)
         if decision:
-            await api.resolve_approval(approval["id"], "approve", "bench policy")
+            try:
+                await api.resolve_approval(approval["id"], "approve", "bench policy")
+            except _ApprovalConflict:
+                # Сессия уже остановлена бюджетом, подтверждение не нужно:
+                # не ошибка, цикл опроса продолжается до терминального статуса.
+                continue
         else:
             await api.resolve_approval(approval["id"], "reject", reason or "denied by bench policy")
             rejections.append({"tool": tool, "reason": reason or "denied"})
@@ -1155,6 +1307,29 @@ def _new_run_id() -> str:
 
 CaseRunner = Callable[..., Awaitable[CaseResult]]
 SnapshotBuilder = Callable[..., Path]
+ResultsWriter = Callable[..., Awaitable[None]]
+
+
+def write_jsonl_line(path: Path, result: CaseResult) -> None:
+    """Дописать одну строку JSONL в файл результатов (append + flush)."""
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(result.as_json(), ensure_ascii=False) + "\n")
+        handle.flush()
+
+
+def make_results_writer(path: Path) -> ResultsWriter:
+    """Создать coroutine-функцию дописывания JSONL, сериализующую вызовы.
+
+    Один asyncio.Lock на прогон гарантирует, что строки из параллельных задач
+    не перемешиваются: запись каждой строки атомарна относительно остальных.
+    """
+    lock = asyncio.Lock()
+
+    async def write(result: CaseResult) -> None:
+        async with lock:
+            write_jsonl_line(path, result)
+
+    return write
 
 
 async def run_all(
@@ -1163,10 +1338,12 @@ async def run_all(
     transport: httpx.AsyncBaseTransport | None = None,
     case_runner: CaseRunner | None = None,
     snapshot_builder: SnapshotBuilder | None = None,
+    progress: Progress | None = None,
 ) -> tuple[list[CaseResult], str]:
     """Выполнить все повторы задач и вернуть (результаты, run_id).
 
     ``transport``, ``case_runner`` и ``snapshot_builder`` предназначены для тестов.
+    ``progress`` — обработчик прогресса (строки заголовка и «[k/N] ...»).
     """
     run_id = _new_run_id()
     tasks = load_tasks(options.tasks_dir, options.only or None)
@@ -1182,23 +1359,39 @@ async def run_all(
     runner = case_runner or run_case
     semaphore = asyncio.Semaphore(options.parallel)
     cases = [(task, n) for task in tasks for n in range(1, options.repeat + 1)]
+    case_count = len(cases)
+    writer = make_results_writer(results_path)
+    if progress is None:
+        progress = Progress(case_count)
 
     async with httpx.AsyncClient(
         base_url=options.base_url, timeout=timeout, transport=transport
     ) as client:
         csrf = await login(client, options.base_url, code)
         api = BenchApi(client, options.base_url.rstrip("/"), csrf)
+        if progress is not None:
+            await progress.header(f"run_id={run_id} tasks={case_count} results={results_path}")
+
+        done = 0
+        done_lock = asyncio.Lock()
 
         async def work(task: Task, n: int) -> CaseResult:
+            nonlocal done
             async with semaphore:
                 snapshot = builder(task, snapshot_target(options.work_dir, task, n, run_id))
-                return await runner(api, task, n, snapshot, options.profile)
+                try:
+                    result = await runner(api, task, n, snapshot, options.profile)
+                except Exception as exc:  # noqa: BLE001 — изоляция одной задачи от остального прогона
+                    result = _runner_error_result(task, n, exc)
+            if progress is not None:
+                async with done_lock:
+                    done += 1
+                    await progress.report(done, result)
+            await writer(result)
+            return result
 
         results = list(await asyncio.gather(*(work(task, n) for task, n in cases)))
 
-    with results_path.open("w", encoding="utf-8") as handle:
-        for result in results:
-            handle.write(json.dumps(result.as_json(), ensure_ascii=False) + "\n")
     return results, run_id
 
 
@@ -1214,17 +1407,35 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="взять код входа из лога сервера; по умолчанию выпускается новый код",
     )
     parser.add_argument("--tasks", default=str(DEFAULT_TASKS_DIR), help="каталог задач (*.toml)")
-    parser.add_argument("--only", nargs="*", metavar="ID", help="прогнать только эти id задач")
+    parser.add_argument(
+        "--only", nargs="*", metavar="ID", help="прогнать или проверить только эти id задач"
+    )
     parser.add_argument("--repeat", type=int, default=1, help="число повторов каждой задачи")
     parser.add_argument("--parallel", type=int, default=3, help="максимум параллельных прогонов")
     parser.add_argument("--profile", default="main", help="профиль LLM для сессий")
     parser.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="каталог результатов")
+    parser.add_argument(
+        "--validate", action="store_true", help="проверить задачи, не запуская сервер"
+    )
+    parser.add_argument("--repo", default=None, help="каталог git-репозитория с fix-коммитами")
     return parser.parse_args(argv)
 
 
 def _main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
+        if args.validate:
+            tasks = load_tasks(Path(args.tasks), tuple(args.only or []))
+            repo = Path(args.repo).resolve() if args.repo else None
+            fail = False
+            for task_id, reasons in validate_tasks(tasks, repo=repo):
+                if reasons:
+                    print(f"bad {task_id}: {'; '.join(reasons)}")
+                    fail = True
+                else:
+                    print(f"ok {task_id}")
+            return 1 if fail else 0
+
         if args.repeat < 1:
             raise BenchError("--repeat must be >= 1")
         if args.parallel < 1:
