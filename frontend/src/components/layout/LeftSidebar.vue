@@ -265,7 +265,7 @@ function isSelected(item: VisNode): boolean {
 
 <template>
   <div class="left-sidebar">
-    <section class="left-sidebar__section">
+    <section class="left-sidebar__section left-sidebar__section--projects">
       <div class="sidebar-heading">
         <span class="sidebar-heading__title">Проекты</span>
         <button
@@ -428,8 +428,15 @@ function isSelected(item: VisNode): boolean {
   min-height: 0;
 }
 
+/* A long project list scrolls on its own and leaves space for the sessions and the footer. */
+.left-sidebar__section--projects {
+  flex: 0 1 auto;
+  max-height: 40%;
+  overflow-y: auto;
+}
+
 .left-sidebar__section--grow {
-  flex: 1;
+  flex: 1 1 0;
   display: flex;
   flex-direction: column;
   overflow-y: auto;
@@ -676,6 +683,7 @@ function isSelected(item: VisNode): boolean {
 }
 
 .left-sidebar__footer {
+  flex: none;
   padding: 8px;
   border-top: 1px solid var(--border);
   display: flex;
