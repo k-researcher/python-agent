@@ -222,8 +222,9 @@ async def budget_block_reason(
 
     ``new_run`` is True when the caller starts a new run generation (sending a
     message, Start): the new run receives fresh steps and a fresh start, but not
-    fresh money. Decisions on an approval of the current run pass ``new_run=False``
-    and keep the live step and deadline accounting.
+    fresh money. Decisions on an approval of the current run pass ``new_run=False``:
+    they keep the live deadline but ignore the step counter, because the tools of the
+    last allowed step may still run; the runtime denies the next inference.
     """
     if new_run:
         summary = await summarize_session_usage(db, session.id)
@@ -237,7 +238,7 @@ async def budget_block_reason(
         )
         return check_budget(budget_limits(settings, session), usage, now).reason
     usage = await load_budget_usage(db, session, now)
-    return check_budget(budget_limits(settings, session), usage, now).reason
+    return check_budget(budget_limits(settings, session), replace(usage, steps=0), now).reason
 
 
 async def check_attempt_budget(

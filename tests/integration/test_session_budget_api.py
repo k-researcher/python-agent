@@ -72,6 +72,19 @@ def _set_cost_spent(session_id: str, *, amount: str) -> None:
     asyncio.run(apply())
 
 
+def _set_cost_limit(session_id: str, amount: str) -> None:
+    async def apply() -> None:
+        async with session_factory() as db:
+            row = await db.get(Session, session_id)
+            assert row is not None
+            state = dict(row.budget_state or {})
+            state["limits"] = {**state.get("limits", {}), "max_cost": amount}
+            row.budget_state = state
+            await db.commit()
+
+    asyncio.run(apply())
+
+
 def _advance_run_generation(session_id: str) -> None:
     async def apply() -> None:
         async with session_factory() as db:
@@ -276,7 +289,7 @@ def test_money_exhausted_blocks_new_run_with_409(tmp_path: Path) -> None:
         assert "cost_exhausted" in response.json()["detail"]
 
 
-def test_approval_on_budget_exhausted_session_returns_409(tmp_path: Path) -> None:
+def test_approval_on_cost_exhausted_session_returns_409(tmp_path: Path) -> None:
     original_llm = supervisor.llm
     supervisor.llm = FakeApproval()  # type: ignore[assignment]
     try:
@@ -297,12 +310,13 @@ def test_approval_on_budget_exhausted_session_returns_409(tmp_path: Path) -> Non
                     break
                 time.sleep(0.02)
             assert approvals, "no approval was created"
-            _set_budget_blocked(session_id, reason="steps_exhausted")
+            _set_cost_limit(session_id, "0.5")
+            _set_cost_spent(session_id, amount="0.5")
             response = client.post(
                 f"/api/approvals/{approvals[0]['id']}",
                 json={"decision": "approve"},
             )
             assert response.status_code == 409
-            assert "steps_exhausted" in response.json()["detail"]
+            assert "cost_exhausted" in response.json()["detail"]
     finally:
         supervisor.llm = original_llm

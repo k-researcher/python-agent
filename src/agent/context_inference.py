@@ -31,6 +31,7 @@ from agent.reasoning import ReasoningDecision
 from agent.session_budget_store import BudgetExceeded, check_attempt_budget
 from agent.summary_runner import summary_effort
 from agent.token_calibration import CalibrationKey
+from agent.usage_ledger import attempt_detail
 from agent.wire import (
     WireRequest,
     body_sha256,
@@ -195,6 +196,7 @@ class ContextInference:
                             "wire_version": request.wire_version,
                             "raw_estimate": estimate_wire(request),
                             "factor": calibration.factor,
+                            "detail": attempt_detail(int(request.payload["max_tokens"])),
                         },
                         record,
                         pricing=model.pricing,

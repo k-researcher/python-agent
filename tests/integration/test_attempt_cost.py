@@ -35,7 +35,9 @@ async def audit_session(tmp_path: Path) -> tuple[str, CalibrationKey]:
 
 
 async def _start(
-    audit_session: tuple[str, CalibrationKey], pricing: PricingSpec | None
+    audit_session: tuple[str, CalibrationKey],
+    pricing: PricingSpec | None,
+    detail: str | None = None,
 ) -> tuple[int, AttemptRecord]:
     session_id, key = audit_session
     record = AttemptRecord(0, "started", 321, "a" * 64)
@@ -52,6 +54,7 @@ async def _start(
             "wire_version": key.wire_version,
             "raw_estimate": 100,
             "factor": 1.0,
+            **({"detail": detail} if detail is not None else {}),
         },
         record,
         pricing=pricing,
@@ -562,3 +565,49 @@ async def test_context_inference_passes_model_pricing_to_persisted_attempt(
     assert rows[0].pricing_snapshot == pricing.model_dump()
     assert isinstance(rows[0].cost_amount, str)
     assert Decimal(rows[0].cost_amount) == Decimal("0.0000003")
+    assert json.loads(rows[0].detail)["max_output_tokens"] > 0
+
+
+async def test_attempt_without_usage_counts_at_its_upper_bound(
+    audit_session: tuple[str, CalibrationKey],
+) -> None:
+    from agent.usage_ledger import attempt_detail, summarize_session_usage
+
+    pricing = PricingSpec(input_per_mtok=1, output_per_mtok=2)
+    cancelled, _ = await _start(audit_session, pricing, attempt_detail(1000))
+    await cancel_attempt(cancelled)
+    timed_out, initial = await _start(audit_session, pricing, attempt_detail(1000))
+    await finish_attempt(
+        timed_out, replace(initial, status="error", error_kind="timeout"), audit_session[1]
+    )
+    async with session_factory() as db:
+        summary = await summarize_session_usage(db, audit_session[0])
+    # Each attempt: 321 request bytes as input tokens plus 1000 output tokens.
+    _assert_summary(summary, attempts=2, tokens=2 * 1321, cost="0.004642")
+
+
+async def test_bounded_attempt_without_pricing_keeps_cost_unknown(
+    audit_session: tuple[str, CalibrationKey],
+) -> None:
+    from agent.usage_ledger import attempt_detail, summarize_session_usage
+
+    audit_id, initial = await _start(audit_session, None, attempt_detail(1000))
+    await finish_attempt(
+        audit_id, replace(initial, status="error", error_kind="timeout"), audit_session[1]
+    )
+    async with session_factory() as db:
+        summary = await summarize_session_usage(db, audit_session[0])
+    _assert_summary(summary, attempts=1, tokens=1321, cost="0", unknown_cost=True)
+
+
+async def test_completed_attempt_without_usage_stays_unknown(
+    audit_session: tuple[str, CalibrationKey],
+) -> None:
+    from agent.usage_ledger import attempt_detail, summarize_session_usage
+
+    pricing = PricingSpec(input_per_mtok=1, output_per_mtok=2)
+    audit_id, initial = await _start(audit_session, pricing, attempt_detail(1000))
+    await finish_attempt(audit_id, replace(initial, status="completed"), audit_session[1])
+    async with session_factory() as db:
+        summary = await summarize_session_usage(db, audit_session[0])
+    _assert_summary(summary, attempts=1, tokens=0, cost="0", unknown_tokens=True, unknown_cost=True)

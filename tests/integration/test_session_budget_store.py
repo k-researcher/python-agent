@@ -341,13 +341,12 @@ async def test_budget_block_reason_when_allowed_and_blocked(
         row = await db.get(Session, session_id)
         assert row is not None
         assert await budget_block_reason(db, _settings(), row, NOW, new_run=False) is None
+    # A decision on the current run lets the tools of the last allowed step run.
     await _with_budget_state(session_id, run_generation=1, limits={"max_steps": 3}, steps=3)
     async with session_factory() as db:
         row = await db.get(Session, session_id)
         assert row is not None
-        assert (
-            await budget_block_reason(db, _settings(), row, NOW, new_run=False) == "steps_exhausted"
-        )
+        assert await budget_block_reason(db, _settings(), row, NOW, new_run=False) is None
 
 
 async def test_budget_block_reason_new_run_ignores_steps_and_deadline(

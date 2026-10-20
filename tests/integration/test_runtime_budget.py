@@ -438,3 +438,21 @@ def test_resumed_approved_tool_is_refused_after_the_deadline(
         assert body["error"] is None
         assert body["budget"]["stop_reason"] == "deadline_exceeded"
     assert not (tmp_path / "out.txt").exists()
+
+
+def test_approved_tool_of_the_last_allowed_step_runs(tmp_path: Path) -> None:
+    replies = [
+        LLMResponse(None, [_write_call("out.txt")], "tool_calls", 10, 5),
+        LLMResponse("done", [], "stop", 10, 5),
+    ]
+    with authed_client() as client, _fake_llm(ScriptedLLM(replies)) as fake:
+        session_id = _create_run(client, tmp_path, "last-step", fake, budget={"max_steps": 1})
+        wait_for(client, session_id, "awaiting_confirmation")
+        approval = client.get(f"/api/sessions/{session_id}/approvals").json()[0]
+        resolved = client.post(f"/api/approvals/{approval['id']}", json={"decision": "approve"})
+        assert resolved.status_code == 200, resolved.text
+        wait_for(client, session_id, "stopped")
+        body = client.get(f"/api/sessions/{session_id}").json()
+        assert body["budget"]["stop_reason"] == "steps_exhausted"
+        assert fake.calls == 1
+    assert (tmp_path / "out.txt").read_text() == "x"
