@@ -285,6 +285,62 @@ class SshExecTool(Tool):
             raise
 
 
+class ListDbConnectionsTool(Tool):
+    name = "list_db_connections"
+    description = "List configured read-only database connections without credentials."
+    risk_level = RiskLevel.read_only
+    network_capability = True
+    input_schema = {"type": "object", "additionalProperties": False}
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        del context, arguments
+        connections: list[dict[str, Any]] = []
+        for conn_id, url in self.settings.database_connections.items():
+            try:
+                parsed = make_url(url)
+            except Exception:
+                continue
+            driver = parsed.get_backend_name()
+            connections.append(
+                {
+                    "id": conn_id,
+                    "driver": driver.split("+", 1)[0],
+                    "host": parsed.host,
+                    "port": parsed.port,
+                    "database": parsed.database,
+                }
+            )
+        return {"connections": connections}
+
+
+class ListSshConnectionsTool(Tool):
+    name = "list_ssh_connections"
+    description = "List configured SSH connections with safe public fields only."
+    risk_level = RiskLevel.read_only
+    network_capability = True
+    input_schema = {"type": "object", "additionalProperties": False}
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        del context, arguments
+        connections: list[dict[str, Any]] = []
+        for conn_id, config in sorted(self.settings.ssh_connections.items()):
+            entry: dict[str, Any] = {
+                "id": conn_id,
+                "host": config.get("host"),
+                "port": config.get("port", 22),
+            }
+            if config.get("description"):
+                entry["description"] = config["description"]
+            connections.append(entry)
+        return {"connections": connections}
+
+
 class ExcelSheetsTool(Tool):
     name = "excel_sheets"
     description = "List worksheet names in an XLSX workbook inside the project."
@@ -427,6 +483,8 @@ def advanced_tools(settings: Settings) -> tuple[Tool, ...]:
         DbSelectTool(settings),
         DbExecuteTool(settings),
         SshExecTool(settings),
+        ListDbConnectionsTool(settings),
+        ListSshConnectionsTool(settings),
         ExcelSheetsTool(),
         ExcelReadTool(),
         RunAgentTool(settings),

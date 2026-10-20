@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import platform
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,12 @@ from agent.session_budget_store import (
 from agent.skill_prompt import load_skill_set, skill_prompt_section
 
 
+def _session_created_at_iso(created_at: datetime | None = None) -> str:
+    """ISO 8601 timestamp with the server timezone (overridable by tests)."""
+    now = created_at or datetime.now().astimezone()
+    return now.isoformat(timespec="seconds")
+
+
 async def create_session_record(
     db: AsyncSession,
     settings: Settings,
@@ -35,6 +43,7 @@ async def create_session_record(
     actor_user_id: str | None = None,
     configuration: dict[str, Any] | None = None,
     budget: SessionBudgetRequest | None = None,
+    created_at: datetime | None = None,
 ) -> Session:
     model = select_model(await effective_registry(db, settings), llm_profile, role=mode)
     selected_profile = model.id
@@ -49,6 +58,10 @@ async def create_session_record(
     if rule:
         system_prompt += f"\n\n{rule}"
     system_prompt += f"\n\nКорневая директория проекта: `{project.root_path}`"
+    system_prompt += (
+        f"\n\nДата и время создания сессии: {_session_created_at_iso(created_at)}\n"
+        f"Семейство ОС сервера: {platform.system()}"
+    )
     skills = load_skill_set(Path(project.root_path), None)
     section = skill_prompt_section(skills)
     if section:
