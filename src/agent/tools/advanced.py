@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import shlex
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from agent.config import Settings
 from agent.security import PathGuard
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 from agent.tools.network import pinned_client, validate_outbound_url
+from agent.trusted_commands import trusted_remote_command
 
 MAX_WORKBOOK_BYTES = 50_000_000
 MAX_WORKBOOK_UNCOMPRESSED_BYTES = 200_000_000
@@ -250,6 +252,12 @@ class SshExecTool(Tool):
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
+    def call_risk(self, arguments: dict[str, Any], project_root: Path | None) -> RiskLevel:
+        """A plain read-only command that names no secret file needs no approval."""
+        if trusted_remote_command(str(arguments.get("command", ""))):
+            return RiskLevel.read_only
+        return self.risk_level
+
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
         name = str(arguments["connection"])
         config = self.settings.ssh_connections.get(name)
@@ -258,6 +266,8 @@ class SshExecTool(Tool):
         if not config.get("known_hosts"):
             raise ToolError("SSH connection must configure known_hosts")
         command = str(arguments["command"])
+        if trusted_remote_command(command):
+            command = f"command -p {shlex.join(shlex.split(command))}"
         await audit(context, "ssh", name, "exec", command, "started")
         options: dict[str, Any] = {
             "host": config["host"],

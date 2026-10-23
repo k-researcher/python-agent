@@ -17,6 +17,7 @@ from agent.security import PathGuard, PathSecurityError
 if TYPE_CHECKING:
     from agent.safe_fs import SafeProjectFS
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
+from agent.trusted_commands import trusted_local_command, trusted_program_path
 
 MAX_TEXT_BYTES = 1_000_000
 MAX_COMMAND_OUTPUT = 100_000
@@ -429,11 +430,21 @@ class ShellTool(Tool):
                 "Use paths relative to the project root."
             )
 
+    def call_risk(self, arguments: dict[str, Any], project_root: Path | None) -> RiskLevel:
+        """A plain read-only command inside the project needs no approval."""
+        command = str(arguments.get("command", ""))
+        if project_root is not None and trusted_local_command(command, project_root):
+            return RiskLevel.read_only
+        return self.risk_level
+
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
         self.check_arguments(arguments)
         command = shlex.split(str(arguments["command"]))
         if not command:
             raise ToolError("Command is empty")
+        trusted_path = trusted_program_path(command[0])
+        if trusted_path is not None:
+            command[0] = trusted_path
         safe_environment = {
             name: os.environ[name]
             for name in (

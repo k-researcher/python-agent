@@ -71,7 +71,7 @@ from agent.source_execution import capture_source_revision, validate_source_exec
 from agent.source_lifecycle import source_registry
 from agent.tool_batch import BatchCall, BatchResult, is_parallel_safe, run_batch
 from agent.tools import ToolRegistry
-from agent.tools.base import Tool, ToolContext, ToolError
+from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 from agent.tools.mcp_tools import McpBackedTool
 from agent.tools.skill_tools import ReadSkillTool
 
@@ -930,6 +930,11 @@ class AgentSupervisor:
 
                 requires_approval = False
                 truncated = response.finish_reason == "length"
+                # The project root lets a tool prove that a local command stays inside it.
+                try:
+                    project_root: Path | None = Path(session.project.root_path).resolve(strict=True)
+                except (OSError, RuntimeError):
+                    project_root = None
                 for raw_call in normalized_calls:
                     function = raw_call.get("function", {})
                     name = str(function.get("name", ""))
@@ -948,8 +953,9 @@ class AgentSupervisor:
                                 + (" (the reply was cut off)" if truncated else "")
                             )
                         self._tools.validate(name, session.mode, arguments, model_ids=models.ids())
-                        risk = self._tools.risk(name, session.mode)
-                        confirmation = self._tools.requires_confirmation(name, session.mode)
+                        # One decision: the stored risk and the approval must never disagree.
+                        risk = self._tools.risk(name, session.mode, arguments, project_root)
+                        confirmation = risk is not RiskLevel.read_only
                         revision = capture_source_revision(self._tools.get(name, session.mode))
                     except Exception as exc:
                         call = ToolCall(

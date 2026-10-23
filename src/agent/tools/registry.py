@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
@@ -108,11 +109,31 @@ class ToolRegistry:
             raise ToolError(f"Invalid arguments for {name}: {details}")
         tool.check_arguments(arguments)
 
-    def risk(self, name: str, mode: str) -> RiskLevel:
-        return self.get(name, mode).risk_level
+    def risk(
+        self,
+        name: str,
+        mode: str,
+        arguments: dict[str, Any] | None = None,
+        project_root: Path | None = None,
+    ) -> RiskLevel:
+        """Return the risk of a tool, or of one call when its arguments are given."""
+        tool = self.get(name, mode)
+        if arguments is None or not self.settings.trusted_read_commands:
+            return tool.risk_level
+        try:
+            return tool.call_risk(arguments, project_root)
+        except Exception:
+            # Any doubt keeps the tool's own risk and so the approval.
+            return tool.risk_level
 
-    def requires_confirmation(self, name: str, mode: str) -> bool:
-        return self.risk(name, mode) is not RiskLevel.read_only
+    def requires_confirmation(
+        self,
+        name: str,
+        mode: str,
+        arguments: dict[str, Any] | None = None,
+        project_root: Path | None = None,
+    ) -> bool:
+        return self.risk(name, mode, arguments, project_root) is not RiskLevel.read_only
 
     async def execute(
         self, name: str, mode: str, context: ToolContext, arguments: dict[str, Any]
