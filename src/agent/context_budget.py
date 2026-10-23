@@ -9,7 +9,7 @@ class Budget:
     """Token budget of one LLM request."""
 
     context_window: int
-    output_tokens: int  # max(reserved_tokens, max_tokens)
+    output_tokens: int  # max(min(reserved_tokens, context_window // 4), max_tokens)
     safety_margin: int
     input_tokens: int  # tokens left for the request input
 
@@ -17,6 +17,15 @@ class Budget:
 def safety_margin(context_window: int) -> int:
     """Return max(256, 2 % of context_window), rounded up."""
     return max(256, ceil(context_window * 2 / 100))
+
+
+def reserve_cap(context_window: int) -> int:
+    """Return the largest output reserve for a window: a quarter of it.
+
+    The reserve is one global setting, sized for large windows. Without a cap it can
+    be larger than the whole window of a small local model.
+    """
+    return context_window // 4
 
 
 def input_budget(context_window: int, reserved_tokens: int, max_tokens: int) -> Budget:
@@ -27,7 +36,8 @@ def input_budget(context_window: int, reserved_tokens: int, max_tokens: int) -> 
         raise ValueError("Tokens must be non-negative")
 
     margin = safety_margin(context_window)
-    output = max(reserved_tokens, max_tokens)
+    # The cap applies only to the reserve; max_tokens is the real answer limit.
+    output = max(min(reserved_tokens, reserve_cap(context_window)), max_tokens)
 
     # No lower bound: a budget of zero or less means that the request cannot fit.
     input_tokens = context_window - output - margin

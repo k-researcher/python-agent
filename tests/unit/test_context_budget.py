@@ -41,8 +41,36 @@ def test_input_budget_reserved_higher():
 def test_input_budget_has_no_lower_bound() -> None:
     # A small window must not get a hidden minimum: 1200 - 100 - 256 = 844.
     assert input_budget(1200, 100, 100).input_tokens == 844
-    # The request cannot fit: the budget is zero or less.
-    assert input_budget(1000, 900, 100).input_tokens <= 0
+    # The answer limit itself does not fit: the budget is zero or less.
+    # 1000 - max(min(100, 250), 900) - 256 = -156.
+    assert input_budget(1000, 100, 900).input_tokens <= 0
+
+
+def test_reserve_is_capped_to_a_quarter_of_a_small_window() -> None:
+    # A local model with an 8192 window and the global reserve of 12000.
+    # reserve: min(12000, 8192 // 4) = 2048; output: max(2048, 4096) = 4096
+    # input: 8192 - 4096 - 256 = 3840
+    budget = input_budget(8192, 12000, 4096)
+    assert budget.output_tokens == 4096
+    assert budget.input_tokens == 3840
+
+
+def test_capped_reserve_wins_over_a_smaller_answer_limit() -> None:
+    # reserve: min(12000, 2048) = 2048; output: max(2048, 1000) = 2048
+    # input: 8192 - 2048 - 256 = 5888
+    budget = input_budget(8192, 12000, 1000)
+    assert budget.output_tokens == 2048
+    assert budget.input_tokens == 5888
+
+
+def test_large_window_keeps_the_full_reserve() -> None:
+    # A quarter of 256000 is 64000, so the reserve of 12000 is not cut.
+    # margin: ceil(5120) = 5120
+    assert input_budget(256000, 12000, 8192).output_tokens == 12000
+    # The answer limit is larger than the reserve: output 16000.
+    budget = input_budget(256000, 12000, 16000)
+    assert budget.output_tokens == 16000
+    assert budget.input_tokens == 256000 - 16000 - 5120
 
 
 def test_overflow_target():
