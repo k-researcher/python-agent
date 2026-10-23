@@ -22,7 +22,7 @@ providers:
   #   kind: openai
   #   base_url: https://api.z.ai/api/paas/v4
   #   api_key_env: ZAI_API_KEY
-  # local_server:                   # локальный сервер
+  # lmstudio:                       # LM Studio, локальный сервер
   #   kind: openai
   #   base_url: http://127.0.0.1:1234/v1
   #   api_key_env: null
@@ -56,7 +56,7 @@ models:
     max_tokens: 8192
     reasoning: {supported: false}
   # local:                          # локальная модель
-  #   provider: local_server
+  #   provider: lmstudio
   #   model: gemma-4-26b-a4b-it-mlx  # точный ID модели на сервере
   #   context_window: 8192          # = длина контекста, с которой модель загружена
   #   max_tokens: 2048
