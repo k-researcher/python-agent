@@ -6,6 +6,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from agent.config import Settings
+from agent.modes import tool_profile
 from agent.tools.advanced import advanced_tools
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 from agent.tools.builtin import BUILTIN_TOOLS
@@ -80,12 +81,12 @@ class ToolRegistry:
                 },
             }
             for tool in self._tools.values()
-            if mode in tool.allowed_modes and self._enabled(tool)
+            if tool_profile(mode) in tool.allowed_modes and self._enabled(tool)
         ]
 
     def get(self, name: str, mode: str) -> Tool:
         tool = self._tools.get(name)
-        if tool is None or mode not in tool.allowed_modes or not self._enabled(tool):
+        if tool is None or tool_profile(mode) not in tool.allowed_modes or not self._enabled(tool):
             raise ToolError(f"Tool is unavailable in mode {mode}: {name}")
         return tool
 

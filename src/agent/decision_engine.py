@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol, TypeVar
 
+from agent.modes import tool_profile
 from agent.reasoning import EFFORT_ORDER
 from agent.tools.base import RiskLevel
 
@@ -113,7 +114,7 @@ class RuleEngine:
         return Decision(ids, "risk, wait, then id", 1.0, self.engine)
 
     def _target_level(self, task: TaskFeatures) -> str:
-        level = _BASE_ASK if task.mode == "ask" else _BASE_DEV
+        level = _BASE_ASK if tool_profile(task.mode) == "ask" else _BASE_DEV
         if task.has_code:
             level = self._next_level(level)
         if task.prompt_chars >= LONG_TASK_CHARS:

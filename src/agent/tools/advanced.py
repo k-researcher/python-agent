@@ -16,6 +16,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from agent.config import Settings
+from agent.modes import MODES
 from agent.security import PathGuard
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 from agent.tools.network import pinned_client, validate_outbound_url
@@ -451,7 +452,7 @@ class RunAgentTool(Tool):
         self.input_schema = {
             "type": "object",
             "properties": {
-                "mode": {"type": "string", "enum": ["dev", "ask"]},
+                "mode": {"type": "string", "enum": list(MODES)},
                 "prompt": {"type": "string"},
                 "wait": {"type": "boolean", "default": True},
                 "llm_profile": {

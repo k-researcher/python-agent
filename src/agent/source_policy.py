@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from agent.modes import tool_profile
 from agent.workspace_policy import workspace_capabilities
 
 
@@ -75,6 +76,6 @@ def can_use_source(
         and project_workspace_id == source.workspace_id
         and (not source.project_ids or project_id in source.project_ids)
         and workspace_capabilities(actor.role).run_agent
-        and mode in {"dev", "ask"}
-        and mode in source.allowed_modes
+        and tool_profile(mode) in {"dev", "ask"}
+        and tool_profile(mode) in source.allowed_modes
     )

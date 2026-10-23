@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from agent.modes import tool_profile
+
 EventKind = Literal["message", "reasoning", "command", "file_change", "usage", "error", "other"]
 
 _CMD = "exec"
@@ -67,7 +69,7 @@ def build_command(spec: CliRunSpec) -> list[str]:
         raise ValueError("The project root must exist")
     if spec.model in spec.forbidden_models:
         raise ValueError("This model is forbidden")
-    sandbox = _SANDBOX_ASK if spec.mode == "ask" else _SANDBOX_DEV
+    sandbox = _SANDBOX_ASK if tool_profile(spec.mode) == "ask" else _SANDBOX_DEV
     command = [
         spec.binary,
         _CMD,

@@ -41,6 +41,7 @@ from agent.models import (
     ToolCallStatus,
     utcnow,
 )
+from agent.modes import ROLE_PROFILES
 from agent.queue import RedisTaskQueue
 from agent.reasoning import ReasoningDecision, decide, lower_effort
 from agent.sandbox import policy_from_settings
@@ -1344,7 +1345,7 @@ class AgentSupervisor:
         depth = int((parent.configuration or {}).get("depth", 0))
         if depth >= self.settings.max_child_depth:
             raise RuntimeError(f"Maximum child depth is {self.settings.max_child_depth}")
-        if mode not in {"dev", "ask"}:
+        if mode not in ROLE_PROFILES:
             raise ValueError(f"Unsupported child mode: {mode}")
         async with session_factory() as db:
             selected_profile = select_model(
