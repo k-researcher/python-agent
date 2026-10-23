@@ -180,6 +180,13 @@ class ProviderSpec(_Spec):
         return _check_http_url(value)
 
 
+class ReasoningTagsSpec(_Spec):
+    """Tags around a reasoning block that a model writes into its answer text."""
+
+    start: str = Field(min_length=1)
+    end: str = Field(min_length=1)
+
+
 class ReasoningSpec(_Spec):
     supported: bool = False
     allowed_efforts: list[str] = Field(default_factory=list)
@@ -188,6 +195,8 @@ class ReasoningSpec(_Spec):
     # Which earlier reasoning texts go back to the model: none, the current turn (since the
     # last user message, for tool loops) or all of them.
     history: Literal["none", "current_turn", "all"] = "none"
+    # The block between these tags moves from the answer to the reasoning; see reasoning_tags.
+    tags: ReasoningTagsSpec | None = None
 
     @field_validator("allowed_efforts")
     @classmethod
