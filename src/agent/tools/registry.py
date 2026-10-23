@@ -14,7 +14,7 @@ from agent.tools.check_tools import RunChecksTool
 from agent.tools.git_tools import GitDiffTool, GitLogTool, GitShowTool, GitStatusTool
 from agent.tools.knowledge import knowledge_tools
 from agent.tools.patch_tools import ApplyPatchTool, EditByLinesTool
-from agent.tools.session_tools import ReadSessionTool
+from agent.tools.session_tools import GetProjectsTool, ReadSessionTool
 from agent.tools.todo_tools import TodoReadTool, TodoWriteTool
 from agent.tools.web_fetch import WebFetchTool
 
@@ -50,6 +50,7 @@ class ToolRegistry:
                 TodoWriteTool(),
                 TodoReadTool(),
                 ReadSessionTool(),
+                GetProjectsTool(),
                 *advanced_tools(self.settings),
                 WebFetchTool(self.settings),
                 *knowledge_tools(self.settings),

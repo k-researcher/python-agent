@@ -58,6 +58,23 @@ def test_trusted_commands_can_be_turned_off(tmp_path: Path) -> None:
     assert registry.requires_confirmation("shell", "dev", {"command": "ls"}, tmp_path) is True
 
 
+def test_get_projects_is_registered_only_for_write_capable_profiles() -> None:
+    registry = ToolRegistry()
+    for mode in ("dev", "pm", "qa", "devops"):
+        tool = registry.get("get_projects", mode)
+        assert tool.risk_level is RiskLevel.read_only
+        assert tool.parallel_safe is False
+        assert registry.requires_confirmation("get_projects", mode) is False
+        registry.validate("get_projects", mode, {})
+        with pytest.raises(ToolError, match="Invalid arguments"):
+            registry.validate("get_projects", mode, {"workspace_id": "foreign"})
+        definitions = registry.definitions(mode)
+        assert any(item["function"]["name"] == "get_projects" for item in definitions)
+    for mode in ("ask", "arch", "cybersec", "analyst"):
+        with pytest.raises(ToolError, match="unavailable"):
+            registry.get("get_projects", mode)
+
+
 def test_object_schemas_without_properties_get_an_empty_properties_map() -> None:
     # Argument-free object schemas include an explicit properties map.
     registry = ToolRegistry()
