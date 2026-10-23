@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from agent.llm import LLMError, LLMResponse, error_for, stream_error_info, token_count
+from agent.reasoning_tags import Part, ReasoningTagSplitter
+
+if TYPE_CHECKING:
+    from agent.model_config import ReasoningTagsSpec
 
 
 @dataclass(frozen=True)
@@ -88,17 +92,27 @@ class SSEDecoder:
 class ChatStreamAccumulator:
     """Collect OpenAI chat.completion.chunk payloads into an LLMResponse."""
 
-    def __init__(self) -> None:
+    def __init__(self, reasoning_tags: ReasoningTagsSpec | None = None) -> None:
         self._content: list[str] = []
         self._reasoning: list[str] = []
         self._tool_calls: dict[int, _ToolCallAccumulator] = {}
         self._finish_reason: str | None = None
         self._usage: dict[str, Any] | None = None
+        # With tags, a reasoning block inside the content goes to the reasoning.
+        self._splitter = (
+            ReasoningTagSplitter(reasoning_tags.start, reasoning_tags.end)
+            if reasoning_tags is not None
+            else None
+        )
 
     def add(self, data: str) -> list[StreamEvent]:
         """Process one decoded data value; ``[DONE]`` marks the end of the stream."""
         if data == "[DONE]":
-            return [StreamEvent(kind="done")]
+            events: list[StreamEvent] = []
+            if self._splitter is not None:
+                self._add_parts(self._splitter.close(), events)
+            events.append(StreamEvent(kind="done"))
+            return events
         try:
             payload = json.loads(data)
         except json.JSONDecodeError as exc:
@@ -110,7 +124,7 @@ class ChatStreamAccumulator:
             info = stream_error_info(error)
             raise error_for(info, f"LLM stream error: {info.message}")
 
-        events: list[StreamEvent] = []
+        events = []
         choices = payload.get("choices")
         if isinstance(choices, list) and choices:
             choice = choices[0]
@@ -127,8 +141,11 @@ class ChatStreamAccumulator:
         if isinstance(delta, dict):
             content = delta.get("content")
             if isinstance(content, str) and content:
-                self._content.append(content)
-                events.append(StreamEvent(kind="content", text=content))
+                if self._splitter is not None:
+                    self._add_parts(self._splitter.feed(content), events)
+                else:
+                    self._content.append(content)
+                    events.append(StreamEvent(kind="content", text=content))
             reasoning = delta.get("reasoning_content") or delta.get("reasoning")
             if isinstance(reasoning, str) and reasoning:
                 self._reasoning.append(reasoning)
@@ -142,6 +159,13 @@ class ChatStreamAccumulator:
         if isinstance(finish_reason, str) and finish_reason:
             self._finish_reason = finish_reason
             events.append(StreamEvent(kind="finish"))
+
+    def _add_parts(self, parts: list[Part], events: list[StreamEvent] | None) -> None:
+        """Store split parts; add stream events when ``events`` is given."""
+        for kind, text in parts:
+            (self._content if kind == "content" else self._reasoning).append(text)
+            if events is not None:
+                events.append(StreamEvent(kind=kind, text=text))
 
     def _apply_tool_call(self, part: dict[str, Any], events: list[StreamEvent]) -> None:
         raw_index = part.get("index")
@@ -176,6 +200,9 @@ class ChatStreamAccumulator:
 
     def result(self) -> LLMResponse:
         """Build the final LLMResponse from all collected chunks."""
+        if self._splitter is not None:
+            # A stream without "[DONE]" can still hold a tail.
+            self._add_parts(self._splitter.close(), None)
         content = "".join(self._content) or None
         reasoning = "".join(self._reasoning) or None
         tool_calls: list[dict[str, Any]] = []

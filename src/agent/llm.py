@@ -16,7 +16,7 @@ from agent.llm_errors import (
     classify_http_error,
 )
 from agent.llm_functions_dialect import from_functions_response, from_functions_stream_delta
-from agent.model_config import SUPPORTED_TRANSPORTS, ResolvedModel
+from agent.model_config import SUPPORTED_TRANSPORTS, ReasoningTagsSpec, ResolvedModel
 from agent.provider_auth import (
     AuthError,
     AuthProvider,
@@ -28,6 +28,7 @@ from agent.provider_auth import (
     OAuthClientCredentials,
     build_ssl_context,
 )
+from agent.reasoning_tags import split_reasoning
 from agent.redaction import redact
 from agent.wire import WireRequest, body_sha256, build_wire_request
 
@@ -398,7 +399,9 @@ class LLMClient:
                     await asyncio.sleep(min(8.0, 2.0**attempt))
                     continue
                 response.raise_for_status()
-                parsed = self._parse_response(self._convert(response.json()))
+                parsed = self._parse_response(
+                    self._convert(response.json()), self.model.reasoning.tags
+                )
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 info = _redacted(
@@ -507,7 +510,8 @@ class LLMClient:
                             await asyncio.sleep(min(8.0, 2.0**attempt))
                             continue
                         raise error_for(info, f"LLM returned HTTP {status}: {info.message}")
-                    decoder, accumulator = SSEDecoder(), ChatStreamAccumulator()
+                    decoder = SSEDecoder()
+                    accumulator = ChatStreamAccumulator(reasoning_tags=self.model.reasoning.tags)
                     async for chunk in response.aiter_bytes():
                         for data in decoder.feed(chunk):
                             for event in accumulator.add(self._convert_chunk(data)):
@@ -654,13 +658,21 @@ class LLMClient:
                 state.error = exc
 
     @staticmethod
-    def _parse_response(body: dict[str, Any]) -> LLMResponse:
+    def _parse_response(
+        body: dict[str, Any], reasoning_tags: ReasoningTagsSpec | None = None
+    ) -> LLMResponse:
         choice = body["choices"][0]
         message = choice.get("message", {})
         usage = body.get("usage", {})
         reasoning = message.get("reasoning_content") or message.get("reasoning")
+        content = message.get("content")
+        if reasoning_tags is not None and isinstance(content, str):
+            content, tagged = split_reasoning(content, reasoning_tags.start, reasoning_tags.end)
+            content = content or None
+            if tagged:
+                reasoning = (reasoning if isinstance(reasoning, str) else "") + tagged
         return LLMResponse(
-            content=message.get("content"),
+            content=content,
             tool_calls=message.get("tool_calls") or [],
             finish_reason=choice.get("finish_reason", "stop"),
             prompt_tokens=token_count(usage, "prompt_tokens"),

@@ -127,6 +127,7 @@ def test_reasoning_field_merge_and_reset(client: TestClient) -> None:
         "default_effort": None,
         "wire_parameter": None,
         "history": "none",
+        "tags": None,
     }
     assert entry["max_tokens"] == 2000
     assert entry["context_window"] == 16000
@@ -143,6 +144,20 @@ def test_reasoning_field_merge_and_reset(client: TestClient) -> None:
 
     assert client.portal is not None
     client.portal.call(check_reset)
+
+
+def test_reasoning_tags_can_be_set_and_are_validated(client: TestClient) -> None:
+    tags = {"start": "<|channel>thought", "end": "<channel|>"}
+    changed = client.put(
+        f"{PREFIX}/models/fast", json={"reasoning": {"supported": False, "tags": tags}}
+    )
+    assert changed.status_code == 200, changed.text
+    assert model(changed.json())["reasoning"]["tags"] == tags
+    empty = client.put(
+        f"{PREFIX}/models/fast",
+        json={"reasoning": {"supported": False, "tags": {"start": "", "end": "x"}}},
+    )
+    assert empty.status_code == 422
 
 
 def test_new_ui_model_and_provider_then_delete(client: TestClient) -> None:
