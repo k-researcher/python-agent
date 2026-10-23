@@ -584,3 +584,15 @@ def test_light_model_reference_resolves(tmp_path: Path) -> None:
     data["routing"]["light"] = "small"
     registry = load_models(_write(tmp_path, data), {"MODEL_KEY": _SECRET}, None)
     assert registry.light().model == "small-model"
+
+
+def test_reasoning_tags_are_optional_and_must_not_be_empty() -> None:
+    assert ReasoningSpec().tags is None
+    tags = {"start": "<|reasoning>", "end": "<reasoning|>"}
+    spec = ReasoningSpec.model_validate({"tags": tags})
+    assert spec.tags is not None
+    assert (spec.tags.start, spec.tags.end) == ("<|reasoning>", "<reasoning|>")
+    with pytest.raises(ValidationError):
+        ReasoningSpec.model_validate({"tags": {"start": "", "end": "<reasoning|>"}})
+    with pytest.raises(ValidationError):
+        ReasoningSpec.model_validate({"tags": {"start": "<x>"}})

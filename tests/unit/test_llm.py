@@ -9,7 +9,27 @@ import pytest
 
 from agent.llm import LLMClient, LLMError, LLMTransientError
 from agent.llm_errors import LLMErrorKind
-from agent.model_config import ReasoningSpec, ResolvedModel
+from agent.model_config import ReasoningSpec, ReasoningTagsSpec, ResolvedModel
+
+
+def test_parse_response_moves_tagged_reasoning_out_of_content() -> None:
+    tags = ReasoningTagsSpec(start="<|reasoning>", end="<reasoning|>")
+    body = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"content": "<|reasoning> plan<reasoning|>Answer"},
+            }
+        ]
+    }
+    response = LLMClient._parse_response(body, tags)
+    assert response.content == "Answer"
+    assert response.reasoning == " plan"
+
+    only_block = {"choices": [{"message": {"content": "<|reasoning> <reasoning|>"}}]}
+    assert LLMClient._parse_response(only_block, tags).content is None
+    # Without tags the content is not touched.
+    assert LLMClient._parse_response(body).content == "<|reasoning> plan<reasoning|>Answer"
 
 
 def test_parse_chat_completion() -> None:

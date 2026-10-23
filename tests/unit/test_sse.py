@@ -5,6 +5,7 @@ import json
 import pytest
 
 from agent.llm import LLMError
+from agent.model_config import ReasoningTagsSpec
 from agent.sse import ChatStreamAccumulator, SSEDecoder, StreamEvent
 
 # --- SSEDecoder -------------------------------------------------------------
@@ -75,6 +76,34 @@ def test_content_and_reasoning_delta() -> None:
     result = accumulator.result()
     assert result.content == "Hello"
     assert result.reasoning == "thinking more"
+
+
+def test_reasoning_tags_split_streamed_content() -> None:
+    tags = ReasoningTagsSpec(start="<|reasoning>", end="<reasoning|>")
+    accumulator = ChatStreamAccumulator(reasoning_tags=tags)
+
+    events = accumulator.add(_chunk({"choices": [{"delta": {"content": "<|reason"}}]}))
+    assert events == []
+    events = accumulator.add(_chunk({"choices": [{"delta": {"content": "ing> p<reasoning|>Ok"}}]}))
+    assert events == [
+        StreamEvent(kind="reasoning", text=" p"),
+        StreamEvent(kind="content", text="Ok"),
+    ]
+    # A held tail that never became a tag is sent when the stream ends.
+    accumulator.add(_chunk({"choices": [{"delta": {"content": " <"}}]}))
+    assert accumulator.add("[DONE]") == [
+        StreamEvent(kind="content", text="<"),
+        StreamEvent(kind="done"),
+    ]
+    result = accumulator.result()
+    assert result.content == "Ok <"
+    assert result.reasoning == " p"
+
+
+def test_without_reasoning_tags_markup_stays_in_content() -> None:
+    accumulator = ChatStreamAccumulator()
+    accumulator.add(_chunk({"choices": [{"delta": {"content": "<|reasoning> x<reasoning|>A"}}]}))
+    assert accumulator.result().content == "<|reasoning> x<reasoning|>A"
 
 
 def test_null_and_empty_delta_fields_skipped() -> None:
