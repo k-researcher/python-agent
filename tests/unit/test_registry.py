@@ -30,6 +30,30 @@ def test_run_registry_keeps_settings_and_does_not_modify_base() -> None:
         scoped.get("http_request", "dev")
 
 
+def test_object_schemas_without_properties_get_an_empty_properties_map() -> None:
+    # Argument-free object schemas include an explicit properties map.
+    registry = ToolRegistry()
+    original = registry.get("git_status", "ask").parameters(None)
+
+    for mode in ("dev", "ask"):
+        for definition in registry.definitions(mode):
+            parameters = definition["function"]["parameters"]
+            if parameters.get("type") == "object":
+                assert isinstance(parameters.get("properties"), dict)
+
+    git_status = next(
+        d for d in registry.definitions("ask") if d["function"]["name"] == "git_status"
+    )
+    assert git_status["function"]["parameters"] == {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {},
+    }
+    # The tool keeps its own schema: the definition is a copy.
+    assert "properties" not in original
+    assert "properties" not in registry.get("git_status", "ask").parameters(None)
+
+
 def test_run_registry_refuses_to_replace_an_existing_tool() -> None:
     registry = ToolRegistry()
     original = registry.get("read_file", "dev")

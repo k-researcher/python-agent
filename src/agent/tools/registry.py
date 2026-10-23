@@ -17,6 +17,17 @@ from agent.tools.todo_tools import TodoReadTool, TodoWriteTool
 from agent.tools.web_fetch import WebFetchTool
 
 
+def _wire_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Return the schema sent to the model; an object schema always has "properties".
+
+    An empty properties map makes argument-free object schemas explicit.
+    The tool's own schema is not changed: argument validation uses it as it is.
+    """
+    if parameters.get("type") == "object" and "properties" not in parameters:
+        return {**parameters, "properties": {}}
+    return parameters
+
+
 class ToolRegistry:
     def __init__(
         self,
@@ -64,7 +75,7 @@ class ToolRegistry:
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": tool.parameters(model_ids),
+                    "parameters": _wire_parameters(tool.parameters(model_ids)),
                 },
             }
             for tool in self._tools.values()
