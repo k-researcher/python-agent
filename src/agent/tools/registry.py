@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
 
 from agent.config import Settings
+from agent.modes import tool_profile
 from agent.tools.advanced import advanced_tools
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 from agent.tools.builtin import BUILTIN_TOOLS
@@ -12,7 +14,7 @@ from agent.tools.check_tools import RunChecksTool
 from agent.tools.git_tools import GitDiffTool, GitLogTool, GitShowTool, GitStatusTool
 from agent.tools.knowledge import knowledge_tools
 from agent.tools.patch_tools import ApplyPatchTool, EditByLinesTool
-from agent.tools.session_tools import ReadSessionTool
+from agent.tools.session_tools import GetProjectsTool, ReadSessionTool
 from agent.tools.todo_tools import TodoReadTool, TodoWriteTool
 from agent.tools.web_fetch import WebFetchTool
 
@@ -48,6 +50,7 @@ class ToolRegistry:
                 TodoWriteTool(),
                 TodoReadTool(),
                 ReadSessionTool(),
+                GetProjectsTool(),
                 *advanced_tools(self.settings),
                 WebFetchTool(self.settings),
                 *knowledge_tools(self.settings),
@@ -79,12 +82,12 @@ class ToolRegistry:
                 },
             }
             for tool in self._tools.values()
-            if mode in tool.allowed_modes and self._enabled(tool)
+            if tool_profile(mode) in tool.allowed_modes and self._enabled(tool)
         ]
 
     def get(self, name: str, mode: str) -> Tool:
         tool = self._tools.get(name)
-        if tool is None or mode not in tool.allowed_modes or not self._enabled(tool):
+        if tool is None or tool_profile(mode) not in tool.allowed_modes or not self._enabled(tool):
             raise ToolError(f"Tool is unavailable in mode {mode}: {name}")
         return tool
 
@@ -108,11 +111,31 @@ class ToolRegistry:
             raise ToolError(f"Invalid arguments for {name}: {details}")
         tool.check_arguments(arguments)
 
-    def risk(self, name: str, mode: str) -> RiskLevel:
-        return self.get(name, mode).risk_level
+    def risk(
+        self,
+        name: str,
+        mode: str,
+        arguments: dict[str, Any] | None = None,
+        project_root: Path | None = None,
+    ) -> RiskLevel:
+        """Return the risk of a tool, or of one call when its arguments are given."""
+        tool = self.get(name, mode)
+        if arguments is None or not self.settings.trusted_read_commands:
+            return tool.risk_level
+        try:
+            return tool.call_risk(arguments, project_root)
+        except Exception:
+            # Any doubt keeps the tool's own risk and so the approval.
+            return tool.risk_level
 
-    def requires_confirmation(self, name: str, mode: str) -> bool:
-        return self.risk(name, mode) is not RiskLevel.read_only
+    def requires_confirmation(
+        self,
+        name: str,
+        mode: str,
+        arguments: dict[str, Any] | None = None,
+        project_root: Path | None = None,
+    ) -> bool:
+        return self.risk(name, mode, arguments, project_root) is not RiskLevel.read_only
 
     async def execute(
         self, name: str, mode: str, context: ToolContext, arguments: dict[str, Any]

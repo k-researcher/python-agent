@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from agent.model_config import ResolvedModel
+from agent.modes import tool_profile
 
 AUTO = "auto"
 # Ordered from the lowest to the highest level.
@@ -59,7 +60,7 @@ def lower_effort(model: ResolvedModel, effort: str | None) -> str | None:
 
 
 def _auto(model: ResolvedModel, mode: str, task_chars: int, recent_errors: int) -> tuple[str, str]:
-    level = "low" if mode == "ask" else "medium"
+    level = "low" if tool_profile(mode) == "ask" else "medium"
     reason = f"mode {mode}"
     if task_chars >= LONG_TASK_CHARS:
         level, reason = "high", "long task"

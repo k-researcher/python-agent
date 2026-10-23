@@ -88,6 +88,9 @@ class Settings(BaseSettings):
     knowledge_base_enabled: bool = False
     tool_sources_file: Path | None = None
     allow_network_tools: bool = False
+    # Plain read-only commands for shell and ssh_exec run without approval; see
+    # agent.trusted_commands. False keeps the approval for every command.
+    trusted_read_commands: bool = True
     # OS sandbox for shell commands: "off", "auto" (use it when the system has one) or
     # "required" (refuse to run a command without it). See agent.sandbox.
     shell_sandbox: Literal["off", "auto", "required"] = "off"

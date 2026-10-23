@@ -55,6 +55,10 @@ class Tool(ABC):
         """Reject arguments that match the schema but cannot run; called before any approval."""
         return None
 
+    def call_risk(self, arguments: dict[str, Any], project_root: Path | None) -> RiskLevel:
+        """Return the risk of one call; a tool lowers it only for arguments it proves safe."""
+        return self.risk_level
+
     @abstractmethod
     async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError

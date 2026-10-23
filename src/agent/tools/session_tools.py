@@ -1,4 +1,4 @@
-"""Read-only access to the conversation of another session in the same project."""
+"""Read-only access to project conversations and workspace projects."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy import select
 
 from agent.database import session_factory
-from agent.models import Message, Session
+from agent.models import Message, Project, Session
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 
 MAX_SESSION_MESSAGES = 200
@@ -97,3 +97,48 @@ class ReadSessionTool(Tool):
             "title": target.title,
             "messages": messages,
         }
+
+
+class GetProjectsTool(Tool):
+    """List projects in the workspace of the current session's project."""
+
+    name = "get_projects"
+    description = (
+        "List the projects of the current workspace: id, name, root path and which one is current."
+    )
+    risk_level = RiskLevel.read_only
+    allowed_modes = frozenset({"dev"})
+    parallel_safe = False
+    input_schema = {"type": "object", "properties": {}, "additionalProperties": False}
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        async with session_factory() as db:
+            current = await db.get(Session, context.session_id)
+            if current is None:
+                raise ToolError("Session not found")
+            project = await db.get(Project, current.project_id)
+            if project is None:
+                raise ToolError("Session not found")
+            scope = (
+                Project.workspace_id == project.workspace_id
+                if project.workspace_id is not None
+                else Project.workspace_id.is_(None)
+            )
+            projects = list(
+                (
+                    await db.execute(
+                        select(Project).where(scope).order_by(Project.name, Project.id)
+                    )
+                ).scalars()
+            )
+            return {
+                "projects": [
+                    {
+                        "id": row.id,
+                        "name": row.name,
+                        "root_path": row.root_path,
+                        "current": row.id == current.project_id,
+                    }
+                    for row in projects
+                ]
+            }

@@ -6,6 +6,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
 
+from agent.modes import SessionMode
+
 
 def _assume_utc(value: datetime) -> datetime:
     """SQLite drops the time zone: a stored value without one is UTC."""
@@ -71,7 +73,7 @@ class SessionBudgetRead(BaseModel):
 class SessionCreate(BaseModel):
     project_id: str
     prompt: str = Field(min_length=1, max_length=2_000_000)
-    mode: Literal["dev", "ask"] = "dev"
+    mode: SessionMode = "dev"
     llm_profile: str | None = Field(default=None, min_length=1, max_length=100)
     reasoning_effort: str | None = Field(default=None, max_length=20)
     title: str | None = Field(default=None, max_length=300)

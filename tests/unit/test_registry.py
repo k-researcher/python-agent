@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from agent.config import Settings
@@ -28,6 +30,49 @@ def test_run_registry_keeps_settings_and_does_not_modify_base() -> None:
         scoped.get("write_file", "ask")
     with pytest.raises(ToolError):
         scoped.get("http_request", "dev")
+
+
+def test_trusted_read_only_commands_need_no_approval(tmp_path: Path) -> None:
+    from agent.tool_batch import is_parallel_safe
+
+    registry = ToolRegistry(settings=Settings(allow_network_tools=True))
+    shell = {"command": "ls -la"}
+    remote = {"connection": "app", "command": "df -h"}
+
+    assert registry.requires_confirmation("shell", "dev", shell, tmp_path) is False
+    assert registry.risk("shell", "dev", shell, tmp_path) is RiskLevel.read_only
+    assert registry.requires_confirmation("shell", "dev", {"command": "rm x"}, tmp_path) is True
+    assert registry.requires_confirmation("ssh_exec", "dev", remote, tmp_path) is False
+    remote_write = {"connection": "app", "command": "rm x"}
+    assert registry.requires_confirmation("ssh_exec", "dev", remote_write, tmp_path) is True
+    remote_read = {"connection": "app", "command": "cat public.txt"}
+    assert registry.requires_confirmation("ssh_exec", "dev", remote_read, tmp_path) is True
+    # Without the arguments of a call the tool's own risk decides.
+    assert registry.requires_confirmation("shell", "dev") is True
+    # Parallel runs use the tool's own risk, so a trusted call never runs in parallel.
+    assert is_parallel_safe(registry.get("shell", "dev")) is False
+
+
+def test_trusted_commands_can_be_turned_off(tmp_path: Path) -> None:
+    registry = ToolRegistry(settings=Settings(trusted_read_commands=False))
+    assert registry.requires_confirmation("shell", "dev", {"command": "ls"}, tmp_path) is True
+
+
+def test_get_projects_is_registered_only_for_write_capable_profiles() -> None:
+    registry = ToolRegistry()
+    for mode in ("dev", "pm", "qa", "devops"):
+        tool = registry.get("get_projects", mode)
+        assert tool.risk_level is RiskLevel.read_only
+        assert tool.parallel_safe is False
+        assert registry.requires_confirmation("get_projects", mode) is False
+        registry.validate("get_projects", mode, {})
+        with pytest.raises(ToolError, match="Invalid arguments"):
+            registry.validate("get_projects", mode, {"workspace_id": "foreign"})
+        definitions = registry.definitions(mode)
+        assert any(item["function"]["name"] == "get_projects" for item in definitions)
+    for mode in ("ask", "arch", "cybersec", "analyst"):
+        with pytest.raises(ToolError, match="unavailable"):
+            registry.get("get_projects", mode)
 
 
 def test_object_schemas_without_properties_get_an_empty_properties_map() -> None:
