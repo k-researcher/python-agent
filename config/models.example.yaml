@@ -1,6 +1,6 @@
 # Структура моделей (базовый слой). UI может переопределять поля поверх этого файла.
 # Ключи здесь не хранятся: api_key_env — имя переменной из окружения или .env.
-# Проверка: uv run agent config check
+# Проверка: uv run pyagent config check
 providers:
   gateway:
     kind: openai
@@ -22,7 +22,7 @@ providers:
   #   kind: openai
   #   base_url: https://api.z.ai/api/paas/v4
   #   api_key_env: ZAI_API_KEY
-  # lmstudio:                       # LM Studio, локальный сервер
+  # local_server:                   # локальный сервер
   #   kind: openai
   #   base_url: http://127.0.0.1:1234/v1
   #   api_key_env: null
@@ -55,6 +55,17 @@ models:
     context_window: 256000
     max_tokens: 8192
     reasoning: {supported: false}
+  # local:                          # локальная модель
+  #   provider: local_server
+  #   model: gemma-4-26b-a4b-it-mlx  # точный ID модели на сервере
+  #   context_window: 8192          # = длина контекста, с которой модель загружена
+  #   max_tokens: 2048
+  #   reasoning:
+  #     supported: false
+  #     # Пример разделителей блока размышлений; задайте теги своей модели.
+  #     tags: {start: "<|channel>thought", end: "<channel|>"}
+  #   # Без цены бюджет сессии с денежным потолком остановит запуск (cost_unknown).
+  #   pricing: {input_per_mtok: 0, output_per_mtok: 0}
 
 routing:
   default: main
