@@ -6,6 +6,8 @@ import logging
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 from redis.asyncio import Redis
@@ -105,23 +107,46 @@ class EventBroker:
 broker = EventBroker()
 
 
-async def emit_event(
+@dataclass(frozen=True)
+class PendingEvent:
+    event: Event
+    payload: dict[str, Any]
+
+
+async def add_event(
     db: AsyncSession, event_type: str, payload: dict[str, Any], session_id: str | None = None
-) -> Event:
+) -> PendingEvent:
     event = Event(session_id=session_id, type=event_type, payload=payload)
     db.add(event)
-    await db.commit()
-    await db.refresh(event)
-    await broker.broadcast(
+    await db.flush()
+    return PendingEvent(
+        event,
         {
             "id": event.id,
             "session_id": event.session_id,
             "type": event.type,
-            "payload": event.payload,
+            "payload": deepcopy(event.payload),
             "created_at": event.created_at.isoformat(),
-        }
+        },
     )
-    return event
+
+
+async def publish(events: list[PendingEvent]) -> None:
+    """Broadcast committed event snapshots without database access."""
+    for pending in events:
+        try:
+            await broker.broadcast(pending.payload)
+        except Exception:
+            logger.exception("Event %s: broadcast failed", pending.payload["id"])
+
+
+async def emit_event(
+    db: AsyncSession, event_type: str, payload: dict[str, Any], session_id: str | None = None
+) -> Event:
+    pending = await add_event(db, event_type, payload, session_id)
+    await db.commit()
+    await publish([pending])
+    return pending.event
 
 
 class StreamPublisher:
