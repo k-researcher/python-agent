@@ -608,6 +608,25 @@ async def test_late_dispatch_failure_only_finishes_unowned_pending(
     assert len(await status_events(session_id)) == (0 if claimed else 1)
 
 
+async def test_embedded_recovery_closes_and_invalidates_old_run(tmp_path: Path) -> None:
+    session_id = await make_session(tmp_path, run_generation=3, status="running")
+    async with session_factory() as db:
+        fence = await claim(db, session_id, lease_seconds=60)
+    await init_database(run_migrations=False, recover_running=False)
+    assert await outcome_rows(session_id) == []
+    await init_database(run_migrations=False, recover_running=True)
+    await init_database(run_migrations=False, recover_running=True)
+    assert [(row.generation, row.status) for row in await outcome_rows(session_id)] == [
+        (3, "interrupted")
+    ]
+    async with session_factory() as db:
+        stored = await db.get(Session, session_id)
+        assert stored.run_generation == 4
+        assert stored.owner_token is None and stored.lease_until is None
+        assert fence is not None
+    assert len(await status_events(session_id)) == 1
+
+
 class FinishingSupervisor(AgentSupervisor):
     def __init__(self) -> None:
         super().__init__(get_settings())
