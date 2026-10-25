@@ -29,12 +29,13 @@ import sqlalchemy as sa
 from sqlalchemy import event
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import ORMExecuteState, SessionTransaction
 from sqlalchemy.orm import Session as SyncSession
 
 from agent.models import Session as SessionRow
-from agent.models import SessionStatus
+from agent.models import SessionRunOutcome
 
-TERMINAL_STATUSES = ("completed", "stopped", "error")
+TERMINAL_STATUSES = ("completed", "stopped", "error", "interrupted")
 
 # The full sessions table, so guarded updates can set any session column.
 _sessions = cast(sa.Table, SessionRow.__table__)
@@ -56,7 +57,19 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _owned(fence: RunFence, now: datetime) -> sa.ColumnElement[bool]:
+def _unfinished() -> sa.ColumnElement[bool]:
+    return sa.and_(
+        _sessions.c.status.not_in(TERMINAL_STATUSES),
+        ~sa.exists(
+            sa.select(SessionRunOutcome.session_id).where(
+                SessionRunOutcome.session_id == _sessions.c.id,
+                SessionRunOutcome.generation == _sessions.c.run_generation,
+            )
+        ),
+    )
+
+
+def _owned(fence: RunFence, now: datetime, *, finishing: bool = False) -> sa.ColumnElement[bool]:
     """Return the condition that the fence still owns an unexpired lease."""
     return sa.and_(
         _sessions.c.id == fence.session_id,
@@ -64,6 +77,7 @@ def _owned(fence: RunFence, now: datetime) -> sa.ColumnElement[bool]:
         _sessions.c.owner_epoch == fence.epoch,
         _sessions.c.owner_token == fence.token,
         _sessions.c.lease_until >= now,
+        sa.true() if finishing else _unfinished(),
     )
 
 
@@ -82,8 +96,8 @@ async def claim(
 ) -> RunFence | None:
     """Take the session run for this executor and commit; return None when it is not free.
 
-    The run is free when the session is not terminal, no Stop is pending, and no owner
-    holds an unexpired lease. The claim increments the owner epoch but keeps the generation.
+    The run is free when it has no outcome, the session is not terminal, no Stop is pending,
+    and no owner holds an unexpired lease. The claim increments the epoch, not the generation.
     With ``expected_generation``, the claim also requires that generation, in the same
     conditional update: a run scheduled for an older generation cannot take a newer one.
     """
@@ -91,7 +105,7 @@ async def claim(
     token = str(uuid.uuid4())
     conditions = [
         _sessions.c.id == session_id,
-        _sessions.c.status.not_in(TERMINAL_STATUSES),
+        _unfinished(),
         _sessions.c.stop_requested.is_(False),
         sa.or_(_sessions.c.owner_token.is_(None), _sessions.c.lease_until < moment),
     ]
@@ -160,7 +174,9 @@ async def fence_check(db: AsyncSession, fence: RunFence, *, now: datetime | None
     moment = now or _now()
     statement = (
         sa.update(_sessions)
-        .where(_owned(fence, moment))
+        .where(
+            _owned(fence, moment, finishing=db.sync_session.info.get("finishing_fence") == fence)
+        )
         .values(owner_token=_sessions.c.owner_token)
     )
     if await _rowcount(db, statement) != 1:
@@ -172,7 +188,13 @@ async def guarded_update(
 ) -> None:
     """Update session columns only while the fence owns the run; no commit."""
     moment = now or _now()
-    statement = sa.update(_sessions).where(_owned(fence, moment)).values(**values)
+    statement = (
+        sa.update(_sessions)
+        .where(
+            _owned(fence, moment, finishing=db.sync_session.info.get("finishing_fence") == fence)
+        )
+        .values(**values)
+    )
     if await _rowcount(db, statement) != 1:
         raise FenceLostError(f"Session {fence.session_id} run is no longer owned")
 
@@ -191,27 +213,43 @@ async def new_generation(db: AsyncSession, session_id: str) -> None:
     )
 
 
-async def stop_generation(db: AsyncSession, session_id: str) -> bool:
-    """Invalidate the current run on the first Stop; return False for a repeated Stop. No commit."""
+async def invalidate_generation(
+    db: AsyncSession, session_id: str, expected_generation: int | None = None
+) -> tuple[int, str] | None:
+    """Lock even a no-op until commit, then invalidate once and return the old run."""
+    lock = (
+        sa.update(_sessions)
+        .where(_sessions.c.id == session_id)
+        .values(owner_token=_sessions.c.owner_token)
+    )
+    if await _rowcount(db, lock) != 1:
+        return None
+    conditions = [_sessions.c.id == session_id, _sessions.c.stop_requested.is_(False)]
+    if expected_generation is not None:
+        conditions.extend(
+            [
+                _sessions.c.run_generation == expected_generation,
+                _sessions.c.status.not_in(TERMINAL_STATUSES),
+            ]
+        )
     statement = (
         sa.update(_sessions)
-        .where(_sessions.c.id == session_id, _sessions.c.stop_requested.is_(False))
+        .where(*conditions)
         .values(
             run_generation=_sessions.c.run_generation + 1,
             owner_token=None,
             lease_until=None,
             stop_requested=True,
         )
+        .returning(_sessions.c.run_generation, _sessions.c.status)
     )
-    return await _rowcount(db, statement) == 1
+    row = (await db.execute(statement)).one_or_none()
+    return (int(row.run_generation) - 1, str(row.status)) if row is not None else None
 
 
-_SCOPED_TERMINAL_STATUSES = (
-    SessionStatus.completed.value,
-    SessionStatus.error.value,
-    SessionStatus.stopped.value,
-    SessionStatus.interrupted.value,
-)
+async def stop_generation(db: AsyncSession, session_id: str) -> bool:
+    """Invalidate the current run once. No commit."""
+    return await invalidate_generation(db, session_id) is not None
 
 
 async def stop_generation_scoped(
@@ -223,22 +261,7 @@ async def stop_generation_scoped(
     generation, no Stop is pending, and the session is not terminal. A late stop
     after a newer generation started does nothing. The check is only in the WHERE.
     """
-    statement = (
-        sa.update(_sessions)
-        .where(
-            _sessions.c.id == session_id,
-            _sessions.c.run_generation == expected_generation,
-            _sessions.c.stop_requested.is_(False),
-            _sessions.c.status.not_in(_SCOPED_TERMINAL_STATUSES),
-        )
-        .values(
-            run_generation=_sessions.c.run_generation + 1,
-            owner_token=None,
-            lease_until=None,
-            stop_requested=True,
-        )
-    )
-    return await _rowcount(db, statement) == 1
+    return await invalidate_generation(db, session_id, expected_generation) is not None
 
 
 # The fence of the run that the current task executes. Tasks that the run starts inherit it.
@@ -246,29 +269,103 @@ CURRENT_FENCE: ContextVar[RunFence | None] = ContextVar("current_fence", default
 _guard_installed = False
 
 
-def _check_before_commit(session: SyncSession) -> None:
-    """Check the current fence before every commit in an executor context."""
+def _check_fence(session: SyncSession, *, committing: bool = False) -> None:
+    """Lock the owned run; at commit also require the exact finished status."""
     fence = CURRENT_FENCE.get()
     if fence is None or session.info.get("fence_exempt"):
         return
-    statement = (
-        sa.update(_sessions)
-        .where(_owned(fence, _now()))
-        .values(owner_token=_sessions.c.owner_token)
-    )
-    result = cast(CursorResult[Any], session.execute(statement))
+    finishing = session.info.get("finishing_fence") == fence
+    conditions = [_owned(fence, _now(), finishing=finishing)]
+    if committing and finishing:
+        conditions.append(_sessions.c.status == session.info["finishing_run"][2])
+    statement = sa.update(_sessions).where(*conditions).values(owner_token=_sessions.c.owner_token)
+    result = session.connection().execute(statement)
     if result.rowcount != 1:
         raise FenceLostError(f"Session {fence.session_id} run is no longer owned")
+
+
+def _check_before_commit(session: SyncSession) -> None:
+    """Check database state after the commit-time flush, not the identity map."""
+    if CURRENT_FENCE.get() is None or session.info.get("fence_exempt"):
+        return
+    session.flush()
+    _check_fence(session, committing=True)
+
+
+def _check_before_flush(session: SyncSession, flush_context: Any, instances: Any) -> None:
+    fence = CURRENT_FENCE.get()
+    if fence is None or session.info.get("fence_exempt"):
+        return
+    finishing_run = session.info.get("finishing_run")
+    for row in session.dirty.union(session.new):
+        if (
+            isinstance(row, SessionRow)
+            and sa.inspect(row).attrs.status.history.has_changes()
+            and (
+                row.status in TERMINAL_STATUSES
+                or (finishing_run is not None and row.id == finishing_run[0])
+            )
+            and (
+                session.info.get("finishing_fence") != fence
+                or session.info.get("finishing_run") != (row.id, row.run_generation, row.status)
+            )
+        ):
+            raise FenceLostError("Session status changes must match finish_run in this transaction")
+    _check_fence(session)
+
+
+def _check_before_dml(state: ORMExecuteState) -> None:
+    if state.is_insert or state.is_update or state.is_delete:
+        _check_fence(state.session)
+
+
+def _clear_finish_permission(session: SyncSession) -> None:
+    if session.in_nested_transaction():
+        return
+    session.info.pop("finishing_fence", None)
+    session.info.pop("finishing_run", None)
+    session.info.pop("finishing_savepoints", None)
+
+
+def _remember_savepoint_finish(session: SyncSession, transaction: SessionTransaction) -> None:
+    if transaction.nested:
+        session.info.setdefault("finishing_savepoints", {})[transaction] = {
+            key: session.info[key]
+            for key in ("finishing_fence", "finishing_run")
+            if key in session.info
+        }
+
+
+def _restore_savepoint_finish(session: SyncSession, transaction: SessionTransaction) -> None:
+    if transaction.nested:
+        previous = session.info.get("finishing_savepoints", {}).pop(transaction, None)
+        if previous is not None:
+            session.info.pop("finishing_fence", None)
+            session.info.pop("finishing_run", None)
+            session.info.update(previous)
+
+
+def _clear_finished_transaction(session: SyncSession, transaction: SessionTransaction) -> None:
+    if transaction.parent is None:
+        _clear_finish_permission(session)
 
 
 def install_commit_guard() -> None:
     """Register the commit guard once per process.
 
-    While CURRENT_FENCE is set, every commit (session state, messages, events, tool calls,
-    audit, checkpoints) first verifies the fence in the same transaction. A lost fence
-    aborts the commit; the transaction then rolls back.
+    While CURRENT_FENCE is set, flushes and explicit DML acquire the session fence
+    before locking dependent rows. After flushing, every commit rechecks ownership
+    and the finished database status. ORM status changes must match finish_run;
+    savepoint rollback restores the enclosing transaction's finish permission.
     """
     global _guard_installed
     if not _guard_installed:
+        event.listen(SyncSession, "before_flush", _check_before_flush)
+        event.listen(SyncSession, "do_orm_execute", _check_before_dml)
         event.listen(SyncSession, "before_commit", _check_before_commit)
+        event.listen(SyncSession, "after_transaction_create", _remember_savepoint_finish)
+        event.listen(SyncSession, "after_commit", _clear_finish_permission)
+        event.listen(SyncSession, "after_rollback", _clear_finish_permission)
+        event.listen(SyncSession, "after_soft_rollback", _restore_savepoint_finish)
+        event.listen(SyncSession, "after_transaction_end", _clear_finished_transaction)
         _guard_installed = True

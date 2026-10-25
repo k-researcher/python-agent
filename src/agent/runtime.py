@@ -5,7 +5,7 @@ import hashlib
 import json
 import logging
 import uuid
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -23,7 +23,7 @@ from agent.config import Settings
 from agent.context_inference import TRANSIENT_KINDS, ContextInference
 from agent.context_manager import ContextManager
 from agent.database import session_factory
-from agent.events import StreamPublisher, emit_event
+from agent.events import PendingEvent, StreamPublisher, add_event, emit_event, publish
 from agent.llm import LLMClient, LLMError, LLMResponse
 from agent.mcp_audit import execute_mcp_attempt
 from agent.message_tree import append_message
@@ -44,6 +44,7 @@ from agent.models import (
 from agent.modes import ROLE_PROFILES
 from agent.queue import RedisTaskQueue
 from agent.reasoning import ReasoningDecision, decide, lower_effort
+from agent.run_finish import finish_run
 from agent.sandbox import policy_from_settings
 from agent.session_budget import check_budget
 from agent.session_budget_store import (
@@ -63,8 +64,6 @@ from agent.session_fence import (
     new_generation,
     release,
     renew,
-    stop_generation,
-    stop_generation_scoped,
 )
 from agent.session_service import create_session_record
 from agent.skill_prompt import load_skill_set
@@ -87,6 +86,7 @@ TERMINAL_STATUSES = {
     SessionStatus.completed.value,
     SessionStatus.stopped.value,
     SessionStatus.error.value,
+    SessionStatus.interrupted.value,
 }
 
 
@@ -251,41 +251,75 @@ class AgentSupervisor:
         return {"execution_mode": "redis", **status}
 
     async def stop(self, session_id: str) -> None:
-        own = [task for task, owner in self._finishing.items() if owner == session_id]
-        current = self._tasks.get(session_id)
-        if current is not None:
-            own.append(current)
-        for task in own:
-            if not task.done():
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
-
-        async with session_factory() as db:
-            children = list(
-                (
-                    await db.execute(
-                        select(Session.id).where(
-                            Session.parent_id == session_id,
-                            Session.status.not_in(TERMINAL_STATUSES),
+        """Stop the active subtree in one transaction, then cancel local executors."""
+        token = CURRENT_FENCE.set(None)
+        try:
+            pending: list[PendingEvent] = []
+            targets: set[asyncio.Task[None]] = set()
+            stopped_runs: list[tuple[str, int]] = []
+            seen: set[str] = set()
+            remaining: list[tuple[str, int | None]] = [(session_id, None)]
+            async with session_factory() as db:
+                while remaining:
+                    current_id, generation = remaining.pop()
+                    if current_id in seen:
+                        continue
+                    seen.add(current_id)
+                    captured = {
+                        task for task, owner in self._finishing.items() if owner == current_id
+                    }
+                    current = self._tasks.get(current_id)
+                    if current is not None:
+                        captured.add(current)
+                    rows = await finish_run(
+                        db,
+                        current_id,
+                        generation,
+                        "stopped",
+                        source="stop" if generation is None else "scoped_stop",
+                    )
+                    pending.extend(rows)
+                    if generation is not None and not rows:
+                        current_generation = await db.scalar(
+                            select(Session.run_generation)
+                            .where(Session.id == current_id)
+                            .with_for_update()
+                        )
+                        if current_generation != generation:
+                            continue
+                    if rows:
+                        stopped_runs.append((current_id, rows[0].payload["payload"]["generation"]))
+                        targets.update(captured)
+                        cancelled = await self._cancel_unfinished_tool_calls(db, current_id)
+                        if cancelled:
+                            pending.append(
+                                await add_event(
+                                    db,
+                                    "approval.cancelled",
+                                    {"tool_call_ids": cancelled},
+                                    current_id,
+                                )
+                            )
+                    remaining.extend(
+                        (child_id, child_generation)
+                        for child_id, child_generation in await db.execute(
+                            select(Session.id, Session.run_generation)
+                            .where(Session.parent_id == current_id)
+                            .order_by(Session.id)
+                            .with_for_update()
                         )
                     )
-                ).scalars()
-            )
-            session = await db.get(Session, session_id)
-            if session is not None:
-                session.status = SessionStatus.stopped.value
-                await stop_generation(db, session_id)
-                cancelled = await self._cancel_unfinished_tool_calls(db, session_id)
                 await db.commit()
-                await emit_event(db, "session.status", {"status": session.status}, session_id)
-                if cancelled:
-                    await emit_event(
-                        db, "approval.cancelled", {"tool_call_ids": cancelled}, session_id
-                    )
-
-        for child_id in children:
-            await self.stop(child_id)
+                for stopped_id, stopped_generation in stopped_runs:
+                    targets.update(self._tasks_of_generation(stopped_id, stopped_generation))
+                for task in targets:
+                    task.cancel()
+                try:
+                    await publish(pending)
+                finally:
+                    await asyncio.gather(*targets, return_exceptions=True)
+        finally:
+            CURRENT_FENCE.reset(token)
 
     async def stop_scoped(self, session_id: str, expected_generation: int) -> bool:
         """Stop only the expected run generation; return True when it was stopped.
@@ -296,31 +330,33 @@ class AgentSupervisor:
         also when an event fails or the caller is cancelled. A task of a newer generation
         is never touched. There is no cascade to children.
         """
-        captured = self._tasks_of_generation(session_id, expected_generation)
-        async with session_factory() as db:
-            if not await stop_generation_scoped(db, session_id, expected_generation):
-                return False
-            session = await db.get(Session, session_id)
-            if session is not None:
-                session.status = SessionStatus.stopped.value
-            cancelled = await self._cancel_unfinished_tool_calls(db, session_id)
-            await db.commit()
-            # No await between the commit and cancel(): the expected task stops even when
-            # a newer generation registers itself while the events below are sent.
-            targets = captured | self._tasks_of_generation(session_id, expected_generation)
-            for task in targets:
-                task.cancel()
-            try:
-                await emit_event(
-                    db, "session.status", {"status": SessionStatus.stopped.value}, session_id
+        token = CURRENT_FENCE.set(None)
+        try:
+            captured = self._tasks_of_generation(session_id, expected_generation)
+            async with session_factory() as db:
+                pending = await finish_run(
+                    db, session_id, expected_generation, "stopped", source="scoped_stop"
                 )
+                if not pending:
+                    return False
+                cancelled = await self._cancel_unfinished_tool_calls(db, session_id)
                 if cancelled:
-                    await emit_event(
-                        db, "approval.cancelled", {"tool_call_ids": cancelled}, session_id
+                    pending.append(
+                        await add_event(
+                            db, "approval.cancelled", {"tool_call_ids": cancelled}, session_id
+                        )
                     )
-            finally:
-                await asyncio.gather(*targets, return_exceptions=True)
-        return True
+                await db.commit()
+                targets = captured | self._tasks_of_generation(session_id, expected_generation)
+                for task in targets:
+                    task.cancel()
+                try:
+                    await publish(pending)
+                finally:
+                    await asyncio.gather(*targets, return_exceptions=True)
+            return True
+        finally:
+            CURRENT_FENCE.reset(token)
 
     def _tasks_of_generation(self, session_id: str, generation: int) -> set[asyncio.Task[None]]:
         """Return the unfinished current task of the session when it runs ``generation``."""
@@ -379,6 +415,14 @@ class AgentSupervisor:
 
     async def resolve_approval(self, approval_id: str, decision: str, comment: str | None) -> str:
         async with session_factory() as db:
+            session_id = await db.scalar(
+                select(ToolCall.session_id)
+                .join(Approval, Approval.tool_call_id == ToolCall.id)
+                .where(Approval.id == approval_id)
+            )
+            if session_id is None:
+                raise LookupError("Approval not found")
+            await db.execute(select(Session).where(Session.id == session_id).with_for_update())
             query = (
                 select(Approval)
                 .where(Approval.id == approval_id)
@@ -493,8 +537,25 @@ class AgentSupervisor:
                 await self.start(session.id, new_run=False)
             return session.id
 
-    async def _run_guarded(self, session_id: str, generation: int | None = None) -> None:
-        async with self._semaphore:
+    async def _run_guarded(
+        self,
+        session_id: str,
+        generation: int | None = None,
+        *,
+        use_slot: bool = True,
+        owned_fence: RunFence | None = None,
+    ) -> None:
+        token = CURRENT_FENCE.set(None)
+        try:
+            async with self._semaphore if use_slot else nullcontext():
+                await self._execute_run(session_id, generation, owned_fence)
+        finally:
+            CURRENT_FENCE.reset(token)
+
+    async def _execute_run(
+        self, session_id: str, generation: int | None, fence: RunFence | None = None
+    ) -> None:
+        if fence is None:
             async with session_factory() as db:
                 fence = await claim(
                     db,
@@ -502,41 +563,45 @@ class AgentSupervisor:
                     lease_seconds=FENCE_LEASE_SECONDS,
                     expected_generation=generation,
                 )
-            if fence is None:
-                return  # terminal, stopped, or another executor owns the run
-            token = CURRENT_FENCE.set(fence)
-            run = asyncio.current_task()
-            keeper = asyncio.create_task(self._keep_lease(fence, run), name=f"lease-{session_id}")
+        if fence is None:
+            return  # terminal, stopped, or another executor owns the run
+        if fence.session_id != session_id or (
+            generation is not None and fence.generation != generation
+        ):
+            raise FenceLostError("The fence does not belong to this run")
+        token = CURRENT_FENCE.set(fence)
+        run = asyncio.current_task()
+        keeper = asyncio.create_task(self._keep_lease(fence, run), name=f"lease-{session_id}")
+        try:
+            await self._run(session_id)
+        except asyncio.CancelledError:
+            raise
+        except FenceLostError:
+            logger.warning("Session %s: the run lost its fence and stops", session_id)
+        except BudgetExceeded as error:
+            # Belt and braces: a budget boundary that escaped the run loop must stop
+            # without session.error, never become a tool error or a retry.
+            current_fence = CURRENT_FENCE.get()
+            async with session_factory() as db:
+                await self._stop_session_by_budget(
+                    db,
+                    session_id,
+                    current_fence.generation if current_fence is not None else 0,
+                    error.reason,
+                    current_fence,
+                )
+        except Exception as exc:
             try:
-                await self._run(session_id)
-            except asyncio.CancelledError:
-                raise
+                await self._mark_error(session_id, exc)
             except FenceLostError:
-                logger.warning("Session %s: the run lost its fence and stops", session_id)
-            except BudgetExceeded as error:
-                # Belt and braces: a budget boundary that escaped the run loop must stop
-                # without session.error, never become a tool error or a retry.
-                current_fence = CURRENT_FENCE.get()
-                async with session_factory() as db:
-                    await self._stop_session_by_budget(
-                        db,
-                        session_id,
-                        current_fence.generation if current_fence is not None else 0,
-                        error.reason,
-                        current_fence,
-                    )
-            except Exception as exc:
-                try:
-                    await self._mark_error(session_id, exc)
-                except FenceLostError:
-                    logger.warning("Session %s: error not recorded, the fence is lost", session_id)
-            finally:
-                keeper.cancel()
-                with suppress(asyncio.CancelledError):
-                    await keeper
-                CURRENT_FENCE.reset(token)
-                async with session_factory() as db:
-                    await release(db, fence)
+                logger.warning("Session %s: error not recorded, the fence is lost", session_id)
+        finally:
+            keeper.cancel()
+            with suppress(asyncio.CancelledError):
+                await keeper
+            CURRENT_FENCE.reset(token)
+            async with session_factory() as db:
+                await release(db, fence)
 
     async def _keep_lease(self, fence: RunFence, run: asyncio.Task[Any] | None) -> None:
         """Renew the lease; cancel the run when the lease is lost (fail closed)."""
@@ -558,15 +623,12 @@ class AgentSupervisor:
         async with session_factory() as db:
             session = await db.get(Session, session_id)
             if session is not None:
-                session.status = SessionStatus.error.value
-                session.error = str(exc)
-                await db.commit()
-                await emit_event(
-                    db,
-                    "session.error",
-                    {"status": session.status, "error": str(exc)},
-                    session_id,
-                )
+                fence = CURRENT_FENCE.get()
+                generation = fence.generation if fence is not None else session.run_generation
+                pending = await finish_run(db, session_id, generation, "error", error=str(exc))
+                if pending:
+                    await db.commit()
+                    await publish(pending)
 
     async def _stop_session_by_budget(
         self,
@@ -585,22 +647,17 @@ class AgentSupervisor:
         """
         if fence is not None:
             await fence_check(db, fence)
+        pending = await finish_run(db, session_id, generation, "stopped", reason=reason)
+        if not pending:
+            return
         await mark_budget_stop(db, session_id, generation, reason)
-        await db.execute(
-            update(Session)
-            .where(Session.id == session_id, Session.status.not_in(TERMINAL_STATUSES))
-            .values(status=SessionStatus.stopped.value)
-        )
         cancelled = await self._cancel_unfinished_tool_calls(db, session_id)
-        await db.commit()
-        await emit_event(
-            db,
-            "session.status",
-            {"status": SessionStatus.stopped.value, "reason": reason},
-            session_id,
-        )
         if cancelled:
-            await emit_event(db, "approval.cancelled", {"tool_call_ids": cancelled}, session_id)
+            pending.append(
+                await add_event(db, "approval.cancelled", {"tool_call_ids": cancelled}, session_id)
+            )
+        await db.commit()
+        await publish(pending)
 
     async def _enforce_budget_before_step(self, db: Any, session_id: str, generation: int) -> bool:
         """Allow or deny the next inference step; deny stops the session. Return False on stop."""
@@ -714,9 +771,9 @@ class AgentSupervisor:
                     and visible[-1].role == "assistant"
                     and not visible[-1].tool_calls
                 ):
-                    session.status = SessionStatus.completed.value
+                    pending = await finish_run(db, session_id, session.run_generation, "completed")
                     await db.commit()
-                    await emit_event(db, "session.status", {"status": session.status}, session.id)
+                    await publish(pending)
                     return
                 if session.status == SessionStatus.awaiting_confirmation.value:
                     pending_approval = any(
@@ -917,16 +974,19 @@ class AgentSupervisor:
                 )
 
                 if not normalized_calls:
-                    await db.commit()
-                    await emit_event(
-                        db,
-                        "message.created",
-                        {"role": "assistant", "message_id": assistant.id},
-                        session.id,
+                    pending = [
+                        await add_event(
+                            db,
+                            "message.created",
+                            {"role": "assistant", "message_id": assistant.id},
+                            session.id,
+                        )
+                    ]
+                    pending.extend(
+                        await finish_run(db, session_id, session.run_generation, "completed")
                     )
-                    session.status = SessionStatus.completed.value
                     await db.commit()
-                    await emit_event(db, "session.status", {"status": session.status}, session.id)
+                    await publish(pending)
                     return
 
                 requires_approval = False
@@ -1348,6 +1408,26 @@ class AgentSupervisor:
         if mode not in ROLE_PROFILES:
             raise ValueError(f"Unsupported child mode: {mode}")
         async with session_factory() as db:
+            parent_fence = CURRENT_FENCE.get()
+            if parent_fence is not None:
+                if parent_fence.session_id != parent.id:
+                    raise FenceLostError("Child creation requires the parent run fence")
+                await fence_check(db, parent_fence)
+            else:
+                locked = await db.execute(
+                    update(Session)
+                    .where(
+                        Session.id == parent.id,
+                        Session.run_generation == parent.run_generation,
+                        Session.status.not_in(TERMINAL_STATUSES),
+                        Session.stop_requested.is_(False),
+                    )
+                    .values(run_generation=Session.run_generation)
+                    .returning(Session.id)
+                    .execution_options(synchronize_session=False)
+                )
+                if locked.one_or_none() is None:
+                    raise FenceLostError("The parent run is no longer active")
             selected_profile = select_model(
                 await effective_registry(db, self.settings), llm_profile or parent.llm_profile
             ).id
@@ -1365,20 +1445,36 @@ class AgentSupervisor:
                 parent_id=parent.id,
                 actor_user_id=parent.created_by_user_id,
                 configuration={"depth": depth + 1},
+                run_generation=1,
+                commit=False,
             )
             child_id = child.id
-            await emit_event(
+            created_event = await add_event(
                 db,
                 "session.child_created",
                 {"child_id": child_id, "parent_id": parent.id, "wait": wait},
                 parent.id,
             )
+            child_fence = None
+            if wait:
+                child_fence = await claim(
+                    db, child_id, lease_seconds=FENCE_LEASE_SECONDS, expected_generation=1
+                )
+                if child_fence is None:
+                    raise FenceLostError("The new child run could not be claimed")
+            else:
+                await db.commit()
+            await publish([created_event])
 
         stopped = False
         if wait:
             # Register the waited run, so that a Stop of the child cancels it.
-            task = asyncio.create_task(self._run(child_id), name=f"agent-child-{child_id}")
+            task = asyncio.create_task(
+                self._run_guarded(child_id, 1, use_slot=False, owned_fence=child_fence),
+                name=f"agent-child-{child_id}",
+            )
             self._tasks[child_id] = task
+            self._task_generation[child_id] = 1
             try:
                 done, _pending = await asyncio.wait(
                     {task}, timeout=self.settings.max_child_wait_seconds
@@ -1393,15 +1489,13 @@ class AgentSupervisor:
             finally:
                 if self._tasks.get(child_id) is task:
                     del self._tasks[child_id]
-            # A Stop cancels the run before it records the stopped status.
+            # Stop commits the terminal state before it cancels the run.
             stopped = task.cancelled()
             failure = None if stopped else task.exception()
-            if isinstance(failure, Exception):
-                await self._mark_error(child_id, failure)
-            elif failure is not None:
+            if failure is not None:
                 raise failure
         else:
-            await self.start(child_id)
+            await self.start(child_id, new_run=False, expected_generation=1)
 
         async with session_factory() as db:
             child_record = await db.get(Session, child_id)
