@@ -6,7 +6,7 @@ from typing import Any
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import event, select, update
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from agent.config import PROJECT_ROOT, get_settings
@@ -61,12 +61,30 @@ async def init_database(
         await db.execute(select(Session.id).limit(1))
         if not should_recover:
             return
-        await db.execute(
-            update(Session)
-            .where(Session.status == SessionStatus.running.value)
-            .values(status=SessionStatus.interrupted.value, stop_requested=False)
-        )
+        from agent.events import publish
+        from agent.run_finish import finish_run
+
+        rows = (
+            await db.execute(
+                select(Session.id, Session.run_generation).where(
+                    Session.status == SessionStatus.running.value
+                )
+            )
+        ).all()
+        pending = []
+        for session_id, generation in rows:
+            pending.extend(
+                await finish_run(
+                    db,
+                    session_id,
+                    generation,
+                    "interrupted",
+                    source="recovery",
+                    reason="executor_restart",
+                )
+            )
         await db.commit()
+        await publish(pending)
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:

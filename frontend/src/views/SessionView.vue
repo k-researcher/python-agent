@@ -14,6 +14,7 @@ import AgentSettings from "../components/chat/AgentSettings.vue";
 import type { RejectPayload, SendPayload } from "../components/chat/types";
 import { toChatTimelineItems } from "../uiAdapters";
 import { sessionStatusLabel } from "../components/layout/status";
+import { modeLabel as resolveModeLabel } from "../modes";
 
 const props = defineProps<{ id: string }>();
 const route = useRoute();
@@ -70,7 +71,7 @@ const modelLabel = computed(() => {
   const profile = appStore.config?.llm_profiles.find((model) => model.name === session.value?.llm_profile);
   return profile ? `${profile.name} · ${profile.model}` : session.value?.llm_profile ?? "По умолчанию";
 });
-const modeLabel = computed(() => session.value?.mode === "ask" ? "Консультант" : "Разработчик");
+const modeLabel = computed(() => resolveModeLabel(session.value?.mode));
 const modelSummary = computed(() => appStore.config?.llm_profiles.find((model) => model.name === session.value?.llm_profile)?.model ?? session.value?.llm_profile ?? "По умолчанию");
 
 const busy = computed(() => {

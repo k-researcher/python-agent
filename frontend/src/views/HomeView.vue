@@ -8,6 +8,8 @@ import AgentSettings from "../components/chat/AgentSettings.vue";
 import EmptyState from "../components/chat/EmptyState.vue";
 import type { SendPayload } from "../components/chat/types";
 import { toModelOptions } from "../uiAdapters";
+import { MODE_LABELS, SESSION_MODES, modeLabel } from "../modes";
+import type { SessionMode } from "../modes";
 
 const appStore = useAppStore();
 const router = useRouter();
@@ -19,7 +21,7 @@ const selectedProfileId = computed({
   get: () => newSessionProfile.value ?? "",
   set: (value: string) => { newSessionProfile.value = value || null; },
 });
-const mode = ref<"dev" | "ask">("dev");
+const mode = ref<SessionMode>("dev");
 const selectedEffort = ref("auto");
 const isCreating = ref(false);
 const error = ref("");
@@ -133,7 +135,7 @@ async function onCreateSession(payload: SendPayload): Promise<void> {
       <AgentSettings
         controls-id="home-agent-controls"
         :model-label="modelSummary"
-        :role-label="mode === 'ask' ? 'Консультант' : 'Разработчик'"
+        :role-label="modeLabel(mode)"
         :effort="selectedEffort"
       />
     </header>
@@ -176,8 +178,9 @@ async function onCreateSession(payload: SendPayload): Promise<void> {
       <label class="agent-control">
         <span>Роль</span>
         <select v-model="mode" :disabled="isCreating" data-testid="mode-select">
-          <option value="dev">Разработчик</option>
-          <option value="ask">Консультант</option>
+          <option v-for="m in SESSION_MODES" :key="m" :value="m">
+            {{ MODE_LABELS[m] }}
+          </option>
         </select>
       </label>
       </template>

@@ -294,7 +294,7 @@ async def test_event_failure_after_commit_still_cancels_expected_task(
     async def broken_event(*args: object, **kwargs: object) -> None:
         raise RuntimeError("synthetic event failure")
 
-    monkeypatch.setattr(runtime, "emit_event", broken_event)
+    monkeypatch.setattr(runtime, "publish", broken_event)
     try:
         # A time limit: without the immediate cancel only the lease loss (60 s) ends the task.
         with pytest.raises(RuntimeError, match="synthetic event failure"):
@@ -322,7 +322,7 @@ async def test_cancelled_stop_after_commit_still_cancels_expected_task(
         in_event.set()
         await release_event.wait()
 
-    monkeypatch.setattr(runtime, "emit_event", blocked_event)
+    monkeypatch.setattr(runtime, "publish", blocked_event)
     stop_task = asyncio.create_task(supervisor.stop_scoped(session_id, 1))
     try:
         await asyncio.wait_for(in_event.wait(), 2)
@@ -354,7 +354,7 @@ async def test_replaced_registry_after_commit_cancels_only_old_task(
         in_event.set()
         await release_event.wait()
 
-    monkeypatch.setattr(runtime, "emit_event", blocked_event)
+    monkeypatch.setattr(runtime, "publish", blocked_event)
     stop_task = asyncio.create_task(supervisor.stop_scoped(session_id, 1))
     tasks = [old_task, stop_task]
     try:

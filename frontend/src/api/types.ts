@@ -1,6 +1,8 @@
 // Shared API and domain types. Kept independent from the fetch layer so both the
 // REST client and the WebSocket path can use them.
 
+import type { SessionMode } from "../modes";
+
 export interface Project {
   id: string;
   name: string;
@@ -131,7 +133,7 @@ export interface Approval {
 export interface NewSession {
   project_id: string;
   prompt: string;
-  mode?: "dev" | "ask";
+  mode?: SessionMode;
   llm_profile?: string;
   reasoning_effort?: string;
   title?: string;

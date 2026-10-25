@@ -44,6 +44,8 @@ async def create_session_record(
     configuration: dict[str, Any] | None = None,
     budget: SessionBudgetRequest | None = None,
     created_at: datetime | None = None,
+    run_generation: int = 0,
+    commit: bool = True,
 ) -> Session:
     model = select_model(await effective_registry(db, settings), llm_profile, role=mode)
     selected_profile = model.id
@@ -82,14 +84,16 @@ async def create_session_record(
         status=SessionStatus.pending.value,
         configuration=configuration,
         budget_state=budget_state,
+        run_generation=run_generation,
     )
     db.add(session)
     await db.flush()
     # Explicit parents: the system prompt is the root, the task is its child.
     await append_message(db, session.id, role="system", content=system_prompt)
     await append_message(db, session.id, role="user", content=prompt)
-    await db.commit()
-    await db.refresh(session)
+    if commit:
+        await db.commit()
+        await db.refresh(session)
     return session
 
 

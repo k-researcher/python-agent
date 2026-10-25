@@ -358,6 +358,9 @@ async def _claim_session_run(
 
 
 async def _dispatch_session_run(db: AsyncSession, session_id: str, generation: int) -> bool:
+    from agent.events import publish
+    from agent.run_finish import finish_run
+
     try:
         started = await supervisor.start(session_id, new_run=False, expected_generation=generation)
         if not started:
@@ -376,22 +379,16 @@ async def _dispatch_session_run(db: AsyncSession, session_id: str, generation: i
         return started
     except (Exception, asyncio.CancelledError) as exc:
         await db.rollback()
-        await db.execute(
-            update(Session)
-            .where(
-                Session.id == session_id,
-                Session.run_generation == generation,
-                Session.status == SessionStatus.pending.value,
-                Session.owner_token.is_(None),
-                Session.stop_requested.is_(False),
-            )
-            .values(
-                status=SessionStatus.error.value,
-                error="The run could not be scheduled; start it again",
-            )
-            .execution_options(synchronize_session=False)
+        pending = await finish_run(
+            db,
+            session_id,
+            generation,
+            "error",
+            source="dispatch",
+            error="The run could not be scheduled; start it again",
         )
         await db.commit()
+        await publish(pending)
         logger.exception("Session %s: run dispatch failed", session_id)
         if isinstance(exc, asyncio.CancelledError):
             raise
