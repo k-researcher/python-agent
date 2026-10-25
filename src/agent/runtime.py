@@ -79,6 +79,7 @@ logger = logging.getLogger(__name__)
 
 # Lease of the run owner, renewed every third of it. A lost lease cancels the run.
 FENCE_LEASE_SECONDS = 60.0
+RECONCILE_SECONDS = 5.0
 # Most read-only tool calls of one model reply that run at the same time.
 PARALLEL_TOOL_LIMIT = 4
 
@@ -243,6 +244,40 @@ class AgentSupervisor:
 
     async def run_job(self, session_id: str, generation: int | None = None) -> None:
         await self._run_guarded(session_id, generation)
+
+    async def reconcile_pending(self) -> None:
+        """Dispatch durable pending intents whose executor is absent or expired."""
+        async with session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(Session.id, Session.run_generation).where(
+                        Session.status == SessionStatus.pending.value,
+                        Session.run_generation > 0,
+                        Session.stop_requested.is_(False),
+                        or_(
+                            Session.owner_token.is_(None),
+                            Session.lease_until < datetime.now(UTC),
+                        ),
+                    )
+                )
+            ).all()
+        for session_id, generation in rows:
+            try:
+                await self.start(session_id, new_run=False, expected_generation=generation)
+            except Exception:
+                logger.exception("Session %s: pending dispatch will be retried", session_id)
+
+    def start_reconciliation(self) -> asyncio.Task[None]:
+        """Start reconciliation; the API or worker lifespan owns the returned task."""
+        return asyncio.create_task(self._reconcile_loop(), name="pending-reconciler")
+
+    async def _reconcile_loop(self) -> None:
+        while True:
+            try:
+                await self.reconcile_pending()
+            except Exception:
+                logger.exception("Pending reconciliation will be retried")
+            await asyncio.sleep(RECONCILE_SECONDS)
 
     async def infrastructure_status(self) -> dict[str, Any]:
         if self.task_queue is None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import webbrowser
 from collections.abc import AsyncIterator
@@ -48,9 +49,17 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await init_database()
     await broker.start(settings, listen=True)
     await announce_login_link()
-    yield
-    await supervisor.shutdown()
-    await broker.stop()
+    reconciler = (
+        supervisor.start_reconciliation() if settings.execution_mode == "embedded" else None
+    )
+    try:
+        yield
+    finally:
+        if reconciler is not None:
+            reconciler.cancel()
+            await asyncio.gather(reconciler, return_exceptions=True)
+        await supervisor.shutdown()
+        await broker.stop()
 
 
 app = FastAPI(title="Python Agent", version="0.1.0", lifespan=lifespan)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,7 @@ from agent.database import init_database, session_factory
 from agent.models import Event, Session
 from agent.runtime import AgentSupervisor
 from agent.session_fence import CURRENT_FENCE, FenceLostError, claim, install_commit_guard
-from tests.integration.test_runtime_start import make_session
+from tests.integration.test_runtime_start import fake_queue, make_session
 
 
 async def outcome_rows(session_id: str) -> list[Any]:
@@ -641,6 +642,83 @@ class FinishingSupervisor(AgentSupervisor):
         async with session_factory() as db:
             await finish_run(db, session_id, fence.generation, "completed")
             await db.commit()
+
+
+@pytest.mark.parametrize("redis_mode", [False, True])
+async def test_reconcile_pending_has_one_execution_even_after_duplicate_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, redis_mode: bool
+) -> None:
+    session_id = await make_session(tmp_path, run_generation=8)
+    supervisor = FinishingSupervisor()
+    queue = fake_queue(f"recover-{session_id}") if redis_mode else None
+    supervisor.task_queue = queue
+    try:
+        await asyncio.gather(*(supervisor.reconcile_pending() for _ in range(3)))
+        if queue is not None:
+            await queue.client.delete(queue._dedupe_key(session_id, 8))
+            await supervisor.reconcile_pending()
+            messages = await queue.read("worker", count=1000, block_ms=1)
+            own = [message for message in messages if message.session_id == session_id]
+            assert len(own) == 2
+            await asyncio.gather(
+                *(supervisor.run_job(message.session_id, message.generation) for message in own)
+            )
+            await supervisor.run_job(session_id, 8)
+        else:
+            await asyncio.gather(*supervisor._tasks.values())
+        assert supervisor.runs.count(session_id) == 1
+        assert len(await outcome_rows(session_id)) == 1
+    finally:
+        await supervisor.shutdown()
+
+
+async def test_reconcile_includes_expired_owner_not_live_owner(tmp_path: Path) -> None:
+    expired = await make_session(
+        tmp_path,
+        run_generation=1,
+        owner_token="dead",
+        lease_until=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    live = await make_session(
+        tmp_path,
+        run_generation=1,
+        owner_token="live",
+        lease_until=datetime.now(UTC) + timedelta(seconds=60),
+    )
+    supervisor = FinishingSupervisor()
+    try:
+        await supervisor.reconcile_pending()
+        await asyncio.gather(*supervisor._tasks.values())
+        assert expired in supervisor.runs and live not in supervisor.runs
+    finally:
+        await supervisor.shutdown()
+
+
+async def test_reconciler_retries_without_process_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = FinishingSupervisor()
+    retried = asyncio.Event()
+    attempts = 0
+
+    async def scan() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary outage")
+        retried.set()
+
+    monkeypatch.setattr(supervisor, "reconcile_pending", scan, raising=False)
+    monkeypatch.setattr(runtime, "RECONCILE_SECONDS", 0.01, raising=False)
+    reconciler = supervisor.start_reconciliation()
+    try:
+        await asyncio.wait_for(retried.wait(), 2)
+    finally:
+        reconciler.cancel()
+        await asyncio.gather(reconciler, return_exceptions=True)
+        await supervisor.shutdown()
+    assert reconciler.cancelled()
+    assert attempts >= 2
 
 
 async def test_competing_finishers_produce_one_outcome(tmp_path: Path) -> None:

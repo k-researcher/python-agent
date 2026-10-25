@@ -53,6 +53,7 @@ class AgentWorker:
         await init_database(recover_running=False)
         await self.queue.ensure_group()
         await broker.start(self.settings, listen=False)
+        reconciler = self.supervisor.start_reconciliation()
         heartbeat = asyncio.create_task(self._heartbeat(), name="worker-heartbeat")
         try:
             while True:
@@ -77,6 +78,8 @@ class AgentWorker:
                     )
                     self._tasks.add(task)
         finally:
+            reconciler.cancel()
+            await asyncio.gather(reconciler, return_exceptions=True)
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat
