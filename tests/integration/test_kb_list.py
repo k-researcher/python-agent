@@ -16,7 +16,7 @@ def _sha(content: str) -> str:
     return hashlib.sha256(content.encode()).hexdigest()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 async def kb_documents() -> None:
     await init_database(recover_running=False)
     async with session_factory() as db:

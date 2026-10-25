@@ -6,9 +6,13 @@ module-level singletons, so the environment must be prepared first.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import sqlite3
 import tempfile
 from pathlib import Path
+
+import pytest
 
 _DATA_DIR = Path(tempfile.mkdtemp(prefix="python-agent-tests-"))
 
@@ -26,3 +30,28 @@ os.environ["AGENT_MODELS_FILE"] = ""
 os.environ["AGENT_AUTH_OPEN_BROWSER"] = "false"
 os.environ["AGENT_ALLOWED_HOSTS"] = '["testserver", "localhost", "127.0.0.1"]'
 os.environ["AGENT_EXTRA_ORIGINS"] = '["http://testserver"]'
+
+
+@pytest.fixture(scope="session")
+def empty_runtime_database() -> Path:
+    from agent.database import engine, init_database
+
+    asyncio.run(init_database(recover_running=False))
+    asyncio.run(engine.dispose())
+    snapshot = _DATA_DIR / "empty.db"
+    with sqlite3.connect(_DATA_DIR / "agent.db") as source, sqlite3.connect(snapshot) as target:
+        source.backup(target)
+    return snapshot
+
+
+@pytest.fixture(autouse=True)
+def isolate_runtime_database(empty_runtime_database: Path) -> None:
+    """Do not let background recovery execute another test's durable intents."""
+    from agent.database import engine
+
+    asyncio.run(engine.dispose())
+    with (
+        sqlite3.connect(empty_runtime_database) as source,
+        sqlite3.connect(_DATA_DIR / "agent.db") as target,
+    ):
+        source.backup(target)
