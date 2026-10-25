@@ -582,6 +582,32 @@ async def test_interrupted_cannot_be_claimed(tmp_path: Path) -> None:
         assert await claim(db, session_id, lease_seconds=60) is None
 
 
+@pytest.mark.parametrize("claimed", [False, True])
+async def test_late_dispatch_failure_only_finishes_unowned_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, claimed: bool
+) -> None:
+    from fastapi import HTTPException
+
+    from agent import api
+
+    session_id = await make_session(tmp_path, run_generation=2)
+
+    async def dispatch(*args: Any, **kwargs: Any) -> bool:
+        if claimed:
+            async with session_factory() as db:
+                assert await claim(db, session_id, lease_seconds=60)
+        raise RuntimeError("dispatch failed")
+
+    monkeypatch.setattr(api.supervisor, "start", dispatch)
+    async with session_factory() as db:
+        with pytest.raises(HTTPException) as caught:
+            await api._dispatch_session_run(db, session_id, 2)
+        assert caught.value.status_code == 503
+    rows = await outcome_rows(session_id)
+    assert [row.status for row in rows] == ([] if claimed else ["error"])
+    assert len(await status_events(session_id)) == (0 if claimed else 1)
+
+
 class FinishingSupervisor(AgentSupervisor):
     def __init__(self) -> None:
         super().__init__(get_settings())
