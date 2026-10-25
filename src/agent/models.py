@@ -270,6 +270,25 @@ class Approval(Base):
     tool_call: Mapped[ToolCall] = relationship(back_populates="approval")
 
 
+class SessionRunOutcome(Base):
+    __tablename__ = "session_run_outcomes"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('completed', 'stopped', 'error', 'interrupted')",
+            name="ck_session_run_outcomes_status",
+        ),
+    )
+
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True
+    )
+    generation: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status: Mapped[str] = mapped_column(String(50))
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Event(Base):
     __tablename__ = "events"
 
