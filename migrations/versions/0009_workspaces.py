@@ -81,7 +81,7 @@ def upgrade() -> None:
         sa.column("display_name", sa.String),
         sa.column("enabled", sa.Boolean),
         sa.column("is_operator", sa.Boolean),
-        sa.column("created_at", sa.DateTime),
+        sa.column("created_at", sa.DateTime(timezone=True)),
     )
     op.bulk_insert(
         users,
@@ -99,7 +99,7 @@ def upgrade() -> None:
         "workspaces",
         sa.column("id", sa.String),
         sa.column("name", sa.String),
-        sa.column("created_at", sa.DateTime),
+        sa.column("created_at", sa.DateTime(timezone=True)),
     )
     op.bulk_insert(
         workspaces,
@@ -116,8 +116,8 @@ def upgrade() -> None:
         sa.column("workspace_id", sa.String),
         sa.column("user_id", sa.String),
         sa.column("role", sa.String),
-        sa.column("revoked_at", sa.DateTime),
-        sa.column("created_at", sa.DateTime),
+        sa.column("revoked_at", sa.DateTime(timezone=True)),
+        sa.column("created_at", sa.DateTime(timezone=True)),
     )
     op.bulk_insert(
         memberships,
