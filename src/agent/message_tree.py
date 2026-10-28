@@ -106,6 +106,10 @@ async def append_message(db: AsyncSession, session_id: str, **fields: Any) -> Me
         raise TreeError("append_message sets parent_id itself", 400)
     await lock_session(db, session_id)
     head = await current_head(db, session_id)
+    if fields.get("role") == "assistant":
+        fields["run_generation"] = await db.scalar(
+            sa.select(Session.run_generation).where(Session.id == session_id)
+        )
     message = Message(session_id=session_id, parent_id=head.id if head else None, **fields)
     db.add(message)
     await db.flush()
@@ -382,7 +386,11 @@ async def fork(
         title=title,
         created_by_user_id=actor_user_id,
         status=SessionStatus.completed.value,
-        configuration=dict(source.configuration or {}),
+        configuration={
+            key: value
+            for key, value in (source.configuration or {}).items()
+            if not key.startswith(("notify_", "wake_"))
+        },
     )
     db.add(copy)
     await db.flush()

@@ -132,3 +132,31 @@ async def test_long_message_is_truncated_with_flag(tmp_path: Path) -> None:
     message = result["messages"][0]
     assert message["truncated"] is True
     assert len(message["content"]) == MAX_MESSAGE_CHARS
+
+
+async def test_read_exact_result_survives_new_history_and_stays_scoped(tmp_path: Path) -> None:
+    parent, child, foreign = await make_sessions(tmp_path)
+    async with session_factory() as db:
+        answer = Message(
+            session_id=child, role="assistant", content="Original result", skipped=True
+        )
+        db.add(answer)
+        await db.flush()
+        answer_id = answer.id
+        db.add_all(
+            [
+                Message(session_id=child, role="user", content=f"Later {index}")
+                for index in range(40)
+            ]
+        )
+        await db.commit()
+    tool = ReadSessionTool()
+    ctx = context(parent, tmp_path)
+    result = await tool.execute(ctx, {"session_id": child, "message_id": answer_id})
+    assert len(result["messages"]) == 1
+    assert result["messages"][0]["id"] == answer_id
+    assert result["messages"][0]["content"] == "Original result"
+    result = await tool.execute(ctx, {"session_id": parent, "message_id": answer_id})
+    assert result["messages"] == []
+    with pytest.raises(ToolError, match="Session not found"):
+        await tool.execute(ctx, {"session_id": foreign, "message_id": answer_id})

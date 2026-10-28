@@ -27,7 +27,7 @@ from agent.checkpoints import load_context_rows
 from agent.config import Settings, get_settings
 from agent.context_inference import ContextInference, ContextPreparationError, context_stats
 from agent.database import get_db, session_factory
-from agent.events import broker, emit_event
+from agent.events import broker, emit_event, publish
 from agent.message_tree import IDLE_STATUSES, append_message
 from agent.model_registry import effective_registry, select_model
 from agent.models import (
@@ -401,6 +401,19 @@ async def _dispatch_session_run(db: AsyncSession, session_id: str, generation: i
 async def add_message(
     session_id: str, payload: MessageCreate, db: AsyncSession = Depends(get_db)
 ) -> Message:
+    from sqlalchemy.exc import DBAPIError
+
+    from agent.session_inbox import deliver, lock_session, retryable, validate_text
+
+    validate_text(payload.content, bounded=False)
+    for attempt in range(3):
+        try:
+            await lock_session(db, session_id)
+            break
+        except DBAPIError as error:
+            await db.rollback()
+            if not retryable(error) or attempt == 2:
+                raise
     session = await db.get(Session, session_id)
     if session is None:
         raise HTTPException(404, "Session not found")
@@ -417,6 +430,8 @@ async def add_message(
             validate_effort(model, payload.reasoning_effort)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+    _, inbox_events = await deliver(db, session.id, human=True)
+    await db.execute(update(Session).where(Session.id == session.id).values(inbox_hop=0))
     message = await append_message(
         db,
         session.id,
@@ -432,6 +447,7 @@ async def add_message(
     db.add(event)
     await db.flush()
     await db.commit()
+    await publish(inbox_events)
     await _dispatch_session_run(db, session.id, session.run_generation)
     try:
         await broker.broadcast(

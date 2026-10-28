@@ -133,7 +133,14 @@ class Project(Base):
 
 class Session(Base):
     __tablename__ = "sessions"
-    __table_args__ = (Index("ix_sessions_archived_updated_at", "archived", "updated_at"),)
+    __table_args__ = (
+        Index("ix_sessions_archived_updated_at", "archived", "updated_at"),
+        CheckConstraint("inbox_hop >= 0", name="ck_sessions_inbox_hop"),
+        CheckConstraint(
+            "notify_generation IS NULL OR (notify_generation > 0 AND parent_id IS NOT NULL)",
+            name="ck_sessions_notify_generation",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="RESTRICT"))
@@ -159,6 +166,8 @@ class Session(Base):
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     configuration: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     budget_state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, default=None)
+    inbox_hop: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    notify_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -203,6 +212,8 @@ class Message(Base):
         ForeignKey("sessions.id", ondelete="CASCADE"), index=True
     )
     role: Mapped[str] = mapped_column(String(30))
+    # Assigned when an assistant message is appended; old history is not inferred.
+    run_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
     parent_id: Mapped[int | None] = mapped_column(
         ForeignKey("messages.id", name="fk_messages_parent_id_messages", ondelete="SET NULL"),
         nullable=True,
@@ -277,6 +288,22 @@ class SessionRunOutcome(Base):
             "status IN ('completed', 'stopped', 'error', 'interrupted')",
             name="ck_session_run_outcomes_status",
         ),
+        CheckConstraint(
+            "(notice_target_id IS NULL AND notice_hop IS NULL AND notice_content IS NULL "
+            "AND notice_message_id IS NULL AND notice_skipped_at IS NULL) OR "
+            "(notice_target_id IS NOT NULL AND notice_hop IS NOT NULL "
+            "AND notice_content IS NOT NULL AND notice_hop >= 0 "
+            "AND length(notice_content) BETWEEN 1 AND 8000)",
+            name="ck_session_run_outcomes_notice",
+        ),
+        Index(
+            "ix_session_run_outcomes_notice",
+            "notice_skipped_at",
+            "notice_target_id",
+            "created_at",
+            "session_id",
+            "generation",
+        ),
     )
 
     session_id: Mapped[str] = mapped_column(
@@ -286,7 +313,50 @@ class SessionRunOutcome(Base):
     status: Mapped[str] = mapped_column(String(50))
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notice_target_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    notice_hop: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    notice_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notice_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Mutable dispatch state only; the notice snapshot above remains immutable.
+    notice_skipped_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SessionInbox(Base):
+    __tablename__ = "session_inbox"
+    __table_args__ = (
+        CheckConstraint("kind IN ('message', 'child_finished')", name="ck_session_inbox_kind"),
+        CheckConstraint("length(content) BETWEEN 1 AND 8000", name="ck_session_inbox_content"),
+        CheckConstraint("hop >= 0", name="ck_session_inbox_hop"),
+        CheckConstraint(
+            "NOT (delivered_at IS NOT NULL AND rejected_at IS NOT NULL)",
+            name="ck_session_inbox_closed",
+        ),
+        UniqueConstraint("dedupe_key", name="uq_session_inbox_dedupe_key"),
+        Index(
+            "ix_session_inbox_pending",
+            "target_session_id",
+            "delivered_at",
+            "rejected_at",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    target_session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
+    sender_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True
+    )
+    kind: Mapped[str] = mapped_column(Text)
+    content: Mapped[str] = mapped_column(Text)
+    hop: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    dedupe_key: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Event(Base):

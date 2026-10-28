@@ -105,6 +105,13 @@ class MessageCreate(BaseModel):
     # Level for this message and the tool loop that follows it: "auto" or a model level.
     reasoning_effort: str | None = Field(default=None, max_length=20)
 
+    @field_validator("content")
+    @classmethod
+    def reject_nul(cls, content: str) -> str:
+        if "\x00" in content:
+            raise ValueError("NUL is not allowed in messages")
+        return content
+
 
 class MessageRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
