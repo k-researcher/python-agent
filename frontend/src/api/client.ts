@@ -6,6 +6,7 @@ import type {
   Project,
   PublicConfig,
   Session,
+  SnapshotStamp,
 } from "./types";
 
 export class ApiError extends Error {
@@ -92,6 +93,15 @@ function createSessionRequest(
   });
 }
 
+async function snapshot<T extends object>(sessionId: string, resource: string): Promise<T & SnapshotStamp> {
+  const envelope = await request<{ data: T; run_generation: number; revision: number; consistent: boolean; completed_streams?: SnapshotStamp["completed_streams"] }>(
+    `/api/sessions/${sessionId}/snapshot/${resource}`,
+  );
+  return Object.assign(Array.isArray(envelope.data) ? [...envelope.data] : { ...envelope.data }, { run_generation: envelope.run_generation,
+    revision: envelope.revision, consistent: envelope.consistent,
+    ...(envelope.completed_streams ? { completed_streams: envelope.completed_streams } : {}) }) as T & SnapshotStamp;
+}
+
 export const api = {
   config: (): Promise<PublicConfig> => request<PublicConfig>("/api/config/public"),
   projects: (): Promise<Project[]> => request<Project[]>("/api/projects"),
@@ -103,15 +113,15 @@ export const api = {
   sessions: (): Promise<Session[]> => request<Session[]>("/api/sessions"),
   createSession: createSessionRequest,
   session: (sessionId: string): Promise<Session> =>
-    request<Session>(`/api/sessions/${sessionId}`),
+    snapshot<Session>(sessionId, "session"),
   messages: (sessionId: string): Promise<Message[]> =>
-    request<Message[]>(`/api/sessions/${sessionId}/messages`),
+    snapshot<Message[]>(sessionId, "messages"),
   children: (sessionId: string): Promise<Session[]> =>
-    request<Session[]>(`/api/sessions/${sessionId}/children`),
+    snapshot<Session[]>(sessionId, "children"),
   audit: (sessionId: string): Promise<OutboundAudit[]> =>
-    request<OutboundAudit[]>(`/api/sessions/${sessionId}/outbound-audit`),
+    snapshot<OutboundAudit[]>(sessionId, "audit"),
   context: (sessionId: string): Promise<ContextStats> =>
-    request<ContextStats>(`/api/sessions/${sessionId}/context`),
+    snapshot<ContextStats>(sessionId, "context"),
   sendMessage: (sessionId: string, content: string, reasoningEffort?: string): Promise<Message> =>
     request<Message>(`/api/sessions/${sessionId}/messages`, {
       method: "POST",
@@ -121,7 +131,7 @@ export const api = {
       }),
     }),
   approvals: (sessionId: string): Promise<Approval[]> =>
-    request<Approval[]>(`/api/sessions/${sessionId}/approvals?pending_only=false`),
+    snapshot<Approval[]>(sessionId, "approvals"),
   resolveApproval: (
     approvalId: string,
     decision: "approve" | "reject",

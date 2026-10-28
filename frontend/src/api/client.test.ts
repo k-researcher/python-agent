@@ -134,9 +134,10 @@ describe("api.approvals", () => {
       id: status, tool_call_id: `call-${status}`, tool_name: "shell", arguments: {},
       risk_level: "high", status, comment: null,
     }));
-    stubFetch(async () => jsonResponse(200, approvals));
+    stubFetch(async () => jsonResponse(200, { data: approvals, revision: 17, run_generation: 2, consistent: true }));
     const result = await api.approvals("session");
-    expect(lastFetchCall().url).toBe("/api/sessions/session/approvals?pending_only=false");
-    expect(result).toEqual(approvals);
+    expect(lastFetchCall().url).toBe("/api/sessions/session/snapshot/approvals");
+    expect(Array.from(result)).toEqual(approvals);
+    expect(result).toMatchObject({ revision: 17, run_generation: 2 });
   });
 });

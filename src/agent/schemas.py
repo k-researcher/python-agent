@@ -94,6 +94,9 @@ class SessionRead(BaseModel):
     status: str
     error: str | None
     archived: bool
+    run_generation: int = 0
+    revision: int = 0
+    error_code: str | None = None
     # Populated by agent.api; the message-tree fork route returns it as None.
     budget: SessionBudgetRead | None = None
     created_at: UtcDatetime

@@ -9,7 +9,15 @@ export interface Project {
   root_path: string;
 }
 
-export interface Session {
+export interface SnapshotStamp {
+  run_generation?: number;
+  revision?: number;
+  consistent?: boolean;
+  completed_streams?: Array<{ generation: number; stream_no: number; stream_id: string }>;
+}
+
+export interface Session extends SnapshotStamp {
+  error_code?: string | null;
   id: string;
   project_id: string;
   parent_id: string | null;
@@ -157,7 +165,7 @@ export interface StreamDeltaEvent {
   type: "message.delta" | "reasoning.delta" | "stream.reset";
   session_id: string;
   ephemeral: true;
-  payload: { stream_id: string; seq?: number; delta?: string };
+  payload: { generation?: number; stream_no?: number; stream_id: string; seq?: number; delta?: string };
 }
 
 export type ServerEvent = PersistentServerEvent | StreamDeltaEvent;

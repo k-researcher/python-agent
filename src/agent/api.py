@@ -16,7 +16,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import attributes, selectinload
@@ -39,6 +39,7 @@ from agent.models import (
     OutboundAudit,
     Project,
     Session,
+    SessionRunOutcome,
     SessionStatus,
     ToolCall,
 )
@@ -93,7 +94,14 @@ async def _session_read(db: AsyncSession, session: Session) -> SessionRead:
         started_at=usage.started_at,
         stop_reason=state.get("stop_reason") if current else None,
     )
+    revision = (
+        await db.scalar(select(func.max(Event.id)).where(Event.session_id == session.id)) or 0
+    )
+    outcome = await db.get(SessionRunOutcome, (session.id, session.run_generation or 0))
     return SessionRead(
+        run_generation=session.run_generation or 0,
+        revision=revision,
+        error_code=outcome.reason if outcome is not None else None,
         id=session.id,
         project_id=session.project_id,
         parent_id=session.parent_id,
@@ -442,7 +450,7 @@ async def add_message(
     event = Event(
         session_id=session.id,
         type="message.created",
-        payload={"role": "user", "message_id": message.id},
+        payload={"role": "user", "message_id": message.id, "generation": session.run_generation},
     )
     db.add(event)
     await db.flush()
@@ -633,3 +641,79 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         last_sent = loop.time()
     except WebSocketDisconnect:
         return
+
+
+async def _snapshot_stamp(db: AsyncSession, session_id: str) -> tuple[int, int]:
+    row = await db.execute(
+        select(Session.run_generation).where(Session.id == session_id).with_for_update()
+    )
+    generation = row.scalar_one_or_none()
+    if generation is None:
+        raise HTTPException(404, "Session not found")
+    revision = (
+        await db.scalar(select(func.max(Event.id)).where(Event.session_id == session_id)) or 0
+    )
+    return generation, revision
+
+
+@router.get("/sessions/{session_id}/snapshot/{resource}")
+async def session_snapshot(
+    session_id: str,
+    resource: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Versioned resource for an atomic client reload.
+
+    The session lock serializes fenced writes with the read. Context preparation uses
+    its own transactions, so check the watermark again and reject a changed snapshot.
+    """
+    before = await _snapshot_stamp(db, session_id)
+    if resource == "session":
+        data: Any = await get_session(session_id, db)
+    elif resource == "messages":
+        data = await list_messages(session_id, db)
+    elif resource == "approvals":
+        data = await list_approvals(session_id, pending_only=False, db=db)
+    elif resource == "children":
+        data = await list_children(session_id, db)
+    elif resource == "audit":
+        data = await list_outbound_audit(session_id, limit=200, db=db)
+    elif resource == "context":
+        data = await session_context(session_id, db)
+    else:
+        raise HTTPException(404, "Unknown session resource")
+    # Materialize ORM data while this read still owns its transaction.
+    if resource == "messages":
+        data = [MessageRead.model_validate(item) for item in data]
+    elif resource == "audit":
+        data = [OutboundAuditRead.model_validate(item) for item in data]
+    completed_streams: list[dict[str, Any]] = []
+    if resource == "messages":
+        payloads = await db.scalars(
+            select(Event.payload).where(
+                Event.session_id == session_id,
+                Event.type == "message.created",
+                Event.id <= before[1],
+            )
+        )
+        for payload in payloads:
+            if (
+                payload.get("role") == "assistant"
+                and type(payload.get("generation")) is int
+                and payload["generation"] >= 0
+                and type(payload.get("stream_no")) is int
+                and payload["stream_no"] > 0
+                and isinstance(payload.get("stream_id"), str)
+                and payload["stream_id"]
+            ):
+                completed_streams.append(
+                    {key: payload[key] for key in ("generation", "stream_no", "stream_id")}
+                )
+    after = await _snapshot_stamp(db, session_id)
+    return {
+        "data": data,
+        "run_generation": before[0],
+        "revision": before[1],
+        "consistent": before == after,
+        "completed_streams": completed_streams,
+    }

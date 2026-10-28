@@ -58,7 +58,7 @@ function delta(
     type,
     session_id: "s1",
     ephemeral: true,
-    payload: { stream_id: streamId, ...(seq === undefined ? {} : { seq }), ...(deltaText ? { delta: deltaText } : {}) },
+    payload: { generation: 0, stream_no: streamId === "new" ? 2 : 1, stream_id: streamId, ...(seq === undefined ? {} : { seq }), ...(deltaText ? { delta: deltaText } : {}) },
   };
 }
 
@@ -78,6 +78,12 @@ describe("session store timeline", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     setActivePinia(createPinia());
+    vi.spyOn(api, "messages").mockResolvedValue([]);
+    vi.spyOn(api, "approvals").mockResolvedValue([]);
+    vi.spyOn(api, "children").mockResolvedValue([]);
+    vi.spyOn(api, "audit").mockResolvedValue([]);
+    vi.spyOn(api, "context").mockResolvedValue(contextStats());
+    vi.spyOn(api, "session").mockResolvedValue(sessionRecord("s1", { status: "running" }));
   });
 
   it("maps user, assistant, tool call with result, approval and summary", () => {
@@ -277,6 +283,12 @@ describe("session store applyEvent", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     setActivePinia(createPinia());
+    vi.spyOn(api, "messages").mockResolvedValue([]);
+    vi.spyOn(api, "approvals").mockResolvedValue([]);
+    vi.spyOn(api, "children").mockResolvedValue([]);
+    vi.spyOn(api, "audit").mockResolvedValue([]);
+    vi.spyOn(api, "context").mockResolvedValue(contextStats());
+    vi.spyOn(api, "session").mockResolvedValue(sessionRecord("s1", { status: "running" }));
   });
 
   it("appends message deltas and drops repeats or stale seq", () => {
@@ -499,6 +511,12 @@ describe("session store actions", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     setActivePinia(createPinia());
+    vi.spyOn(api, "messages").mockResolvedValue([]);
+    vi.spyOn(api, "approvals").mockResolvedValue([]);
+    vi.spyOn(api, "children").mockResolvedValue([]);
+    vi.spyOn(api, "audit").mockResolvedValue([]);
+    vi.spyOn(api, "context").mockResolvedValue(contextStats());
+    vi.spyOn(api, "session").mockResolvedValue(sessionRecord("s1", { status: "running" }));
   });
 
   it("send() forwards reasoningEffort, resets streaming and adds the message exactly once across a reload race", async () => {
@@ -602,6 +620,12 @@ describe("session store open races", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     setActivePinia(createPinia());
+    vi.spyOn(api, "messages").mockResolvedValue([]);
+    vi.spyOn(api, "approvals").mockResolvedValue([]);
+    vi.spyOn(api, "children").mockResolvedValue([]);
+    vi.spyOn(api, "audit").mockResolvedValue([]);
+    vi.spyOn(api, "context").mockResolvedValue(contextStats());
+    vi.spyOn(api, "session").mockResolvedValue(sessionRecord("s1", { status: "running" }));
   });
 
   /** Stubs every API slice with immediate values except `messages`, which
@@ -740,6 +764,9 @@ describe("session store open races", () => {
     const messagesSpy = vi.spyOn(api, "messages").mockReturnValue(msgD.promise);
     const approvalsSpy = vi.spyOn(api, "approvals").mockReturnValue(apprD.promise);
     const contextSpy = vi.spyOn(api, "context").mockReturnValue(ctxD.promise);
+    vi.spyOn(api, "children").mockResolvedValue([]);
+    vi.spyOn(api, "audit").mockResolvedValue([]);
+    vi.spyOn(api, "session").mockResolvedValue(sessionRecord("A"));
 
     store.applyEvent({
       id: 9,
@@ -763,7 +790,7 @@ describe("session store open races", () => {
       created_at: "2026-01-01T00:00:00Z",
     });
 
-    expect(messagesSpy).toHaveBeenCalledTimes(2);
+    expect(messagesSpy).toHaveBeenCalledTimes(1); // One in-flight reload coalesces all resources.
     expect(approvalsSpy).toHaveBeenCalled();
     expect(contextSpy).toHaveBeenCalled();
 
