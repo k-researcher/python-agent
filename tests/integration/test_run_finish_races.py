@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import os
 import uuid
 from collections.abc import AsyncIterator
@@ -9,8 +8,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from alembic.migration import MigrationContext
-from alembic.operations import Operations
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import event, select, text, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
@@ -19,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from agent import runtime
 from agent.config import get_settings
 from agent.database import configure_sqlite_connection
-from agent.models import Approval, Base, Event, Project, Session, SessionRunOutcome, ToolCall
+from agent.models import Approval, Event, Project, Session, SessionRunOutcome, ToolCall
 from agent.run_finish import finish_run
 from agent.runtime import AgentSupervisor
 from agent.session_fence import (
@@ -33,15 +32,10 @@ from agent.session_fence import (
 
 
 def prepare_schema(connection: Connection) -> None:
-    Base.metadata.create_all(
-        connection,
-        tables=[
-            table for table in Base.metadata.sorted_tables if table.name != "session_run_outcomes"
-        ],
-    )
-    migration = importlib.import_module("migrations.versions.0015_session_run_outcomes")
-    with Operations.context(MigrationContext.configure(connection)):
-        migration.upgrade()
+    config = Config(str(Path(__file__).resolve().parents[2] / "alembic.ini"))
+    config.attributes["connection"] = connection
+    command.upgrade(config, "0015")
+    command.upgrade(config, "0016")
 
 
 @pytest.fixture(params=["sqlite", "postgresql"])
@@ -56,12 +50,21 @@ async def run_store(
         engine = create_async_engine(url, connect_args={"server_settings": {"search_path": schema}})
     else:
         engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'runs.db'}")
-        event.listen(engine.sync_engine, "connect", lambda db, _: configure_sqlite_connection(db))
+        event.listen(
+            engine.sync_engine,
+            "connect",
+            lambda db, _: configure_sqlite_connection(db, foreign_keys=False),
+        )
     try:
         async with engine.begin() as connection:
             if request.param == "postgresql":
                 await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
             await connection.run_sync(prepare_schema)
+        if request.param == "sqlite":
+            await engine.dispose()
+            event.listen(
+                engine.sync_engine, "connect", lambda db, _: configure_sqlite_connection(db)
+            )
         factory = async_sessionmaker(engine, expire_on_commit=False)
         monkeypatch.setattr(runtime, "session_factory", factory)
         install_commit_guard()
@@ -102,6 +105,52 @@ async def seed_call(
             db.add(approval_row)
         await db.commit()
         return call.id, approval_row.id if approval_row else None
+
+
+async def test_inbox_migration_roundtrip_uses_native_environment(
+    run_store: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    from sqlalchemy import inspect
+
+    session_id = await seed(run_store, tmp_path)
+    async with run_store() as db:
+        await finish_run(db, session_id, 1, "completed")
+        await db.commit()
+    engine = run_store.kw["bind"]
+
+    def migrate(connection: Connection, action: str, revision: str) -> None:
+        config = Config(str(Path(__file__).resolve().parents[2] / "alembic.ini"))
+        config.attributes["connection"] = connection
+        getattr(command, action)(config, revision)
+
+    async with engine.connect() as connection:
+        if engine.dialect.name == "sqlite":
+            await connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            await connection.commit()
+        await connection.run_sync(migrate, "downgrade", "0015")
+        await connection.commit()
+        checks = await connection.run_sync(
+            lambda sync: inspect(sync).get_check_constraints("session_run_outcomes")
+        )
+        assert "ck_session_run_outcomes_status" in {row["name"] for row in checks}
+        assert "ck_session_run_outcomes_notice" not in {row["name"] for row in checks}
+        assert await connection.scalar(text("SELECT count(*) FROM sessions WHERE title='run'")) == 1
+        assert (
+            await connection.scalar(text("SELECT status FROM session_run_outcomes")) == "completed"
+        )
+        await connection.commit()
+        await connection.run_sync(migrate, "upgrade", "0016")
+        await connection.commit()
+        if engine.dialect.name == "sqlite":
+            assert (await connection.execute(text("PRAGMA foreign_key_check"))).all() == []
+            await connection.commit()
+            await connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            await connection.commit()
+    async with run_store() as db:
+        row = await db.get(Session, session_id)
+        assert row.inbox_hop == 0 and row.notify_generation is None
+        assert (await db.get(SessionRunOutcome, (session_id, 1))).notice_target_id is None
 
 
 @pytest.mark.parametrize("write", ["bulk", "flush", "autoflush", "claim", "approval"])
