@@ -1,3 +1,4 @@
+import asyncio
 import time
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,7 @@ class ConcurrencyProbe:
     def __init__(self) -> None:
         self.active = 0
         self.maximum = 0
+        self.both_entered = asyncio.Event()
 
 
 class FakeProfileLLM:
@@ -95,9 +97,10 @@ class FakeProfileLLM:
         self.probe.active += 1
         self.probe.maximum = max(self.probe.maximum, self.probe.active)
         try:
-            import asyncio
-
-            await asyncio.sleep(0.05)
+            async with asyncio.timeout(2):
+                if self.probe.active == 2:
+                    self.probe.both_entered.set()
+                await self.probe.both_entered.wait()
             return LLMResponse(f"Response from {self.name}", [], "stop", 10, 3)
         finally:
             self.probe.active -= 1
