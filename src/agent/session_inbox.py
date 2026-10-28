@@ -240,6 +240,16 @@ async def promote_notices(factory: async_sessionmaker[AsyncSession]) -> None:
                 .where(
                     SessionRunOutcome.notice_target_id.is_not(None),
                     SessionRunOutcome.notice_skipped_at.is_(None),
+                    select(func.count())
+                    .select_from(SessionInbox)
+                    .where(
+                        SessionInbox.target_session_id == SessionRunOutcome.notice_target_id,
+                        SessionInbox.delivered_at.is_(None),
+                        SessionInbox.rejected_at.is_(None),
+                    )
+                    .correlate(SessionRunOutcome)
+                    .scalar_subquery()
+                    < INBOX_CAPACITY,
                     ~exists().where(
                         SessionInbox.dedupe_key
                         == "child:"

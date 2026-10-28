@@ -283,6 +283,73 @@ async def test_notice_reconcile_scan_is_bounded(
     assert len(attempts) == 101
 
 
+async def test_full_inbox_does_not_starve_other_notice_targets(
+    run_store: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    inbox = inbox_module()
+    child, full_target = await pair(run_store, tmp_path)
+    async with run_store() as db:
+        source = await db.get(Session, child)
+        free_target = Session(project_id=source.project_id, title="Free target", configuration={})
+        db.add(free_target)
+        await db.flush()
+        free_id = free_target.id
+        oldest = datetime.now(UTC) - timedelta(days=1)
+        db.add_all(
+            inbox.SessionInbox(
+                target_session_id=full_target,
+                sender_session_id=child,
+                kind="message",
+                content="Full",
+                hop=0,
+                dedupe_key=f"full:{index}",
+            )
+            for index in range(inbox.INBOX_CAPACITY)
+        )
+        db.add_all(
+            SessionRunOutcome(
+                session_id=child,
+                generation=generation,
+                status="completed",
+                notice_target_id=full_target,
+                notice_hop=0,
+                notice_content="Waiting notice",
+                created_at=oldest,
+            )
+            for generation in range(1, inbox.NOTICE_SCAN_LIMIT + 1)
+        )
+        free_generation = inbox.NOTICE_SCAN_LIMIT + 1
+        db.add(
+            SessionRunOutcome(
+                session_id=child,
+                generation=free_generation,
+                status="completed",
+                notice_target_id=free_id,
+                notice_hop=0,
+                notice_content="Deliverable notice",
+                created_at=oldest + timedelta(seconds=1),
+            )
+        )
+        await db.commit()
+    await inbox.promote_notices(run_store)
+    async with run_store() as db:
+        receipt = await db.scalar(
+            select(inbox.SessionInbox).where(
+                inbox.SessionInbox.dedupe_key == f"child:{child}:{free_generation}"
+            )
+        )
+        assert receipt is not None, "A full inbox must not block notices for another target"
+        assert receipt.target_session_id == free_id
+        assert (
+            await db.scalar(
+                select(func.count()).select_from(inbox.pending_rows(full_target).subquery())
+            )
+            == inbox.INBOX_CAPACITY
+        )
+
+
 async def test_busy_message_is_tool_error_and_sender_run_continues(
     run_store: async_sessionmaker[AsyncSession], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
