@@ -23,6 +23,12 @@ class LLMErrorKind(StrEnum):
     timeout = "timeout"
     network = "network"
     unknown = "unknown"
+    inference_timeout = "llm_inference_timeout"
+    semantic_idle = "llm_semantic_idle"
+    empty_response = "llm_empty_response"
+    repetition = "llm_repetition"
+    invalid_response = "llm_invalid_response"
+    stream_incomplete = "llm_stream_incomplete"
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,3 +160,14 @@ def is_context_overflow(info: ProviderErrorInfo) -> bool:
     Only the classified kind counts: a known phrase in another error is not an overflow.
     """
     return info.kind is LLMErrorKind.context_overflow
+
+
+TERMINAL_GUARDS = frozenset(
+    {
+        LLMErrorKind.inference_timeout,
+        LLMErrorKind.semantic_idle,
+        LLMErrorKind.empty_response,
+        LLMErrorKind.repetition,
+        LLMErrorKind.invalid_response,
+    }
+)

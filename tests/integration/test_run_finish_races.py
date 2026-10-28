@@ -360,6 +360,123 @@ async def test_two_inbox_auto_claims_increment_generation_once(
     assert results.count(2) == 1 and results.count(None) == 1
 
 
+async def test_postgres_locked_target_gives_sender_tool_error(
+    run_store: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if run_store.kw["bind"].dialect.name != "postgresql":
+        pytest.skip("PostgreSQL row-lock race")
+    async with asyncio.timeout(10):
+        sender, _, target = await inbox_sessions(run_store, tmp_path)
+
+        from sqlalchemy import func
+
+        from agent.llm import LLMResponse
+        from agent.message_tree import append_message
+        from agent.models import Message, SessionInbox
+        from agent.session_fence import release
+        from agent.session_inbox import enqueue
+
+        supervisor = AgentSupervisor(get_settings())
+        seen: list[Any] = []
+
+        class Reply:
+            endpoint = "https://inference.invalid/chat"
+
+            async def chat(self, messages: Any, tools: Any, **options: Any) -> Any:
+                seen.append(messages)
+                return LLMResponse("Sender continued", [], "stop", 1, 1)
+
+        monkeypatch.setattr(supervisor, "llm", Reply())
+        monkeypatch.setattr(supervisor, "_run", supervisor._run_session)
+        async with run_store() as db:
+            await append_message(db, sender, role="user", content="Send data")
+            await append_message(
+                db,
+                sender,
+                role="assistant",
+                tool_calls=[
+                    {
+                        "id": "locked-call",
+                        "type": "function",
+                        "function": {
+                            "name": "message_to_session",
+                            "arguments": {"session_id": target, "message": "data"},
+                        },
+                    }
+                ],
+            )
+            db.add(
+                ToolCall(
+                    id="locked-call",
+                    session_id=sender,
+                    name="message_to_session",
+                    arguments={"session_id": target, "message": "data"},
+                    risk_level="network_access",
+                    status="pending",
+                )
+            )
+            await db.commit()
+
+        lock_acquired = asyncio.Event()
+        release_lock = asyncio.Event()
+
+        async def hold_lock() -> None:
+            async with run_store() as db:
+                await db.execute(select(Session.id).where(Session.id == target).with_for_update())
+                lock_acquired.set()
+                await release_lock.wait()
+                await db.rollback()
+
+        lock_task = asyncio.create_task(hold_lock())
+        try:
+            await lock_acquired.wait()
+            # Keep the target locked through retries and the next inference request.
+            await supervisor.run_job(sender, 1)
+            release_lock.set()
+            await lock_task
+        finally:
+            release_lock.set()
+            if not lock_task.done():
+                lock_task.cancel()
+            await asyncio.gather(lock_task, return_exceptions=True)
+
+        async with run_store() as db:
+            call = await db.get(ToolCall, "locked-call")
+            assert call.status == "error" and call.result["success"] is False
+            assert "Inbox temporarily busy" in call.result["error"]
+            assert (await db.get(SessionRunOutcome, (sender, 1))).status == "completed"
+            assert (await db.get(Session, sender)).status == "completed"
+            assert await db.scalar(select(func.count()).select_from(SessionInbox)) == 0
+            closing = list(
+                await db.scalars(select(Message).where(Message.tool_call_id == "locked-call"))
+            )
+            assert len(closing) == 1 and '"success": false' in closing[0].content
+        assert len(seen) == 1 and "Inbox temporarily busy" in str(seen[0])
+
+        # Retry under a fresh run fence; repeated enqueue must keep one receipt.
+        async with run_store() as db:
+            await new_generation(db, sender)
+            await db.execute(update(Session).where(Session.id == sender).values(status="pending"))
+            await db.commit()
+            fence = await claim(db, sender, lease_seconds=60)
+        assert fence is not None
+        token = CURRENT_FENCE.set(fence)
+        try:
+            async with run_store() as db:
+                await enqueue(db, sender, target, "data", "tool:locked-call")
+                await db.commit()
+                await enqueue(db, sender, target, "data", "tool:locked-call")
+                await db.commit()
+        finally:
+            CURRENT_FENCE.reset(token)
+            async with run_store() as db:
+                await release(db, fence)
+        async with run_store() as db:
+            assert await db.scalar(select(func.count()).select_from(SessionInbox)) == 1
+
+
 async def test_inbox_delivery_rejects_expired_and_reclaimed_fence(
     run_store: async_sessionmaker[AsyncSession],
     tmp_path: Path,

@@ -533,7 +533,11 @@ async def test_publication_failure_does_not_lose_dispatch_or_saved_event(
         event = await db.scalar(
             select(Event).where(Event.session_id == session_id, Event.type == "message.created")
         )
-        assert event is not None and event.payload == {"role": "user", "message_id": message.id}
+        assert event is not None and event.payload == {
+            "role": "user",
+            "message_id": message.id,
+            "generation": 8,
+        }
         assert await db.get(Message, message.id) is not None
 
 

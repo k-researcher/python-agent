@@ -9,6 +9,7 @@ import {
   type OutboundAudit,
   type ServerEvent,
   type Session,
+  type SnapshotStamp,
   type StreamDeltaEvent,
   type TimelineItem,
   type ToolCallView,
@@ -103,21 +104,47 @@ export const useSessionStore = defineStore("session", () => {
   const audit = ref<OutboundAudit[]>([]);
   const children = ref<Session[]>([]);
 
-  // Delta ordering: one stream_id per generation; seq grows inside a stream per kind.
-  // Superseded stream ids are remembered so a straggling fragment from an older
-  // generation is dropped instead of being mistaken for a fresh stream.
   let activeStreamId: string | null = null;
   let finishedStreamIds = new Set<string>();
+  let maxStreamNo = 0;
+  let maxStreamId: string | null = null;
   let contentSeq = 0;
   let reasoningSeq = 0;
   let generation = 0;
+  let runGeneration = 0;
+  let runOpen = true;
+  let epoch = 0;
+  let latestRevision = 0;
+  let acceptedRevision = 0;
+  type Reload = { token: number; dirty: boolean; promise: Promise<void> };
+  let reload: Reload | null = null;
+  const terminal = new Set(["completed", "stopped", "error", "interrupted"]);
 
   function resetStream(): void {
+    if (activeStreamId != null) finishedStreamIds.add(activeStreamId);
     streaming.value = null;
     activeStreamId = null;
-    finishedStreamIds.clear();
-    contentSeq = 0;
-    reasoningSeq = 0;
+    contentSeq = reasoningSeq = 0;
+  }
+
+  function confirmRun(next: number, status: string): boolean {
+    if (next < runGeneration) return false;
+    if (next > runGeneration) {
+      if (status !== "running" && status !== "pending" && !terminal.has(status)) return false;
+      epoch += 1;
+      resetStream();
+      finishedStreamIds = new Set();
+      maxStreamNo = 0;
+      maxStreamId = null;
+      runGeneration = next;
+      runOpen = true;
+    }
+    if (!runOpen && !terminal.has(status)) return false;
+    if (terminal.has(status)) {
+      runOpen = false;
+      resetStream();
+    }
+    return true;
   }
 
   function clearSessionData(): void {
@@ -128,6 +155,11 @@ export const useSessionStore = defineStore("session", () => {
     children.value = [];
     session.value = null;
     resetStream();
+    finishedStreamIds.clear();
+    maxStreamId = null;
+    maxStreamNo = runGeneration = latestRevision = acceptedRevision = 0;
+    runOpen = true;
+    epoch += 1;
   }
 
   function close(): void {
@@ -140,52 +172,57 @@ export const useSessionStore = defineStore("session", () => {
     return id != null && sessionId.value === id && generation === gen;
   }
 
-  async function loadMessages(): Promise<void> {
+  function reloadAll(): Promise<void> {
     const id = sessionId.value;
-    const gen = generation;
-    if (id == null) return;
-    const data = await api.messages(id);
-    if (!isCurrent(id, gen)) return;
-    messages.value = data;
-  }
-
-  async function loadApprovals(): Promise<void> {
-    const id = sessionId.value;
-    const gen = generation;
-    if (id == null) return;
-    const data = await api.approvals(id);
-    if (!isCurrent(id, gen)) return;
-    approvals.value = data;
-  }
-
-  async function loadContext(): Promise<void> {
-    const id = sessionId.value;
-    const gen = generation;
-    if (id == null) return;
-    const data = await api.context(id);
-    if (!isCurrent(id, gen)) return;
-    context.value = data;
-  }
-
-  async function reloadAll(): Promise<void> {
-    const id = sessionId.value;
-    const gen = generation;
-    if (id == null) return;
-    const [msgs, appr, kids, aud, ctx, sess] = await Promise.all([
-      api.messages(id),
-      api.approvals(id),
-      api.children(id),
-      api.audit(id),
-      api.context(id).catch(() => null),
-      api.session(id).catch(() => null),
-    ]);
-    if (!isCurrent(id, gen)) return;
-    messages.value = msgs;
-    approvals.value = appr;
-    children.value = kids;
-    audit.value = aud;
-    context.value = ctx;
-    if (sess) session.value = sess;
+    const token = generation;
+    if (id == null) return Promise.resolve();
+    if (reload?.token === token) {
+      reload.dirty = true;
+      return reload.promise;
+    }
+    const state: Reload = { token, dirty: false, promise: Promise.resolve() };
+    reload = state;
+    state.promise = (async () => {
+      try {
+        do {
+          state.dirty = false;
+          const capturedEpoch = epoch;
+          const [msgs, appr, kids, aud, ctx, sess] = await Promise.all([
+            api.messages(id), api.approvals(id), api.children(id), api.audit(id),
+            api.context(id), api.session(id),
+          ]);
+          if (!isCurrent(id, token)) return;
+          const stamps: SnapshotStamp[] = [msgs, appr, kids, aud, ctx, sess] as SnapshotStamp[];
+          const versioned = stamps.some((item) => item.revision !== undefined);
+          const revision = sess.revision ?? 0;
+          const nextRun = sess.run_generation ?? 0;
+          if (state.dirty || capturedEpoch !== epoch || (versioned && (
+            stamps.some((item) => item.consistent === false || item.revision !== revision || item.run_generation !== nextRun) ||
+            revision < latestRevision || revision < acceptedRevision || nextRun < runGeneration
+          ))) {
+            state.dirty = true;
+            continue;
+          }
+          // Apply one clean package. A reload of a closed run cannot open it again.
+          const acceptStatus = confirmRun(nextRun, sess.status);
+          for (const identity of (msgs as SnapshotStamp).completed_streams ?? []) {
+            applyStream({ type: "stream.reset", session_id: id, ephemeral: true, payload: identity });
+          }
+          messages.value = msgs;
+          approvals.value = appr;
+          children.value = kids;
+          audit.value = aud;
+          context.value = ctx;
+          if (acceptStatus) session.value = sess;
+          else if (session.value) session.value = { ...sess, status: session.value.status, error: session.value.error };
+          acceptedRevision = revision;
+          latestRevision = Math.max(latestRevision, revision);
+        } while (state.dirty && isCurrent(id, token));
+      } finally {
+        if (reload === state) reload = null;
+      }
+    })();
+    return state.promise;
   }
 
   async function open(id: string): Promise<void> {
@@ -220,122 +257,109 @@ export const useSessionStore = defineStore("session", () => {
     const gen = generation;
     await api.resolveApproval(approvalId, decision, comment);
     if (!isCurrent(id, gen)) return;
-    await Promise.all([loadApprovals(), loadMessages()]);
+    await reloadAll();
   }
 
   async function stop(): Promise<void> {
     const id = sessionId.value;
     const gen = generation;
     if (id == null) return;
-    await api.stop(id);
-    if (!isCurrent(id, gen)) return;
-    if (session.value) {
-      session.value = { ...session.value, status: "stopped" };
+    epoch += 1;
+    runOpen = false;
+    resetStream();
+    if (session.value) session.value = { ...session.value, status: "stopped" };
+    try {
+      await api.stop(id);
+    } catch {
+      if (isCurrent(id, gen)) await reloadAll().catch(() => {});
     }
   }
 
-  function applyDelta(event: StreamDeltaEvent): void {
+  function streamNumber(payload: StreamDeltaEvent["payload"]): number | null {
+    if (Number.isInteger(payload.stream_no) && (payload.stream_no ?? 0) > 0) return payload.stream_no!;
+    return null;
+  }
+
+  function applyStream(event: StreamDeltaEvent): void {
     const payload = event.payload;
-    // Server frames are not validated upstream: a malformed frame must never throw
-    // or corrupt a live stream (self-check point 1).
-    if (typeof payload !== "object" || payload === null || typeof payload.stream_id !== "string") {
+    if (typeof payload !== "object" || payload === null || typeof payload.stream_id !== "string") return;
+    if (!runOpen || (payload.generation ?? 0) !== runGeneration) return;
+    const no = streamNumber(payload);
+    if (no === null || no < maxStreamNo) return;
+    const { stream_id, seq, delta } = payload;
+    if (event.type === "stream.reset") {
+      finishedStreamIds.add(stream_id);
+      if (no > maxStreamNo) {
+        resetStream();
+        maxStreamNo = no;
+        maxStreamId = stream_id;
+      } else if (stream_id === activeStreamId) resetStream();
       return;
     }
-    const { stream_id, seq, delta } = payload;
-    const isMessage = event.type === "message.delta";
-    // A frame without actual text never opens or mutates a stream (self-check 1):
-    // a broken frame carrying a new stream_id must not wipe the live generation.
-    if (typeof delta !== "string") return;
-    if (stream_id !== activeStreamId) {
-      // A fragment whose stream was already superseded is late: drop it and keep
-      // the current generation untouched.
-      if (finishedStreamIds.has(stream_id)) return;
-      if (activeStreamId != null) finishedStreamIds.add(activeStreamId);
-      // A brand-new stream_id starts a fresh generation; drop any queued text.
+    if (typeof delta !== "string" || finishedStreamIds.has(stream_id)) return;
+    if (no === maxStreamNo && maxStreamId !== null && maxStreamId !== stream_id) return;
+    if (no > maxStreamNo || activeStreamId === null) {
+      resetStream();
+      maxStreamNo = no;
+      maxStreamId = stream_id;
       activeStreamId = stream_id;
-      contentSeq = 0;
-      reasoningSeq = 0;
       streaming.value = { content: "", reasoning: "" };
     }
-    const current =
-      streaming.value ?? { content: "", reasoning: "" };
-    if (isMessage) {
+    const current = streaming.value ?? { content: "", reasoning: "" };
+    if (event.type === "message.delta") {
       if (seq == null || seq > contentSeq) {
         if (seq != null) contentSeq = seq;
         current.content += delta;
       }
-    } else {
-      if (seq == null || seq > reasoningSeq) {
-        if (seq != null) reasoningSeq = seq;
-        current.reasoning += delta;
-      }
+    } else if (seq == null || seq > reasoningSeq) {
+      if (seq != null) reasoningSeq = seq;
+      current.reasoning += delta;
     }
     streaming.value = current;
   }
 
-  function applyApprovalEvent(): void {
-    void loadApprovals();
-    void loadMessages();
-  }
-
   /** Fold one server event into the open session state. */
   function applyEvent(event: ServerEvent): void {
+    if (event.session_id !== sessionId.value) return;
     if (isStreamDeltaEvent(event)) {
-      if (event.session_id !== sessionId.value) return;
-      if (event.type === "stream.reset") {
-        resetStream();
-        return;
-      }
-      applyDelta(event);
+      applyStream(event);
       return;
     }
-    if (event.session_id !== sessionId.value) return;
+    const payload = event.payload;
+    if (typeof payload !== "object" || payload === null) return;
+    latestRevision = Math.max(latestRevision, event.id);
+    if (reload?.token === generation) reload.dirty = true;
+    const nextRun = typeof payload.generation === "number" ? payload.generation : 0;
     switch (event.type) {
+      case "session.status":
+      case "session.error": {
+        const status = typeof payload.status === "string" ? payload.status : session.value?.status ?? "pending";
+        if (!confirmRun(nextRun, status)) break;
+        if (session.value) session.value = { ...session.value, status,
+          run_generation: runGeneration,
+          error: typeof payload.error === "string" ? payload.error : session.value.error,
+          error_code: typeof payload.reason === "string" ? payload.reason : session.value.error_code,
+        };
+        break;
+      }
       case "message.created":
-        resetStream();
-        void loadMessages();
+        if (nextRun === runGeneration && payload.role === "assistant") {
+          if (payload.stream_id === activeStreamId || (runGeneration === 0 && payload.stream_id === undefined)) resetStream();
+        }
+        void reloadAll().catch(() => {});
         break;
       case "approval.required":
       case "approval.resolved":
       case "approval.cancelled":
-        applyApprovalEvent();
-        break;
       case "tool.completed":
-        void loadMessages();
-        break;
+      case "outbound.audit":
       case "context.compacted":
-        void loadContext();
-        break;
-      case "session.status":
-      case "session.error":
-        if (session.value) {
-          const payload = event.payload;
-          if (typeof payload !== "object" || payload === null) break;
-          const next = { ...session.value };
-          if (typeof (payload as Record<string, unknown>).status === "string") {
-            next.status = (payload as Record<string, unknown>).status as string;
-          }
-          if (typeof (payload as Record<string, unknown>).error === "string") {
-            next.error = (payload as Record<string, unknown>).error as string;
-          }
-          session.value = next;
-        }
-        break;
       case "session.child_created":
-        void loadChildren();
+        void reloadAll().catch(() => {});
         break;
       default:
         break;
     }
-  }
-
-  async function loadChildren(): Promise<void> {
-    const id = sessionId.value;
-    const gen = generation;
-    if (id == null) return;
-    const data = await api.children(id);
-    if (!isCurrent(id, gen)) return;
-    children.value = data;
   }
 
   /** Merged feed: messages (minus skipped), tool calls with results and approvals, summary, streaming. */
@@ -394,6 +418,7 @@ export const useSessionStore = defineStore("session", () => {
     resolve,
     stop,
     applyEvent,
+    reloadAll,
     timeline,
   };
 });

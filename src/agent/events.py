@@ -6,6 +6,7 @@ import logging
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.config import Settings
 from agent.models import Event
+from agent.session_fence import CURRENT_FENCE
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +118,9 @@ class PendingEvent:
 async def add_event(
     db: AsyncSession, event_type: str, payload: dict[str, Any], session_id: str | None = None
 ) -> PendingEvent:
+    fence = CURRENT_FENCE.get()
+    if fence is not None and session_id == fence.session_id:
+        payload = {"generation": fence.generation, **payload}
     event = Event(session_id=session_id, type=event_type, payload=payload)
     db.add(event)
     await db.flush()
@@ -149,6 +154,15 @@ async def emit_event(
     return pending.event
 
 
+@dataclass
+class StreamRun:
+    generation: int
+    number: int = 0
+
+
+CURRENT_STREAMS: ContextVar[StreamRun | None] = ContextVar("stream_run", default=None)
+
+
 class StreamPublisher:
     """Send streamed text to WebSocket clients as temporary events.
 
@@ -162,12 +176,35 @@ class StreamPublisher:
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
         self.stream_id = secrets.token_hex(8)
+        run = CURRENT_STREAMS.get()
+        fence = CURRENT_FENCE.get()
+        if run is None:
+            run = StreamRun(fence.generation if fence is not None else 0)
+            CURRENT_STREAMS.set(run)
+        run.number += 1
+        self.generation = run.generation
+        self.stream_no = run.number
+        self.closed = False
         self._seq = 0
         self._pending: dict[str, list[str]] = {}
         self._size = 0
         self._last_flush = asyncio.get_running_loop().time()
 
+    def close(self) -> None:
+        self.closed = True
+        self._pending, self._size = {}, 0
+
+    @property
+    def identity(self) -> dict[str, Any]:
+        return {
+            "generation": self.generation,
+            "stream_no": self.stream_no,
+            "stream_id": self.stream_id,
+        }
+
     async def add(self, kind: str, text: str) -> None:
+        if self.closed:
+            return
         self._pending.setdefault(kind, []).append(text)
         self._size += len(text)
         now = asyncio.get_running_loop().time()
@@ -175,9 +212,13 @@ class StreamPublisher:
             await self.flush()
 
     async def flush(self) -> None:
+        if self.closed:
+            return
         self._last_flush = asyncio.get_running_loop().time()
         pending, self._pending, self._size = self._pending, {}, 0
         for kind, parts in pending.items():
+            if self.closed:
+                return
             self._seq += 1
             await broker.broadcast(
                 {
@@ -185,7 +226,7 @@ class StreamPublisher:
                     "session_id": self.session_id,
                     "ephemeral": True,
                     "payload": {
-                        "stream_id": self.stream_id,
+                        **self.identity,
                         "seq": self._seq,
                         "delta": "".join(parts),
                     },
@@ -194,12 +235,13 @@ class StreamPublisher:
 
     async def reset(self) -> None:
         """Tell clients to drop the text of this stream (a retry or a fallback starts)."""
-        self._pending, self._size = {}, 0
+        self.close()
+        self._seq += 1
         await broker.broadcast(
             {
                 "type": "stream.reset",
                 "session_id": self.session_id,
                 "ephemeral": True,
-                "payload": {"stream_id": self.stream_id},
+                "payload": {**self.identity, "seq": self._seq},
             }
         )

@@ -227,6 +227,26 @@ class ModelSpec(_Spec):
     max_tokens: int = Field(gt=0)
     reasoning: ReasoningSpec = Field(default_factory=ReasoningSpec)
     pricing: PricingSpec | None = None
+    inference_timeout_seconds: float = Field(default=600, gt=0, allow_inf_nan=False, strict=True)
+    semantic_idle_timeout_seconds: float = Field(
+        default=120, gt=0, allow_inf_nan=False, strict=True
+    )
+    repetition_threshold_chars: int | None = Field(default=65536, gt=0, strict=True)
+
+    @field_validator("inference_timeout_seconds", "semantic_idle_timeout_seconds", mode="before")
+    @classmethod
+    def validate_guard_number(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("must be a finite positive number")
+        return value
+
+    @model_validator(mode="after")
+    def validate_guard_limits(self) -> Self:
+        if self.semantic_idle_timeout_seconds > self.inference_timeout_seconds:
+            raise ValueError(
+                "semantic_idle_timeout_seconds must not exceed inference_timeout_seconds"
+            )
+        return self
 
     @field_validator("max_tokens")
     @classmethod
@@ -373,6 +393,9 @@ class ResolvedModel:
     ca_bundle: str | None = None
     dialect: Literal["chat", "functions"] = "chat"
     data_in_russia: bool = False
+    inference_timeout_seconds: float = 600
+    semantic_idle_timeout_seconds: float = 120
+    repetition_threshold_chars: int | None = 65536
 
 
 @dataclass(frozen=True, slots=True)
@@ -554,6 +577,9 @@ def resolve_model(
         max_retries=provider.max_retries,
         reasoning=model.reasoning,
         pricing=model.pricing,
+        inference_timeout_seconds=model.inference_timeout_seconds,
+        semantic_idle_timeout_seconds=model.semantic_idle_timeout_seconds,
+        repetition_threshold_chars=model.repetition_threshold_chars,
         auth=provider.auth,
         auth_secret=secret if provider.auth is not None else "",
         headers=headers,

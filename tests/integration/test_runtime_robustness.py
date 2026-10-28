@@ -102,9 +102,15 @@ def test_schema_invalid_arguments_fail_without_approval(tmp_path: Path) -> None:
     try:
         with authed_client() as client:
             session_id = project_session(client, tmp_path, "schema")
-            wait_for(client, session_id, "completed")
+            wait_for(client, session_id, "error")
             assert client.get(f"/api/sessions/{session_id}/approvals").json() == []
-        assert any("Invalid arguments for write_file" in text for text in fake.seen)
+            assert client.get(f"/api/sessions/{session_id}").json()["error"]
+            assert not any(
+                row["role"] == "assistant" and row["kind"] == "normal"
+                for row in client.get(f"/api/sessions/{session_id}/messages").json()
+            )
+        assert fake.calls == 1
+        assert fake.seen == []
     finally:
         supervisor.llm = original
 

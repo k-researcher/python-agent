@@ -332,11 +332,12 @@ def test_invalid_choices_gets_terminal_error_record() -> None:
     async def on_attempt(record: AttemptRecord) -> None:
         records.append(record)
 
-    with pytest.raises(IndexError):
+    with pytest.raises(LLMError) as caught:
         asyncio.run(client.send(request, on_attempt=on_attempt))
 
     assert [record.status for record in records] == ["started", "error"]
-    assert records[1].error_kind == LLMErrorKind.unknown
+    assert caught.value.kind == LLMErrorKind.invalid_response
+    assert records[1].error_kind == LLMErrorKind.invalid_response
 
 
 def test_remote_protocol_error_exhausts_as_network(monkeypatch: Any) -> None:

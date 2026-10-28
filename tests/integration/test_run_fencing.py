@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -130,14 +129,14 @@ def test_broken_tool_arguments_never_reach_the_provider_history(tmp_path: Path) 
     try:
         with authed_client() as client:
             session_id = project_session(client, tmp_path, "broken-args")
-            wait_for(client, session_id, "completed")
+            wait_for(client, session_id, "error")
             messages = client.get(f"/api/sessions/{session_id}/messages").json()
-        assert len(fake.histories) == 2
-        for item in fake.histories[1]:
-            for call in item.get("tool_calls") or []:
-                json.loads(call["function"]["arguments"])  # valid JSON for the provider
-        tool_results = [m for m in messages if m["role"] == "tool"]
-        assert "not valid JSON" in tool_results[0]["content"]
+        assert len(fake.histories) == 1
+        assert not any(message["role"] == "tool" for message in messages)
+        assert not any(
+            message["role"] == "assistant" and message["kind"] == "normal" for message in messages
+        )
+        assert not (tmp_path / "broken.txt").exists()
     finally:
         supervisor.llm = original
 

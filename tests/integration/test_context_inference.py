@@ -743,6 +743,17 @@ async def test_summary_invalid_response_sets_summary_failed(
         )
         _patch_summary_llm(monkeypatch, handler)
 
+        if label == "blank":
+            with pytest.raises(LLMError) as caught:
+                await inference.run(primary)
+            assert caught.value.kind.value == "llm_empty_response"
+            assert handler.seen.get("inference", 0) == 0
+            async with session_factory() as db:
+                await db.execute(
+                    __import__("sqlalchemy").delete(Message).where(Message.session_id == session_id)
+                )
+                await db.commit()
+            continue
         result = await inference.run(primary)
 
         assert result.response.content == "hi"
