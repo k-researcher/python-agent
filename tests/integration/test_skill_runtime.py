@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -128,9 +129,20 @@ def test_skill_manifest_cannot_register_a_tool(
             },
         )
         assert session.status_code == 201
-        messages = completed_messages(client, session.json()["id"])
-    result = json.loads(
-        next(message["content"] for message in messages if message["role"] == "tool")
-    )
-    assert result["success"] is False
-    assert "unavailable" in result["error"]
+        session_id = session.json()["id"]
+
+        async def wait_run():
+            task = supervisor._tasks.get(session_id)
+            if task is not None:
+                async with asyncio.timeout(5):
+                    await task
+
+        client.portal.call(wait_run)
+        state = client.get(f"/api/sessions/{session_id}").json()
+        messages = client.get(f"/api/sessions/{session_id}/messages").json()
+        assert state["status"] == "error"
+        assert len(model.requests) == 1
+        assert not any(message["role"] == "tool" for message in messages)
+        assert not any(
+            message["role"] == "assistant" and message["kind"] == "normal" for message in messages
+        )

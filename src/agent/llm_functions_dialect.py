@@ -157,20 +157,19 @@ def _tool_calls_from_function_call(
         arguments = function_call["arguments"]
         raw = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
     else:
-        # A stream sends the arguments in string fragments: a fragment without them adds
-        # nothing. A full reply without arguments means a call with no arguments.
-        raw = "" if streamed else "{}"
+        # Missing fragments add nothing. Complete arguments are validated before adaptation.
+        raw = ""
     # Each reply gets its own ID: two calls with the same name and arguments are different
     # calls, and each must keep its own result.
-    call_id = "call_" + uuid.uuid4().hex[:24]
     call: dict[str, Any] = {
-        "id": call_id,
         "type": "function",
         "function": {"name": name, "arguments": raw},
     }
     if streamed:
         # A streamed tool call carries its position, as in the chat-completions stream.
         call["index"] = index
+    else:
+        call["id"] = "call_" + uuid.uuid4().hex[:24]
     return [call]
 
 

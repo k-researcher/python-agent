@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, cast
 
 from pydantic import ValidationError
@@ -7,6 +8,8 @@ from sqlalchemy import CursorResult, select, update
 from sqlalchemy.exc import IntegrityError
 
 from agent.database import session_factory
+from agent.events import add_event, publish
+from agent.inference_guard import CURRENT_GUARD, terminal_reason
 from agent.llm import AttemptRecord
 from agent.model_config import PricingSpec
 from agent.models import OutboundAudit, TokenCalibration, utcnow
@@ -32,14 +35,20 @@ async def start_attempt(
             **fields,
         )
         db.add(audit)
+        await db.flush()
+        pending = await add_event(
+            db, "outbound.audit", {"audit_id": audit.id, "status": "started"}, session_id
+        )
         await db.commit()
+        await publish([pending])
         return audit.id
 
 
 async def finish_attempt(audit_id: int, record: AttemptRecord, key: CalibrationKey) -> None:
     async with session_factory() as db:
-        status = "cancelled" if record.error_kind == "cancelled" else record.status
         audit = await db.get(OutboundAudit, audit_id)
+        record = _terminal_record(record)
+        status = "cancelled" if record.error_kind == "cancelled" else record.status
         if audit is None or audit.status != "started":
             return
         prompt_tokens = valid_token_count(record.prompt_tokens)
@@ -134,7 +143,25 @@ async def finish_attempt(audit_id: int, record: AttemptRecord, key: CalibrationK
                     break
             else:
                 raise RuntimeError("Token calibration update conflict")
+        final_record = _terminal_record(record)
+        if final_record != record:
+            await db.rollback()
+            await finish_attempt(audit_id, final_record, key)
+            return
+        pending = await add_event(
+            db, "outbound.audit", {"audit_id": audit_id, "status": status}, audit.session_id
+        )
         await db.commit()
+        await publish([pending])
+
+
+def _terminal_record(record: AttemptRecord) -> AttemptRecord:
+    guard = CURRENT_GUARD.get()
+    if guard is None or not guard.closed:
+        return record
+    reason = guard.reason
+    kind = terminal_reason(reason)
+    return replace(record, status="error", error_kind=kind)
 
 
 async def cancel_attempt(audit_id: int) -> None:

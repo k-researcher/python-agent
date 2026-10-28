@@ -13,21 +13,21 @@ from agent.sse import ChatStreamAccumulator, SSEDecoder, StreamEvent
 
 def test_crlf_and_cr_line_endings() -> None:
     decoder = SSEDecoder()
-    assert decoder.feed(b"data: one\r\ndata: two\r\n\r\n") == ["one\ntwo"]
-    assert decoder.feed(b"data: three\r\r\n") == ["three"]
-    assert decoder.feed(b"data: four\r") == []
-    assert decoder.feed(b"data: five\n\n") == ["four\nfive"]
+    assert list(decoder.feed(b"data: one\r\ndata: two\r\n\r\n")) == ["one\ntwo"]
+    assert list(decoder.feed(b"data: three\r\r\n")) == ["three"]
+    assert list(decoder.feed(b"data: four\r")) == []
+    assert list(decoder.feed(b"data: five\n\n")) == ["four\nfive"]
 
 
 def test_comments_are_ignored() -> None:
     decoder = SSEDecoder()
-    events = decoder.feed(b": hello\n: world\ndata: value\n\n: trailing\n")
+    events = list(decoder.feed(b": hello\n: world\ndata: value\n\n: trailing\n"))
     assert events == ["value"]
 
 
 def test_multiline_data_joined_with_newline() -> None:
     decoder = SSEDecoder()
-    assert decoder.feed(b"data: first\ndata: second\n\n") == ["first\nsecond"]
+    assert list(decoder.feed(b"data: first\ndata: second\n\n")) == ["first\nsecond"]
 
 
 def test_split_across_chunks_line_and_utf8() -> None:
@@ -35,20 +35,20 @@ def test_split_across_chunks_line_and_utf8() -> None:
     payload = "data: привет мир\n\n".encode()
     events: list[str] = []
     for i in range(0, len(payload), 3):
-        events.extend(decoder.feed(payload[i : i + 3]))
+        events.extend(list(decoder.feed(payload[i : i + 3])))
     assert events == ["привет мир"]
 
 
 def test_close_flushes_last_event() -> None:
     decoder = SSEDecoder()
-    decoder.feed(b"data: partial")
+    list(decoder.feed(b"data: partial"))
     assert decoder.close() == ["partial"]
     assert decoder.close() == []
 
 
 def test_close_no_events() -> None:
     decoder = SSEDecoder()
-    decoder.feed(b": comment\n")
+    list(decoder.feed(b": comment\n"))
     assert decoder.close() == []
 
 
@@ -334,10 +334,10 @@ def test_full_stream_result() -> None:
 
 def test_crlf_split_between_chunks_does_not_end_the_event() -> None:
     decoder = SSEDecoder()
-    assert decoder.feed(b"data: one\r") == []
-    assert decoder.feed(b"\ndata: two\r\n\r\n") == ["one\ntwo"]
+    assert list(decoder.feed(b"data: one\r")) == []
+    assert list(decoder.feed(b"\ndata: two\r\n\r\n")) == ["one\ntwo"]
 
 
 def test_invalid_utf8_is_replaced() -> None:
     decoder = SSEDecoder()
-    assert decoder.feed(b"data: \xff\n\n") == ["\ufffd"]
+    assert list(decoder.feed(b"data: \xff\n\n")) == ["\ufffd"]

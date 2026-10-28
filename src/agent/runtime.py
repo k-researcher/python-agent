@@ -21,11 +21,28 @@ from sqlalchemy.orm import attributes, selectinload
 
 from agent.checkpoints import load_context_rows
 from agent.config import Settings
-from agent.context_inference import TRANSIENT_KINDS, ContextInference
+from agent.context_inference import TRANSIENT_KINDS, ContextInference, InferenceResult
 from agent.context_manager import ContextManager
 from agent.database import session_factory
-from agent.events import PendingEvent, StreamPublisher, add_event, emit_event, publish
+from agent.events import (
+    CURRENT_STREAMS,
+    PendingEvent,
+    StreamPublisher,
+    StreamRun,
+    add_event,
+    emit_event,
+    publish,
+)
+from agent.inference_guard import (
+    CURRENT_RUN_GUARD,
+    GuardContext,
+    LoopClock,
+    bounded_cleanup,
+    guard_error,
+    retain,
+)
 from agent.llm import LLMClient, LLMError, LLMResponse
+from agent.llm_errors import LLMErrorKind
 from agent.mcp_audit import execute_mcp_attempt
 from agent.message_tree import append_message
 from agent.model_config import ModelConfigError, ResolvedModel, ResolvedModelRegistry
@@ -46,6 +63,7 @@ from agent.models import (
 from agent.modes import ROLE_PROFILES
 from agent.queue import RedisTaskQueue
 from agent.reasoning import ReasoningDecision, decide, lower_effort
+from agent.response_validation import arguments_object
 from agent.run_finish import finish_run
 from agent.sandbox import policy_from_settings
 from agent.session_budget import check_budget
@@ -408,10 +426,7 @@ class AgentSupervisor:
                     targets.update(self._tasks_of_generation(stopped_id, stopped_generation))
                 for task in targets:
                     task.cancel()
-                try:
-                    await publish(pending)
-                finally:
-                    await asyncio.gather(*targets, return_exceptions=True)
+                await self._settle_stopped(targets, pending)
         finally:
             CURRENT_FENCE.reset(token)
 
@@ -444,13 +459,26 @@ class AgentSupervisor:
                 targets = captured | self._tasks_of_generation(session_id, expected_generation)
                 for task in targets:
                     task.cancel()
-                try:
-                    await publish(pending)
-                finally:
-                    await asyncio.gather(*targets, return_exceptions=True)
+                await self._settle_stopped(targets, pending)
             return True
         finally:
             CURRENT_FENCE.reset(token)
+
+    async def _settle_stopped(
+        self, targets: set[asyncio.Task[None]], pending: list[PendingEvent]
+    ) -> None:
+        clock = LoopClock()
+        for task in targets:
+            retain(task)
+
+        async def settle() -> None:
+            try:
+                await publish(pending)
+            finally:
+                if targets:
+                    await asyncio.wait(targets)
+
+        await bounded_cleanup(settle(), clock, clock.now() + 2)
 
     def _tasks_of_generation(self, session_id: str, generation: int) -> set[asyncio.Task[None]]:
         """Return the unfinished current task of the session when it runs ``generation``."""
@@ -499,16 +527,22 @@ class AgentSupervisor:
         return cancelled
 
     async def shutdown(self) -> None:
+        clock = LoopClock()
         tasks = [task for task in [*self._tasks.values(), *self._finishing] if not task.done()]
         for task in tasks:
+            retain(task)
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        for client in [*self._llm_clients.values(), *self._retired_clients]:
-            if isinstance(client, LLMClient):
-                await client.aclose()
-        if self.task_queue is not None:
-            await self.task_queue.close()
+
+        async def close_resources() -> None:
+            if tasks:
+                await asyncio.wait(tasks)
+            for client in [*self._llm_clients.values(), *self._retired_clients]:
+                if isinstance(client, LLMClient):
+                    await client.aclose()
+            if self.task_queue is not None:
+                await self.task_queue.close()
+
+        await bounded_cleanup(close_resources(), clock, clock.now() + 2)
 
     async def resolve_approval(self, approval_id: str, decision: str, comment: str | None) -> str:
         async with session_factory() as db:
@@ -666,7 +700,9 @@ class AgentSupervisor:
             generation is not None and fence.generation != generation
         ):
             raise FenceLostError("The fence does not belong to this run")
+        run_guard_token = CURRENT_RUN_GUARD.set(None)
         token = CURRENT_FENCE.set(fence)
+        stream_token = CURRENT_STREAMS.set(StreamRun(fence.generation))
         run = asyncio.current_task()
         keeper = asyncio.create_task(self._keep_lease(fence, run), name=f"lease-{session_id}")
         try:
@@ -694,11 +730,25 @@ class AgentSupervisor:
                 logger.warning("Session %s: error not recorded, the fence is lost", session_id)
         finally:
             keeper.cancel()
-            with suppress(asyncio.CancelledError):
-                await keeper
+            cleanup_guard = CURRENT_RUN_GUARD.get()
+            CURRENT_RUN_GUARD.reset(run_guard_token)
+            CURRENT_STREAMS.reset(stream_token)
             CURRENT_FENCE.reset(token)
-            async with session_factory() as db:
-                await release(db, fence)
+
+            async def release_resources() -> None:
+                with suppress(asyncio.CancelledError):
+                    await keeper
+                async with session_factory() as db:
+                    await release(db, fence)
+
+            try:
+                if cleanup_guard is not None and cleanup_guard.closed:
+                    await cleanup_guard.cleanup(release_resources())
+                else:
+                    clock = LoopClock()
+                    await bounded_cleanup(release_resources(), clock, clock.now() + 2)
+            except Exception:
+                logger.exception("Session %s: run resource cleanup failed", session_id)
 
     async def _keep_lease(self, fence: RunFence, run: asyncio.Task[Any] | None) -> None:
         """Renew the lease; cancel the run when the lease is lost (fail closed)."""
@@ -722,7 +772,14 @@ class AgentSupervisor:
             if session is not None:
                 fence = CURRENT_FENCE.get()
                 generation = fence.generation if fence is not None else session.run_generation
-                pending = await finish_run(db, session_id, generation, "error", error=str(exc))
+                pending = await finish_run(
+                    db,
+                    session_id,
+                    generation,
+                    "error",
+                    error=str(exc),
+                    reason=exc.kind.value if isinstance(exc, LLMError) else None,
+                )
                 if pending:
                     await db.commit()
                     await publish(pending)
@@ -860,11 +917,192 @@ class AgentSupervisor:
             await publish(pending)
         return delivered
 
+    async def _reset_inference_stream(self, publisher: StreamPublisher | None) -> None:
+        if publisher is not None:
+            await publisher.reset()
+
+    async def _infer_logical(
+        self,
+        session_id: str,
+        model: ResolvedModel,
+        models: ResolvedModelRegistry,
+        definitions: list[dict[str, Any]],
+        decisions: dict[str, ReasoningDecision],
+    ) -> InferenceResult | None:
+        # The worker owns this resource, including cancellation of its pending operations.
+        async with session_factory() as db:
+            session = await db.get(Session, session_id)
+            if session is None:
+                return None
+            return await self._infer_logical_work(
+                db, session, model, models, definitions, decisions
+            )
+
+    async def _infer_logical_work(
+        self,
+        db: Any,
+        session: Session,
+        model: ResolvedModel,
+        models: ResolvedModelRegistry,
+        definitions: list[dict[str, Any]],
+        decisions: dict[str, ReasoningDecision],
+    ) -> InferenceResult | None:
+        cut_offs = 0
+        session_id = session.id
+        original_decisions = decisions
+        while True:
+            decisions = original_decisions
+            retried = False
+            stream_retries = 0
+            while True:
+
+                def reasoning_for(
+                    candidate: ResolvedModel,
+                    snapshot: dict[str, ReasoningDecision] = decisions,
+                ) -> ReasoningDecision:
+                    return snapshot[candidate.id]
+
+                inference = ContextInference(
+                    session.id,
+                    self.settings.context_reserved_tokens,
+                    definitions,
+                    models,
+                    partial(self._llm_for, models),
+                    reasoning_for,
+                    settings=self.settings,
+                )
+                try:
+                    outcome = await inference.run(model)
+                except BudgetExceeded as error:
+                    await self._stop_session_by_budget(
+                        db, session_id, session.run_generation or 0, error.reason
+                    )
+                    return None
+                except LLMError as error:
+                    # The stream broke after the first fragment: no tool ran and nothing
+                    # was stored, so drop the partial reply and send the step again.
+                    if (
+                        not error.started
+                        or error.kind not in TRANSIENT_KINDS
+                        or stream_retries >= MAX_STREAM_RETRIES
+                    ):
+                        raise
+                    stream_retries += 1
+                    await self._reset_inference_stream(inference.publisher)
+                    await emit_event(
+                        db,
+                        "inference.retry",
+                        {
+                            "reason": "stream_interrupted",
+                            "model_id": model.id,
+                            "retry": stream_retries,
+                        },
+                        session.id,
+                    )
+                    continue
+                response = outcome.response
+                reasoning_effort = outcome.reasoning.effective
+                await db.refresh(session, attribute_names=["status", "stop_requested"])
+                if session.stop_requested or session.status == SessionStatus.stopped.value:
+                    return None
+                lower = lower_effort(outcome.model, reasoning_effort)
+                if retried or lower is None or not _cut_in_reasoning(response):
+                    break
+                # The output limit cut the reply during reasoning, before any text: keep the
+                # cut reply for diagnosis and try once more with a lower reasoning level.
+                retried = True
+                db.add(
+                    Message(
+                        session_id=session.id,
+                        role="assistant",
+                        kind="interrupted",
+                        content=response.content,
+                        token_count=response.completion_tokens or None,
+                        reasoning_content=response.reasoning,
+                        reasoning_effort=reasoning_effort,
+                    )
+                )
+                await db.commit()
+                await self._reset_inference_stream(outcome.publisher)
+                await emit_event(
+                    db,
+                    "inference.retry",
+                    {
+                        "reason": "output_limit_in_reasoning",
+                        "model_id": outcome.model.id,
+                        "from": reasoning_effort,
+                        "to": lower,
+                    },
+                    session.id,
+                )
+                decisions = _lowered(decisions, models)
+
+            # Our own globally unique IDs: providers may omit or reuse theirs, and the
+            # step counter restarts whenever the loop resumes after an approval.
+            normalized_calls = [
+                {**dict(raw_call), "id": f"call_{uuid.uuid4().hex}"}
+                for raw_call in (response.interrupted_tool_calls or response.tool_calls)
+            ]
+            if response.finish_reason == "length":
+                # The output limit cut the reply. It is not a result: keep the partial text
+                # for diagnosis (kind "interrupted" never reaches the model), run no tool
+                # call from it, and stop with advice. No hidden second request.
+                db.add(
+                    Message(
+                        session_id=session.id,
+                        role="assistant",
+                        kind="interrupted",
+                        content=response.content,
+                        tool_calls=[_history_safe_call(c) for c in normalized_calls] or None,
+                        token_count=response.completion_tokens or None,
+                        reasoning_content=response.reasoning,
+                        reasoning_effort=reasoning_effort,
+                    )
+                )
+                cut_offs += 1
+                if cut_offs > MAX_CUT_OFF_REPLIES:
+                    await db.commit()
+                    raise ToolError(
+                        "The model reply was cut off by the output limit, so it was not "
+                        "used and no tool ran. Ask for smaller steps, for example write a "
+                        "large file in parts."
+                    )
+                # Tell the model and let it take a smaller step in the next inference.
+                await append_message(db, session.id, role="user", content=CUT_OFF_NOTICE)
+                await db.commit()
+                await self._reset_inference_stream(outcome.publisher)
+                await emit_event(
+                    db,
+                    "inference.retry",
+                    {"reason": "output_limit", "model_id": outcome.model.id, "retry": cut_offs},
+                    session.id,
+                )
+                allowed = await self._enforce_budget_before_step(
+                    db, session.id, session.run_generation or 0
+                )
+                await db.commit()
+                if not allowed:
+                    return None
+                continue
+            for call in response.tool_calls:
+                fn = call["function"]
+                try:
+                    self._tools.validate(
+                        fn["name"],
+                        session.mode,
+                        arguments_object(fn["arguments"]),
+                        model_ids=models.ids(),
+                    )
+                except Exception as error:
+                    raise guard_error(
+                        LLMErrorKind.invalid_response, "Некорректный вызов инструмента"
+                    ) from error
+            return outcome
+
     async def _run_session(self, session_id: str) -> None:
         # One catalogue snapshot for the whole execution: a YAML or UI change applies to the
         # next execution, not between two steps of a running one.
         models: ResolvedModelRegistry | None = None
-        cut_offs = 0
         while True:
             async with session_factory() as db:
                 fence = CURRENT_FENCE.get()
@@ -982,133 +1220,55 @@ class AgentSupervisor:
                 }
                 await db.commit()
 
-                retried = False
-                stream_retries = 0
-                while True:
-
-                    def reasoning_for(
-                        candidate: ResolvedModel,
-                        snapshot: dict[str, ReasoningDecision] = decisions,
-                    ) -> ReasoningDecision:
-                        return snapshot[candidate.id]
-
-                    inference = ContextInference(
-                        session.id,
-                        self.settings.context_reserved_tokens,
-                        definitions,
-                        models,
-                        partial(self._llm_for, models),
-                        reasoning_for,
-                        settings=self.settings,
+                limits = budget_limits(self.settings, session)
+                usage = await load_budget_usage(db, session, datetime.now(UTC))
+                session_deadline = None
+                if limits.deadline_seconds is not None and usage.started_at is not None:
+                    remaining = (
+                        limits.deadline_seconds
+                        - (datetime.now(UTC) - usage.started_at).total_seconds()
                     )
-                    try:
-                        outcome = await inference.run(model)
-                    except BudgetExceeded as error:
-                        await self._stop_session_by_budget(
-                            db, session_id, session.run_generation or 0, error.reason
-                        )
-                        return
-                    except LLMError as error:
-                        # The stream broke after the first fragment: no tool ran and nothing
-                        # was stored, so drop the partial reply and send the step again.
-                        if (
-                            not error.started
-                            or error.kind not in TRANSIENT_KINDS
-                            or stream_retries >= MAX_STREAM_RETRIES
-                        ):
-                            raise
-                        stream_retries += 1
-                        await StreamPublisher(session.id).reset()
-                        await emit_event(
-                            db,
-                            "inference.retry",
-                            {
-                                "reason": "stream_interrupted",
-                                "model_id": model.id,
-                                "retry": stream_retries,
-                            },
+                    session_deadline = asyncio.get_running_loop().time() + max(0, remaining)
+                await db.commit()
+                guard = GuardContext(model, session_deadline=session_deadline)
+                run_guard_token = CURRENT_RUN_GUARD.set(guard)
+                try:
+                    outcome = await guard.run(
+                        self._infer_logical(
                             session.id,
-                        )
-                        continue
-                    response = outcome.response
-                    reasoning_effort = outcome.reasoning.effective
-                    await db.refresh(session, attribute_names=["status", "stop_requested"])
-                    if session.stop_requested or session.status == SessionStatus.stopped.value:
-                        return
-                    lower = lower_effort(outcome.model, reasoning_effort)
-                    if retried or lower is None or not _cut_in_reasoning(response):
-                        break
-                    # The output limit cut the reply during reasoning, before any text: keep the
-                    # cut reply for diagnosis and try once more with a lower reasoning level.
-                    retried = True
-                    db.add(
-                        Message(
-                            session_id=session.id,
-                            role="assistant",
-                            kind="interrupted",
-                            content=response.content,
-                            token_count=response.completion_tokens or None,
-                            reasoning_content=response.reasoning,
-                            reasoning_effort=reasoning_effort,
+                            model,
+                            models,
+                            definitions,
+                            decisions,
                         )
                     )
-                    await db.commit()
-                    await StreamPublisher(session.id).reset()
-                    await emit_event(
-                        db,
-                        "inference.retry",
-                        {
-                            "reason": "output_limit_in_reasoning",
-                            "model_id": outcome.model.id,
-                            "from": reasoning_effort,
-                            "to": lower,
-                        },
-                        session.id,
+                except LLMError as error:
+                    guard.close(error)
+                    try:
+                        await guard.cleanup(self._mark_error(session_id, error))
+                    except Exception:
+                        logger.exception("Session %s: terminal outcome cleanup failed", session_id)
+                    return
+                except BudgetExceeded as error:
+                    await guard.cleanup(
+                        self._stop_session_by_budget(
+                            db,
+                            session_id,
+                            session.run_generation or 0,
+                            error.reason,
+                        )
                     )
-                    decisions = _lowered(decisions, models)
-
-                # Our own globally unique IDs: providers may omit or reuse theirs, and the
-                # step counter restarts whenever the loop resumes after an approval.
+                    return
+                guard.close()
+                CURRENT_RUN_GUARD.reset(run_guard_token)
+                if outcome is None:
+                    return
+                response = outcome.response
+                reasoning_effort = outcome.reasoning.effective
                 normalized_calls = [
                     {**dict(raw_call), "id": f"call_{uuid.uuid4().hex}"}
                     for raw_call in response.tool_calls
                 ]
-                if response.finish_reason == "length":
-                    # The output limit cut the reply. It is not a result: keep the partial text
-                    # for diagnosis (kind "interrupted" never reaches the model), run no tool
-                    # call from it, and stop with advice. No hidden second request.
-                    db.add(
-                        Message(
-                            session_id=session.id,
-                            role="assistant",
-                            kind="interrupted",
-                            content=response.content,
-                            tool_calls=[_history_safe_call(c) for c in normalized_calls] or None,
-                            token_count=response.completion_tokens or None,
-                            reasoning_content=response.reasoning,
-                            reasoning_effort=reasoning_effort,
-                        )
-                    )
-                    cut_offs += 1
-                    if cut_offs > MAX_CUT_OFF_REPLIES:
-                        await db.commit()
-                        raise ToolError(
-                            "The model reply was cut off by the output limit, so it was not "
-                            "used and no tool ran. Ask for smaller steps, for example write a "
-                            "large file in parts."
-                        )
-                    # Tell the model and let it take a smaller step in the next inference.
-                    await append_message(db, session.id, role="user", content=CUT_OFF_NOTICE)
-                    await db.commit()
-                    await StreamPublisher(session.id).reset()
-                    await emit_event(
-                        db,
-                        "inference.retry",
-                        {"reason": "output_limit", "model_id": outcome.model.id, "retry": cut_offs},
-                        session.id,
-                    )
-                    continue
-                cut_offs = 0
 
                 assistant = await append_message(
                     db,
@@ -1128,7 +1288,15 @@ class AgentSupervisor:
                         await add_event(
                             db,
                             "message.created",
-                            {"role": "assistant", "message_id": assistant.id},
+                            {
+                                "role": "assistant",
+                                "message_id": assistant.id,
+                                **(
+                                    outcome.publisher.identity
+                                    if outcome.publisher is not None
+                                    else {}
+                                ),
+                            },
                             session.id,
                         )
                     ]
@@ -1217,7 +1385,11 @@ class AgentSupervisor:
                 await emit_event(
                     db,
                     "message.created",
-                    {"role": "assistant", "message_id": assistant.id},
+                    {
+                        "role": "assistant",
+                        "message_id": assistant.id,
+                        **(outcome.publisher.identity if outcome.publisher is not None else {}),
+                    },
                     session.id,
                 )
                 if requires_approval:

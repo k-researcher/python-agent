@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import ssl
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import httpx
 
+from agent.inference_guard import CURRENT_GUARD, GuardContext, terminal_reason
 from agent.llm_errors import (
+    TERMINAL_GUARDS,
     LLMErrorKind,
     ProviderErrorInfo,
     classify_exception,
@@ -30,6 +33,8 @@ from agent.provider_auth import (
 )
 from agent.reasoning_tags import split_reasoning
 from agent.redaction import redact
+from agent.repetition import RepetitionDetector
+from agent.response_validation import calls_validated, envelope, finish, usable, validate_functions
 from agent.wire import WireRequest, body_sha256, build_wire_request
 
 __all__ = ["LLMClient", "LLMError", "LLMResponse", "LLMTransientError", "redact"]
@@ -149,6 +154,23 @@ class LLMResponse:
     prompt_tokens: int | None
     completion_tokens: int | None
     reasoning: str | None = None
+    # Diagnostic fragments only; never eligible for tool execution.
+    interrupted_tool_calls: list[dict[str, Any]] | None = None
+
+
+class _DeferredResponseClose(httpx.AsyncByteStream):
+    """Keep EOF separate from transport cleanup so response validation runs first."""
+
+    def __init__(self, stream: httpx.AsyncByteStream) -> None:
+        self.stream = stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self.stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        # The inference worker closes the original stream in its cleanup scope.
+        pass
 
 
 class LLMClient:
@@ -223,7 +245,8 @@ class LLMClient:
 
     def _convert(self, data: Any) -> Any:
         """Turn a reply in the provider dialect into the chat-completions shape."""
-        if self.model.dialect == "functions" and isinstance(data, dict):
+        if self.model.dialect == "functions":
+            validate_functions(data, stream=False)
             return from_functions_response(data)
         return data
 
@@ -234,8 +257,7 @@ class LLMClient:
             parsed = json.loads(data)
         except json.JSONDecodeError:
             return data  # The accumulator reports the invalid chunk.
-        if not isinstance(parsed, dict):
-            return data
+        validate_functions(parsed, stream=True)
         return json.dumps(from_functions_stream_delta(parsed), ensure_ascii=False)
 
     async def aclose(self) -> None:
@@ -258,6 +280,14 @@ class LLMClient:
         The exact ``request.body`` bytes are transmitted. Retry 429, 5xx and transport
         errors, but never after the first streamed fragment has been delivered.
         """
+        guard = CURRENT_GUARD.get()
+        if guard is None:
+            guard = GuardContext(self.model)
+            return await guard.run(
+                self.send(request, on_delta=on_delta, on_attempt=on_attempt), cleanup_worker=True
+            )
+        guard.ensure_open()
+        guard.select(self.model)
         streaming = bool(request.payload.get("stream"))
         if streaming and on_delta is None:
             raise ValueError("on_delta is required when the request streams")
@@ -273,6 +303,7 @@ class LLMClient:
         refresh = provider is not None and provider.refreshable
         offset = 0
         while True:
+            guard.ensure_open()
             try:
                 if streaming:
                     assert on_delta is not None
@@ -323,11 +354,25 @@ class LLMClient:
         retries = self.model.max_retries
         payload_bytes = len(request.body)
         for attempt in range(retries + 1):
+            guard = CURRENT_GUARD.get()
+            assert guard is not None
+            guard.ensure_open()
             number = attempt + offset
+            observed_usage: Any = {}
             headers, token = await self._headers()
             await self._emit_attempt(state, on_attempt, number, "started", payload_bytes, sha256)
             try:
-                response = await client.post(self.endpoint, headers=headers, content=request.body)
+                response = await client.post(
+                    self.endpoint,
+                    headers=headers,
+                    content=request.body,
+                    timeout=httpx.Timeout(
+                        connect=client.timeout.connect,
+                        write=client.timeout.write,
+                        pool=client.timeout.pool,
+                        read=600.0,
+                    ),
+                )
             except asyncio.CancelledError:
                 await self._emit_attempt(
                     state,
@@ -399,9 +444,15 @@ class LLMClient:
                     await asyncio.sleep(min(8.0, 2.0**attempt))
                     continue
                 response.raise_for_status()
-                parsed = self._parse_response(
-                    self._convert(response.json()), self.model.reasoning.tags
-                )
+                body = response.json()
+                observed_usage = body.get("usage", {}) if isinstance(body, dict) else {}
+                guard = CURRENT_GUARD.get()
+                if guard is not None:
+                    guard.observe_usage(
+                        token_count(observed_usage, "prompt_tokens"),
+                        token_count(observed_usage, "completion_tokens"),
+                    )
+                parsed = self._parse_response(self._convert(body), self.model.reasoning.tags)
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 info = _redacted(
@@ -417,7 +468,10 @@ class LLMClient:
                     error_kind=info.kind,
                 )
                 raise error_for(info, f"LLM returned HTTP {status}: {info.message}") from exc
-            except (KeyError, TypeError, ValueError) as exc:
+            except LLMError as exc:
+                guard = CURRENT_GUARD.get()
+                if guard is not None and exc.kind in TERMINAL_GUARDS:
+                    guard.close(exc)
                 await self._emit_attempt(
                     state,
                     on_attempt,
@@ -425,9 +479,30 @@ class LLMClient:
                     "error",
                     payload_bytes,
                     sha256,
-                    error_kind=LLMErrorKind.unknown,
+                    error_kind=exc.kind,
+                    prompt_tokens=token_count(observed_usage, "prompt_tokens"),
+                    completion_tokens=token_count(observed_usage, "completion_tokens"),
                 )
-                raise LLMError("LLM returned an invalid response") from exc
+                raise
+            except (KeyError, TypeError, ValueError) as exc:
+                from agent.response_validation import invalid
+
+                error = invalid()
+                guard = CURRENT_GUARD.get()
+                if guard is not None:
+                    guard.close(error)
+                await self._emit_attempt(
+                    state,
+                    on_attempt,
+                    number,
+                    "error",
+                    payload_bytes,
+                    sha256,
+                    error_kind=LLMErrorKind.invalid_response,
+                    prompt_tokens=token_count(observed_usage, "prompt_tokens"),
+                    completion_tokens=token_count(observed_usage, "completion_tokens"),
+                )
+                raise error from exc
             except Exception:
                 await self._emit_attempt(
                     state,
@@ -464,6 +539,28 @@ class LLMClient:
         offset: int,
         refresh: bool,
     ) -> LLMResponse:
+        guard = CURRENT_GUARD.get()
+        assert guard is not None
+        progress = _SemanticProgress(guard)
+        return await guard.idle(
+            self._stream_work(
+                state, request, sha256, on_delta, on_attempt, offset, refresh, progress
+            ),
+            self.model.semantic_idle_timeout_seconds,
+            lambda: progress.at,
+        )
+
+    async def _stream_work(
+        self,
+        state: _AuditState,
+        request: WireRequest,
+        sha256: str,
+        on_delta: DeltaCallback,
+        on_attempt: AttemptCallback | None,
+        offset: int,
+        refresh: bool,
+        progress: _SemanticProgress,
+    ) -> LLMResponse:
         """Stream one request. A retry is possible only before the first received fragment.
 
         With ``refresh``, a 401 ends this call with ``_AuthExpired`` for one token refresh.
@@ -473,14 +570,34 @@ class LLMClient:
         retries = self.model.max_retries
         payload_bytes = len(request.body)
         for attempt in range(retries + 1):
+            guard = CURRENT_GUARD.get()
+            assert guard is not None
+            guard.ensure_open()
             number = attempt + offset
             started = False
+            accumulator: ChatStreamAccumulator | None = None
+            progress.reset()
             headers, token = await self._headers()
             await self._emit_attempt(state, on_attempt, number, "started", payload_bytes, sha256)
             try:
-                async with self._client().stream(
+                manager = self._client().stream(
                     "POST", self.endpoint, headers=headers, content=request.body
-                ) as response:
+                )
+                response = await manager.__aenter__()
+                transport_stream = response.stream
+                assert isinstance(transport_stream, httpx.AsyncByteStream)
+                response.stream = _DeferredResponseClose(transport_stream)
+
+                async def close_response(
+                    manager: AbstractAsyncContextManager[httpx.Response] = manager,
+                    transport_stream: httpx.AsyncByteStream = transport_stream,
+                ) -> None:
+                    try:
+                        await manager.__aexit__(None, None, None)
+                    finally:
+                        await transport_stream.aclose()
+
+                try:
                     if response.status_code == 401 and refresh:
                         await response.aread()
                         await self._emit_attempt(
@@ -511,37 +628,130 @@ class LLMClient:
                             continue
                         raise error_for(info, f"LLM returned HTTP {status}: {info.message}")
                     decoder = SSEDecoder()
-                    accumulator = ChatStreamAccumulator(reasoning_tags=self.model.reasoning.tags)
+                    accumulator = ChatStreamAccumulator(
+                        reasoning_tags=self.model.reasoning.tags, defer_text=True
+                    )
+                    detectors = {
+                        kind: RepetitionDetector(self.model.repetition_threshold_chars)
+                        for kind in ("content", "reasoning")
+                    }
+
+                    async def consume(
+                        data: str | None,
+                        accumulator: ChatStreamAccumulator = accumulator,
+                        detectors: dict[str, RepetitionDetector] = detectors,
+                        number: int = number,
+                    ) -> None:
+                        nonlocal started
+                        await asyncio.sleep(0)
+                        if data is None:
+                            events = accumulator.end_events()
+                        elif data != "[DONE]":
+                            try:
+                                raw = json.loads(data)
+                            except ValueError:
+                                from agent.response_validation import invalid
+
+                                raise invalid() from None
+                            if isinstance(raw, dict) and isinstance(raw.get("usage"), dict):
+                                progress.guard.observe_usage(
+                                    token_count(raw["usage"], "prompt_tokens"),
+                                    token_count(raw["usage"], "completion_tokens"),
+                                )
+                            await asyncio.sleep(0)
+                            if self.model.dialect == "functions":
+                                validate_functions(raw, stream=True)
+                            progress.observe(raw)
+                            payload = (
+                                from_functions_stream_delta(raw)
+                                if self.model.dialect == "functions"
+                                else raw
+                            )
+                            await asyncio.sleep(0)
+                            events = accumulator.add_payload(payload)
+                        else:
+                            events = accumulator.add(data)
+                        await asyncio.sleep(0)
+                        for event in events:
+                            if event.kind == "tool_call":
+                                started = True
+                            elif event.kind in {"content", "reasoning"} and event.text:
+                                started = True
+                                if await detectors[event.kind].feed(event.text):
+                                    from agent.inference_guard import guard_error
+
+                                    raise guard_error(LLMErrorKind.repetition)
+                                progress.guard.ensure_open()
+                                accumulator.accept_text(event.kind, event.text)
+                                await asyncio.sleep(0)
+                                progress.guard.ensure_open()
+                                try:
+                                    await on_delta(event.kind, event.text)
+                                except asyncio.CancelledError:
+                                    raise
+                                except BaseException as exc:
+                                    await self._emit_attempt(
+                                        state,
+                                        on_attempt,
+                                        number,
+                                        "error",
+                                        payload_bytes,
+                                        sha256,
+                                        error_kind=LLMErrorKind.unknown,
+                                    )
+                                    raise _CallbackError(exc) from exc
+                                await asyncio.sleep(0)
+                                progress.guard.ensure_open()
+
                     async for chunk in response.aiter_bytes():
-                        for data in decoder.feed(chunk):
-                            for event in accumulator.add(self._convert_chunk(data)):
-                                if event.kind == "tool_call":
-                                    started = True
-                                elif event.kind in {"content", "reasoning"} and event.text:
-                                    started = True
-                                    try:
-                                        await on_delta(event.kind, event.text)
-                                    except asyncio.CancelledError:
-                                        raise
-                                    except BaseException as exc:
-                                        await self._emit_attempt(
-                                            state,
-                                            on_attempt,
-                                            number,
-                                            "error",
-                                            payload_bytes,
-                                            sha256,
-                                            error_kind=LLMErrorKind.unknown,
-                                        )
-                                        raise _CallbackError(exc) from exc
-                    for data in decoder.close():
-                        accumulator.add(self._convert_chunk(data))
-                    result = accumulator.result()
+                        for offset_bytes in range(0, len(chunk), 4096):
+                            await asyncio.sleep(0)
+                            for data in decoder.iter_feed(
+                                chunk[offset_bytes : offset_bytes + 4096]
+                            ):
+                                await consume(data)
+                                if accumulator.done:
+                                    break
+                            if accumulator.done:
+                                break
+                        if accumulator.done:
+                            break
+                    if not accumulator.done:
+                        for data in decoder.close():
+                            await consume(data)
+                        await consume(None)
+                    result = accumulator.finalize()
+                except BaseException as error:
+                    if isinstance(error, asyncio.CancelledError) or (
+                        isinstance(error, LLMError) and error.kind in TERMINAL_GUARDS
+                    ):
+                        progress.guard.close(error)
+                    raise
+                finally:
+                    guard = progress.guard
+                    if guard.closed:
+                        # A close failure is secondary to the first Stop or guard.
+                        with suppress(Exception):
+                            await guard.cleanup(close_response())
+                    else:
+                        await guard.finalize(close_response())
             except _CallbackError as exc:
                 raise exc.original from None
             except _AuthExpired:
                 raise
             except LLMError as exc:
+                if exc.kind == LLMErrorKind.stream_incomplete and not started and attempt < retries:
+                    await self._emit_attempt(
+                        state,
+                        on_attempt,
+                        number,
+                        "error",
+                        payload_bytes,
+                        sha256,
+                        error_kind=exc.kind,
+                    )
+                    await asyncio.sleep(min(8.0, 2.0**attempt))
+                    continue
                 # An error event inside the stream: keep its classification and state, but
                 # never its secrets.
                 secrets = tuple(item for item in self._secrets(token) if item)
@@ -550,6 +760,10 @@ class LLMClient:
                     info=_redacted(exc.info, self._secrets(token)),
                     started=exc.started or started,
                 )
+                counts = progress.guard.attempt_usage
+                guard = progress.guard
+                if exc.kind in TERMINAL_GUARDS:
+                    guard.close(clean)
                 await self._emit_attempt(
                     state,
                     on_attempt,
@@ -558,9 +772,12 @@ class LLMClient:
                     payload_bytes,
                     sha256,
                     error_kind=exc.kind,
+                    prompt_tokens=counts[0],
+                    completion_tokens=counts[1],
                 )
                 raise clean from None
             except asyncio.CancelledError:
+                counts = progress.guard.attempt_usage
                 await self._emit_attempt(
                     state,
                     on_attempt,
@@ -569,6 +786,8 @@ class LLMClient:
                     payload_bytes,
                     sha256,
                     error_kind="cancelled",
+                    prompt_tokens=counts[0],
+                    completion_tokens=counts[1],
                 )
                 raise
             except (
@@ -638,8 +857,20 @@ class LLMClient:
         LLM error wins, so a failing callback never hides it; the failure is kept and
         re-raised once the request has otherwise succeeded.
         """
+        guard = CURRENT_GUARD.get()
+        if guard is not None and status == "started":
+            guard.ensure_open()
+            guard.attempt_usage = (None, None)
         if on_attempt is None:
             return
+        if guard is not None and guard.closed:
+            status = "error"
+            error_kind = terminal_reason(guard.reason)
+        if guard is not None and status != "started":
+            prompt_tokens = prompt_tokens if prompt_tokens is not None else guard.attempt_usage[0]
+            completion_tokens = (
+                completion_tokens if completion_tokens is not None else guard.attempt_usage[1]
+            )
         record = AttemptRecord(
             attempt=attempt,
             status=status,
@@ -650,7 +881,10 @@ class LLMClient:
             error_kind=error_kind,
         )
         try:
-            await on_attempt(record)
+            if guard is not None and guard.closed:
+                await guard.cleanup(on_attempt(record))
+            else:
+                await on_attempt(record)
         except Exception as exc:
             if status != "error":
                 raise
@@ -661,8 +895,10 @@ class LLMClient:
     def _parse_response(
         body: dict[str, Any], reasoning_tags: ReasoningTagsSpec | None = None
     ) -> LLMResponse:
-        choice = body["choices"][0]
-        message = choice.get("message", {})
+        choice = envelope(body, stream=False)
+        assert choice is not None
+        reason = finish(choice.get("finish_reason")) or "stop"
+        message = choice["message"]
         usage = body.get("usage", {})
         reasoning = message.get("reasoning_content") or message.get("reasoning")
         content = message.get("content")
@@ -671,13 +907,17 @@ class LLMClient:
             content = content or None
             if tagged:
                 reasoning = (reasoning if isinstance(reasoning, str) else "") + tagged
+        calls = [] if reason == "length" else calls_validated(message.get("tool_calls"))
+        if reason != "length":
+            usable(content, calls, reason)
         return LLMResponse(
             content=content,
-            tool_calls=message.get("tool_calls") or [],
-            finish_reason=choice.get("finish_reason", "stop"),
+            tool_calls=calls,
+            finish_reason=reason,
             prompt_tokens=token_count(usage, "prompt_tokens"),
             completion_tokens=token_count(usage, "completion_tokens"),
             reasoning=reasoning if isinstance(reasoning, str) else None,
+            interrupted_tool_calls=message.get("tool_calls") if reason == "length" else None,
         )
 
 
@@ -700,3 +940,43 @@ def stream_error_info(error: Any) -> ProviderErrorInfo:
     body = json.dumps({"error": error}, ensure_ascii=False, default=str)
     status = error.get("status") if isinstance(error, dict) else None
     return classify_http_error(status if isinstance(status, int) else 0, body)
+
+
+class _SemanticProgress:
+    def __init__(self, guard: GuardContext) -> None:
+        self.guard = guard
+        self.at = guard.clock.now()
+        self.metadata: dict[tuple[int, str], str] = {}
+
+    def reset(self) -> None:
+        self.at = self.guard.clock.now()
+        self.metadata.clear()
+        self.guard.progressed.set()
+
+    def observe(self, raw: Any) -> None:
+        if not isinstance(raw, dict) or raw.get("error"):
+            return
+        choice = envelope(raw, stream=True, functions=True)
+        if choice is None:
+            return
+        delta = choice.get("delta", {})
+        changed = any(
+            isinstance(delta.get(k), str) and delta[k].strip()
+            for k in ("content", "reasoning", "reasoning_content")
+        )
+        calls = delta.get("tool_calls") or []
+        if isinstance(delta.get("function_call"), dict):
+            calls = [{"index": 0, "function": delta["function_call"]}]
+        for call in calls:
+            index = call.get("index", 0)
+            fn = call.get("function") or {}
+            for key, value in (("id", call.get("id")), ("name", fn.get("name"))):
+                if isinstance(value, str) and value and self.metadata.get((index, key)) != value:
+                    self.metadata[index, key] = value
+                    changed = True
+            args = fn.get("arguments")
+            if isinstance(args, dict) or isinstance(args, str) and args:
+                changed = True
+        if changed:
+            self.at = self.guard.clock.now()
+            self.guard.progressed.set()

@@ -27,7 +27,9 @@ def test_parse_response_moves_tagged_reasoning_out_of_content() -> None:
     assert response.reasoning == " plan"
 
     only_block = {"choices": [{"message": {"content": "<|reasoning> <reasoning|>"}}]}
-    assert LLMClient._parse_response(only_block, tags).content is None
+    with pytest.raises(LLMError) as caught:
+        LLMClient._parse_response(only_block, tags)
+    assert caught.value.kind == LLMErrorKind.empty_response
     # Without tags the content is not touched.
     assert LLMClient._parse_response(body).content == "<|reasoning> plan<reasoning|>Answer"
 

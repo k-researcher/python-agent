@@ -41,6 +41,9 @@ models:
     model: deepseek-v4-flash
     context_window: 256000
     max_tokens: 16000
+    inference_timeout_seconds: 600     # весь inference вместе с подготовкой и повторами
+    semantic_idle_timeout_seconds: 120 # ожидание новых данных потока; не больше общего времени
+    repetition_threshold_chars: 65536  # null отключает обнаружение повтора
     # Пример: шлюз LiteLLM понимает только «выкл/вкл»: "none" выключает рассуждения,
     # любой другой уровень включает их без регулировки силы (проверено 2026-10-06).
     reasoning:
