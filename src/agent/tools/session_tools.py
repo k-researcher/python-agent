@@ -42,6 +42,7 @@ class ReadSessionTool(Tool):
         "type": "object",
         "properties": {
             "session_id": {"type": "string"},
+            "message_id": {"type": "integer", "minimum": 1},
             "limit": {
                 "type": "integer",
                 "minimum": 1,
@@ -64,6 +65,7 @@ class ReadSessionTool(Tool):
             if current is None or target is None or current.project_id != target.project_id:
                 raise ToolError("Session not found")
 
+            message_id = arguments.get("message_id")
             rows = list(
                 (
                     await db.execute(
@@ -71,7 +73,9 @@ class ReadSessionTool(Tool):
                         .where(
                             Message.session_id == target.id,
                             Message.kind == "normal",
-                            Message.skipped.is_(False),
+                            Message.skipped.is_(False)
+                            if message_id is None
+                            else Message.id == int(message_id),
                         )
                         .order_by(Message.id.desc())
                         .limit(limit)
@@ -85,6 +89,7 @@ class ReadSessionTool(Tool):
             truncated = len(content) > MAX_MESSAGE_CHARS
             messages.append(
                 {
+                    "id": row.id,
                     "role": row.role,
                     "content": content[:MAX_MESSAGE_CHARS],
                     "truncated": truncated,
