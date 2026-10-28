@@ -8,13 +8,14 @@ from sqlalchemy import exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.events import PendingEvent, add_event
-from agent.models import Session, SessionRunOutcome
+from agent.models import Message, Session, SessionRunOutcome
 from agent.session_fence import (
     CURRENT_FENCE,
     TERMINAL_STATUSES,
     FenceLostError,
     invalidate_generation,
 )
+from agent.session_inbox import render_notice
 
 FinishSource = Literal["run", "dispatch", "stop", "scoped_stop", "recovery"]
 
@@ -34,6 +35,7 @@ async def finish_run(
         raise ValueError("A run outcome must be terminal")
     if generation is None and source != "stop":
         raise ValueError("A run generation is required")
+    render_notice(session_id, generation or 0, status, reason)
     fence = CURRENT_FENCE.get()
     if (
         source == "run"
@@ -100,6 +102,32 @@ async def finish_run(
         if result.one_or_none() is None:
             return []
     assert generation is not None
+    session = await db.scalar(
+        select(Session).where(Session.id == session_id).execution_options(populate_existing=True)
+    )
+    notice: dict[str, Any] = {}
+    if session is not None and session.notify_generation == generation:
+        answers = await db.scalars(
+            select(Message)
+            .where(
+                Message.session_id == session_id,
+                Message.run_generation == generation,
+                Message.role == "assistant",
+                Message.kind == "normal",
+                Message.skipped.is_(False),
+            )
+            .order_by(Message.id.desc())
+        )
+        message_id = next(
+            (row.id for row in answers if not row.tool_calls and (row.content or "").strip()),
+            None,
+        )
+        notice = {
+            "notice_target_id": session.parent_id,
+            "notice_hop": session.inbox_hop,
+            "notice_content": render_notice(session_id, generation, status, reason, message_id),
+            "notice_message_id": message_id,
+        }
     db.add(
         SessionRunOutcome(
             session_id=session_id,
@@ -107,6 +135,7 @@ async def finish_run(
             status=status,
             reason=reason,
             error=error,
+            **notice,
         )
     )
     if (

@@ -38,6 +38,87 @@ def prepare_schema(connection: Connection) -> None:
     command.upgrade(config, "0016")
 
 
+@pytest.mark.parametrize("stop_kind", ["plain", "scoped", "cascade"])
+async def test_stopped_message_call_is_never_recovered(
+    run_store: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stop_kind: str,
+) -> None:
+    from sqlalchemy.orm import attributes, selectinload
+
+    from agent import api
+    from agent.models import Message, SessionInbox
+    from agent.schemas import MessageCreate
+
+    sender_id = await seed(run_store, tmp_path)
+    parent_id = await seed(run_store, tmp_path / "parent")
+    async with run_store() as db:
+        sender = await db.get(Session, sender_id)
+        assert sender is not None
+        if stop_kind == "cascade":
+            sender.parent_id = parent_id
+        db.add(
+            ToolCall(
+                id="cancelled-message",
+                session_id=sender_id,
+                name="message_to_session",
+                arguments={"session_id": parent_id, "message": "queued"},
+                risk_level="network_access",
+                status="running",
+            )
+        )
+        await db.commit()
+        old_fence = await claim(db, sender_id, lease_seconds=60)
+    assert old_fence is not None
+    supervisor = AgentSupervisor(get_settings())
+
+    async def no_dispatch(*args: Any, **kwargs: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(supervisor, "start", no_dispatch)
+    monkeypatch.setattr(supervisor, "_run_guarded", no_dispatch)
+    monkeypatch.setattr(api, "_dispatch_session_run", no_dispatch)
+    if stop_kind == "scoped":
+        assert await supervisor.stop_scoped(sender_id, 1)
+    else:
+        await supervisor.stop(parent_id if stop_kind == "cascade" else sender_id)
+    async with run_store() as db:
+        stopped_call = await db.get(ToolCall, "cancelled-message")
+        assert stopped_call is not None and stopped_call.status == "cancelled"
+        assert stopped_call.result is not None and stopped_call.result["success"] is False
+        await api.add_message(sender_id, MessageCreate(content="Continue"), db)
+    assert await AgentSupervisor.start(supervisor, sender_id)
+    await supervisor._tasks[sender_id]
+    await supervisor.reconcile_pending()
+    async with run_store() as db:
+        sender = await db.get(Session, sender_id)
+        assert sender is not None
+        calls = list(
+            await db.scalars(
+                select(ToolCall)
+                .where(ToolCall.session_id == sender_id)
+                .options(selectinload(ToolCall.approval))
+            )
+        )
+        attributes.set_committed_value(sender, "tool_calls", calls)
+        assert await supervisor._resume_tool_calls(db, sender) == "ready"
+        assert calls[0].status == "cancelled"
+        closing = list(
+            await db.scalars(select(Message).where(Message.tool_call_id == "cancelled-message"))
+        )
+        assert len(closing) == 1
+        assert '"success": false' in (closing[0].content or "")
+        assert await db.scalar(select(SessionInbox.id).limit(1)) is None
+        token = CURRENT_FENCE.set(old_fence)
+        try:
+            with pytest.raises(FenceLostError):
+                await supervisor._execute_message_call(db, sender, calls[0])
+            await db.rollback()
+        finally:
+            CURRENT_FENCE.reset(token)
+
+
 @pytest.fixture(params=["sqlite", "postgresql"])
 async def run_store(
     request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -67,6 +148,11 @@ async def run_store(
             )
         factory = async_sessionmaker(engine, expire_on_commit=False)
         monkeypatch.setattr(runtime, "session_factory", factory)
+        from agent import attempt_audit, context_inference, context_state
+
+        monkeypatch.setattr(attempt_audit, "session_factory", factory)
+        monkeypatch.setattr(context_inference, "session_factory", factory)
+        monkeypatch.setattr(context_state, "session_factory", factory)
         install_commit_guard()
         yield factory
     finally:
@@ -105,6 +191,448 @@ async def seed_call(
             db.add(approval_row)
         await db.commit()
         return call.id, approval_row.id if approval_row else None
+
+
+async def inbox_sessions(
+    factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> tuple[str, str, str]:
+    first = await seed(factory, tmp_path)
+    async with factory() as db:
+        project_id = await db.scalar(select(Session.project_id).where(Session.id == first))
+        second = Session(project_id=project_id, title="second", run_generation=1)
+        target = Session(
+            project_id=project_id, title="target", run_generation=1, status="completed"
+        )
+        db.add_all([second, target])
+        await db.commit()
+        return first, second.id, target.id
+
+
+async def test_postgres_inbox_capacity_serializes_competing_posts(
+    run_store: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    from sqlalchemy import func
+    from sqlalchemy.exc import DBAPIError
+
+    from agent.models import SessionInbox
+    from agent.session_inbox import enqueue, retryable
+    from agent.tools.base import ToolError
+
+    if run_store.kw["bind"].dialect.name != "postgresql":
+        pytest.skip("PostgreSQL row-lock race")
+    first, second, target = await inbox_sessions(run_store, tmp_path)
+    async with run_store() as db:
+        for index in range(19):
+            db.add(
+                SessionInbox(
+                    target_session_id=target,
+                    sender_session_id=first,
+                    kind="message",
+                    content="seed",
+                    hop=0,
+                    dedupe_key=f"seed:{index}",
+                )
+            )
+        await db.commit()
+        first_fence = await claim(db, first, lease_seconds=60)
+        second_fence = await claim(db, second, lease_seconds=60)
+    inserted, collision, committed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def winner() -> None:
+        token = CURRENT_FENCE.set(first_fence)
+        try:
+            async with run_store() as db:
+                await enqueue(db, first, target, "winner", "winner")
+                inserted.set()
+                await collision.wait()
+                await db.commit()
+                committed.set()
+        finally:
+            CURRENT_FENCE.reset(token)
+
+    async def contender() -> None:
+        await inserted.wait()
+        token = CURRENT_FENCE.set(second_fence)
+        try:
+            async with run_store() as db:
+                with pytest.raises(DBAPIError) as caught:
+                    await enqueue(db, second, target, "contender", "contender")
+                assert retryable(caught.value)
+                await db.rollback()
+                collision.set()
+                await committed.wait()
+                with pytest.raises(ToolError, match="Inbox full"):
+                    await enqueue(db, second, target, "contender", "contender")
+        finally:
+            CURRENT_FENCE.reset(token)
+
+    async with asyncio.timeout(10):
+        await asyncio.gather(winner(), contender())
+    async with run_store() as db:
+        assert await db.scalar(select(func.count()).select_from(SessionInbox)) == 20
+
+
+async def test_postgres_mutual_messages_use_nowait_without_deadlock(
+    run_store: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    from sqlalchemy import func
+    from sqlalchemy.exc import DBAPIError
+
+    from agent.models import SessionInbox
+    from agent.session_inbox import enqueue, retryable
+
+    if run_store.kw["bind"].dialect.name != "postgresql":
+        pytest.skip("PostgreSQL row-lock race")
+    first, second, _ = await inbox_sessions(run_store, tmp_path)
+    async with run_store() as db:
+        fences = [await claim(db, session_id, lease_seconds=60) for session_id in (first, second)]
+    barrier = asyncio.Barrier(2)
+
+    async def send(sender: str, target: str, fence: Any) -> bool:
+        token = CURRENT_FENCE.set(fence)
+        try:
+            async with run_store() as db:
+                await fence_check(db, fence)
+                await barrier.wait()
+                try:
+                    await enqueue(db, sender, target, "mutual", f"mutual:{sender}")
+                    await db.commit()
+                    return True
+                except DBAPIError as error:
+                    assert retryable(error)
+                    await db.rollback()
+                    return False
+        finally:
+            CURRENT_FENCE.reset(token)
+
+    async with asyncio.timeout(10):
+        accepted = await asyncio.gather(
+            send(first, second, fences[0]), send(second, first, fences[1])
+        )
+    for sender, target, fence, done in zip(
+        (first, second), (second, first), fences, accepted, strict=True
+    ):
+        if not done:
+            token = CURRENT_FENCE.set(fence)
+            try:
+                async with run_store() as db:
+                    await enqueue(db, sender, target, "mutual", f"mutual:{sender}")
+                    await db.commit()
+            finally:
+                CURRENT_FENCE.reset(token)
+    async with run_store() as db:
+        assert await db.scalar(select(func.count()).select_from(SessionInbox)) == 2
+
+
+async def test_two_inbox_auto_claims_increment_generation_once(
+    run_store: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    from agent.models import SessionInbox
+    from agent.session_inbox import auto_claim
+
+    first, _, target = await inbox_sessions(run_store, tmp_path)
+    async with run_store() as db:
+        db.add(
+            SessionInbox(
+                target_session_id=target,
+                sender_session_id=first,
+                kind="message",
+                content="wake",
+                hop=0,
+                dedupe_key="wake",
+            )
+        )
+        await db.commit()
+    barrier = asyncio.Barrier(2)
+
+    async def wake() -> int | None:
+        await barrier.wait()
+        async with run_store() as db:
+            generation = await auto_claim(db, target, 1, get_settings())
+            await db.commit()
+            return generation
+
+    async with asyncio.timeout(10):
+        results = await asyncio.gather(wake(), wake())
+    assert results.count(2) == 1 and results.count(None) == 1
+
+
+async def test_inbox_delivery_rejects_expired_and_reclaimed_fence(
+    run_store: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from agent.models import SessionInbox
+    from agent.session_inbox import deliver
+
+    first, target, _ = await inbox_sessions(run_store, tmp_path)
+    async with run_store() as db:
+        db.add(
+            SessionInbox(
+                target_session_id=target,
+                sender_session_id=first,
+                kind="message",
+                content="pending",
+                hop=0,
+                dedupe_key="pending",
+            )
+        )
+        await db.commit()
+        old = await claim(db, target, lease_seconds=60)
+        await db.execute(
+            update(Session)
+            .where(Session.id == target)
+            .values(lease_until=datetime.now(UTC) - timedelta(seconds=1))
+        )
+        await db.commit()
+        fresh = await claim(db, target, lease_seconds=60)
+    assert fresh is not None and old is not None and fresh.epoch > old.epoch
+    token = CURRENT_FENCE.set(old)
+    try:
+        async with run_store() as db:
+            with pytest.raises(FenceLostError):
+                await deliver(db, target)
+            await db.rollback()
+    finally:
+        CURRENT_FENCE.reset(token)
+    token = CURRENT_FENCE.set(fresh)
+    try:
+        async with run_store() as db:
+            assert (await deliver(db, target))[0]
+            await db.commit()
+    finally:
+        CURRENT_FENCE.reset(token)
+
+
+async def test_postgres_stop_waits_for_delivery_commit(
+    run_store: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    from agent.models import Message, SessionInbox
+    from agent.session_inbox import deliver
+
+    if run_store.kw["bind"].dialect.name != "postgresql":
+        pytest.skip("PostgreSQL row-lock race")
+    first, target, _ = await inbox_sessions(run_store, tmp_path)
+    async with run_store() as db:
+        db.add(
+            SessionInbox(
+                target_session_id=target,
+                sender_session_id=first,
+                kind="message",
+                content="pending",
+                hop=0,
+                dedupe_key="pending",
+            )
+        )
+        await db.commit()
+        fence = await claim(db, target, lease_seconds=60)
+    staged, stop_entered, commit = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    pids: dict[str, int] = {}
+
+    async def delivery() -> None:
+        token = CURRENT_FENCE.set(fence)
+        try:
+            async with run_store() as db:
+                pids["delivery"] = await db.scalar(text("SELECT pg_backend_pid()"))
+                assert (await deliver(db, target))[0]
+                staged.set()
+                await commit.wait()
+                await db.commit()
+        finally:
+            CURRENT_FENCE.reset(token)
+
+    async def stop() -> None:
+        await staged.wait()
+        async with run_store() as db:
+            pids["stop"] = await db.scalar(text("SELECT pg_backend_pid()"))
+            stop_entered.set()
+            await finish_run(db, target, None, "stopped", source="stop")
+            await db.commit()
+
+    delivery_task = asyncio.create_task(delivery())
+    stop_task = asyncio.create_task(stop())
+    try:
+        await asyncio.wait_for(stop_entered.wait(), 10)
+        await wait_for_blocker(run_store, pids["stop"], pids["delivery"], stop_task)
+        commit.set()
+        await asyncio.wait_for(asyncio.gather(delivery_task, stop_task), 10)
+    finally:
+        commit.set()
+        for task in (delivery_task, stop_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(delivery_task, stop_task, return_exceptions=True)
+    async with run_store() as db:
+        rows = list(await db.scalars(select(Message).where(Message.session_id == target)))
+        assert len(rows) == 1
+        assert (await db.get(Session, target)).status == "stopped"
+        receipt = await db.scalar(select(SessionInbox).where(SessionInbox.dedupe_key == "pending"))
+        assert receipt.delivered_at is not None
+
+
+async def test_postgres_child_finish_never_locks_notice_parent(
+    run_store: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    if run_store.kw["bind"].dialect.name != "postgresql":
+        pytest.skip("PostgreSQL row-lock race")
+    parent, child, _ = await inbox_sessions(run_store, tmp_path)
+    async with run_store() as db:
+        await db.execute(
+            update(Session).where(Session.id == child).values(parent_id=parent, notify_generation=1)
+        )
+        await db.commit()
+    async with run_store() as locked:
+        await locked.execute(select(Session).where(Session.id == parent).with_for_update())
+
+        async def finish_child() -> None:
+            async with run_store() as db:
+                await finish_run(db, child, 1, "completed")
+                await db.commit()
+
+        async with asyncio.timeout(10):
+            await finish_child()
+        await locked.rollback()
+    async with run_store() as db:
+        outcome = await db.get(SessionRunOutcome, (child, 1))
+        assert outcome.notice_target_id == parent
+
+
+async def test_postgres_completion_and_post_leave_a_durable_wake(
+    run_store: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    from sqlalchemy.exc import DBAPIError
+
+    from agent.session_fence import release
+    from agent.session_inbox import auto_claim, deliver, enqueue, retryable
+
+    if run_store.kw["bind"].dialect.name != "postgresql":
+        pytest.skip("PostgreSQL row-lock race")
+    sender, target, _ = await inbox_sessions(run_store, tmp_path)
+    async with run_store() as db:
+        sender_fence = await claim(db, sender, lease_seconds=60)
+        target_fence = await claim(db, target, lease_seconds=60)
+    checked, collision, completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def complete() -> None:
+        token = CURRENT_FENCE.set(target_fence)
+        try:
+            async with run_store() as db:
+                assert not (await deliver(db, target))[0]
+                checked.set()
+                await collision.wait()
+                await finish_run(db, target, 1, "completed")
+                await db.commit()
+        finally:
+            CURRENT_FENCE.reset(token)
+        async with run_store() as db:
+            await release(db, target_fence)
+        completed.set()
+
+    async def send() -> None:
+        await checked.wait()
+        token = CURRENT_FENCE.set(sender_fence)
+        try:
+            async with run_store() as db:
+                with pytest.raises(DBAPIError) as caught:
+                    await enqueue(db, sender, target, "late", "late")
+                assert retryable(caught.value)
+                await db.rollback()
+                collision.set()
+                await completed.wait()
+                await enqueue(db, sender, target, "late", "late")
+                await db.commit()
+        finally:
+            CURRENT_FENCE.reset(token)
+
+    async with asyncio.timeout(10):
+        await asyncio.gather(complete(), send())
+    async with run_store() as db:
+        assert await auto_claim(db, target, 1, get_settings()) == 2
+        await db.commit()
+        assert (await db.get(SessionRunOutcome, (target, 1))).status == "completed"
+
+
+async def test_postgres_post_and_notice_share_the_capacity_lock(
+    run_store: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    from sqlalchemy import func
+
+    from agent.models import SessionInbox
+    from agent.session_inbox import enqueue, promote_notices
+
+    if run_store.kw["bind"].dialect.name != "postgresql":
+        pytest.skip("PostgreSQL row-lock race")
+    sender, child, target = await inbox_sessions(run_store, tmp_path)
+    async with run_store() as db:
+        await db.execute(
+            update(Session).where(Session.id == child).values(parent_id=target, notify_generation=1)
+        )
+        await finish_run(db, child, 1, "completed")
+        for index in range(19):
+            db.add(
+                SessionInbox(
+                    target_session_id=target,
+                    sender_session_id=sender,
+                    kind="message",
+                    content="seed",
+                    hop=0,
+                    dedupe_key=f"seed:{index}",
+                )
+            )
+        await db.commit()
+        fence = await claim(db, sender, lease_seconds=60)
+    entered = asyncio.Event()
+    pids: dict[str, int] = {}
+
+    class PromotionSession(AsyncSession):
+        async def execute(self, statement: Any, *args: Any, **kwargs: Any) -> Any:
+            if "FROM sessions" in str(statement) and "FOR UPDATE" in str(statement):
+                pids["promotion"] = (
+                    await super().execute(text("SELECT pg_backend_pid()"))
+                ).scalar_one()
+                entered.set()
+            return await super().execute(statement, *args, **kwargs)
+
+    promotion_factory = async_sessionmaker(
+        run_store.kw["bind"], class_=PromotionSession, expire_on_commit=False
+    )
+    token = CURRENT_FENCE.set(fence)
+    task: asyncio.Task[None] | None = None
+    try:
+        async with run_store() as db:
+            pids["post"] = await db.scalar(text("SELECT pg_backend_pid()"))
+            await enqueue(db, sender, target, "last slot", "last")
+            empty_fence = CURRENT_FENCE.set(None)
+            try:
+                task = asyncio.create_task(promote_notices(promotion_factory))
+            finally:
+                CURRENT_FENCE.reset(empty_fence)
+            await asyncio.wait_for(entered.wait(), 10)
+            await wait_for_blocker(run_store, pids["promotion"], pids["post"], task)
+            await db.commit()
+            await asyncio.wait_for(task, 10)
+    finally:
+        CURRENT_FENCE.reset(token)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    async with run_store() as db:
+        assert await db.scalar(select(func.count()).select_from(SessionInbox)) == 20
+        assert (
+            await db.scalar(
+                select(SessionInbox.id).where(SessionInbox.dedupe_key == f"child:{child}:1")
+            )
+            is None
+        )
+        assert (await db.get(SessionRunOutcome, (child, 1))).notice_target_id == target
 
 
 async def test_inbox_migration_roundtrip_uses_native_environment(

@@ -147,3 +147,34 @@ class GetProjectsTool(Tool):
                     for row in projects
                 ]
             }
+
+
+class MessageToSessionTool(Tool):
+    """Queue untrusted data for another session in the current project."""
+
+    name = "message_to_session"
+    description = (
+        "Queue a message to another session in the same project; delivery is asynchronous."
+    )
+    risk_level = RiskLevel.network_access
+    allowed_modes = frozenset({"dev"})
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string"},
+            "message": {"type": "string", "minLength": 1, "maxLength": 8000},
+        },
+        "required": ["session_id", "message"],
+        "additionalProperties": False,
+    }
+
+    def check_arguments(self, arguments: dict[str, Any]) -> None:
+        from agent.session_inbox import validate_text
+
+        validate_text(str(arguments["message"]))
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> dict[str, Any]:
+        self.check_arguments(arguments)
+        if context.post_message is None:
+            raise ToolError("Message posting is unavailable outside a tool call")
+        return await context.post_message(str(arguments["session_id"]), str(arguments["message"]))

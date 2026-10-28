@@ -105,6 +105,7 @@ class Settings(BaseSettings):
     knowledge_base_embedding_api_key: str = ""
     knowledge_base_embedding_model: str = ""
     max_parallel_sessions: int = Field(default=4, ge=1, le=32)
+    max_auto_hops: int = Field(default=3, ge=1)
     max_child_depth: int = Field(default=3, ge=0, le=10)
     max_child_wait_seconds: int = Field(default=600, ge=10, le=7200)
     api_token: str = ""

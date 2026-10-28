@@ -16,6 +16,7 @@ from typing import Any, cast
 from pydantic import ValidationError
 from sqlalchemy import or_, select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import attributes, selectinload
 
 from agent.checkpoints import load_context_rows
@@ -36,6 +37,7 @@ from agent.models import (
     OutboundAudit,
     Project,
     Session,
+    SessionInbox,
     SessionStatus,
     ToolCall,
     ToolCallStatus,
@@ -64,6 +66,15 @@ from agent.session_fence import (
     new_generation,
     release,
     renew,
+)
+from agent.session_inbox import (
+    auto_claim,
+    deliver,
+    enqueue,
+    has_eligible,
+    lock_session,
+    promote_notices,
+    retryable,
 )
 from agent.session_service import create_session_record
 from agent.skill_prompt import load_skill_set
@@ -169,6 +180,7 @@ class AgentSupervisor:
         # until they end, and cancelled by Stop of the session and by shutdown.
         self._finishing: dict[asyncio.Task[None], str] = {}
         self._semaphore = asyncio.Semaphore(settings.max_parallel_sessions)
+        self._reconcile_signal = asyncio.Event()
         self.task_queue = RedisTaskQueue(settings) if settings.execution_mode == "redis" else None
         install_commit_guard()
 
@@ -247,6 +259,11 @@ class AgentSupervisor:
 
     async def reconcile_pending(self) -> None:
         """Dispatch durable pending intents whose executor is absent or expired."""
+        token = CURRENT_FENCE.set(None)
+        try:
+            await self._reconcile_inbox()
+        finally:
+            CURRENT_FENCE.reset(token)
         async with session_factory() as db:
             rows = (
                 await db.execute(
@@ -267,17 +284,59 @@ class AgentSupervisor:
             except Exception:
                 logger.exception("Session %s: pending dispatch will be retried", session_id)
 
+    async def _reconcile_inbox(self) -> None:
+        await promote_notices(session_factory)
+        async with session_factory() as db:
+            targets = (
+                await db.execute(
+                    select(Session.id, Session.run_generation).where(
+                        Session.status == "completed",
+                        select(SessionInbox.id)
+                        .where(
+                            SessionInbox.target_session_id == Session.id,
+                            SessionInbox.delivered_at.is_(None),
+                            SessionInbox.rejected_at.is_(None),
+                        )
+                        .exists(),
+                    )
+                )
+            ).all()
+        for session_id, generation in targets:
+            try:
+                async with session_factory() as db:
+                    claimed = await auto_claim(db, session_id, generation, self.settings)
+                    events = []
+                    if claimed is not None:
+                        events.append(
+                            await add_event(
+                                db,
+                                "session.status",
+                                {
+                                    "status": "pending",
+                                    "generation": claimed,
+                                },
+                                session_id,
+                            )
+                        )
+                    await db.commit()
+                await publish(events)
+            except DBAPIError:
+                logger.exception("Session %s: inbox wake will be retried", session_id)
+
     def start_reconciliation(self) -> asyncio.Task[None]:
         """Start reconciliation; the API or worker lifespan owns the returned task."""
+        self._reconcile_signal = asyncio.Event()
         return asyncio.create_task(self._reconcile_loop(), name="pending-reconciler")
 
     async def _reconcile_loop(self) -> None:
         while True:
+            self._reconcile_signal.clear()
             try:
                 await self.reconcile_pending()
             except Exception:
                 logger.exception("Pending reconciliation will be retried")
-            await asyncio.sleep(RECONCILE_SECONDS)
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._reconcile_signal.wait(), RECONCILE_SECONDS)
 
     async def infrastructure_status(self) -> dict[str, Any]:
         if self.task_queue is None:
@@ -408,11 +467,14 @@ class AgentSupervisor:
                 select(ToolCall)
                 .where(
                     ToolCall.session_id == session_id,
-                    ToolCall.status.in_(
-                        {
-                            ToolCallStatus.pending.value,
-                            ToolCallStatus.awaiting_confirmation.value,
-                        }
+                    or_(
+                        ToolCall.status.in_(
+                            {
+                                ToolCallStatus.pending.value,
+                                ToolCallStatus.awaiting_confirmation.value,
+                            }
+                        ),
+                        (ToolCall.name == "message_to_session") & (ToolCall.status == "running"),
                     ),
                 )
                 .options(selectinload(ToolCall.approval))
@@ -672,6 +734,7 @@ class AgentSupervisor:
         generation: int,
         reason: str,
         fence: RunFence | None = None,
+        pending_events: list[PendingEvent] | None = None,
     ) -> None:
         """Stop the session for a budget reason: durable reason, conditionally stopped status.
 
@@ -685,6 +748,7 @@ class AgentSupervisor:
         pending = await finish_run(db, session_id, generation, "stopped", reason=reason)
         if not pending:
             return
+        pending = [*(pending_events or []), *pending]
         await mark_budget_stop(db, session_id, generation, reason)
         cancelled = await self._cancel_unfinished_tool_calls(db, session_id)
         if cancelled:
@@ -764,6 +828,38 @@ class AgentSupervisor:
             finally:
                 self._run_registry.reset(token)
 
+    async def _deliver_inbox(
+        self, db: Any, session: Session, *, pending: list[PendingEvent]
+    ) -> bool | None:
+        fence = CURRENT_FENCE.get()
+        if fence is None:
+            return False
+        if fence.session_id != session.id:
+            raise FenceLostError("Automatic delivery requires the target run fence")
+        await fence_check(db, fence)
+        fresh = await lock_session(db, session.id)
+        if fresh is None:
+            return False
+        if await has_eligible(db, fresh, self.settings):
+            now = datetime.now(UTC)
+            usage = await load_budget_usage(db, fresh, now)
+            decision = check_budget(budget_limits(self.settings, fresh), usage, now)
+            if not decision.allowed:
+                await self._stop_session_by_budget(
+                    db,
+                    fresh.id,
+                    fence.generation,
+                    decision.reason or "budget_exceeded",
+                    pending_events=pending,
+                )
+                return None
+        delivered, events = await deliver(db, fresh.id, settings=self.settings)
+        pending.extend(events)
+        if delivered:
+            await db.commit()
+            await publish(pending)
+        return delivered
+
     async def _run_session(self, session_id: str) -> None:
         # One catalogue snapshot for the whole execution: a YAML or UI change applies to the
         # next execution, not between two steps of a running one.
@@ -771,6 +867,16 @@ class AgentSupervisor:
         cut_offs = 0
         while True:
             async with session_factory() as db:
+                fence = CURRENT_FENCE.get()
+                if fence is not None:
+                    for attempt in range(3):
+                        try:
+                            await fence_check(db, fence)
+                            break
+                        except DBAPIError as error:
+                            await db.rollback()
+                            if not retryable(error) or attempt == 2:
+                                raise
                 query = (
                     select(Session)
                     .where(Session.id == session_id)
@@ -795,6 +901,13 @@ class AgentSupervisor:
                     )
                 )
                 attributes.set_committed_value(session, "tool_calls", unfinished)
+                inbox_pending: list[PendingEvent] = []
+                if not unfinished:
+                    delivered = await self._deliver_inbox(db, session, pending=inbox_pending)
+                    if delivered is None:
+                        return
+                    if delivered:
+                        continue
                 visible = [
                     message
                     for message in session.messages
@@ -805,10 +918,11 @@ class AgentSupervisor:
                     and visible
                     and visible[-1].role == "assistant"
                     and not visible[-1].tool_calls
+                    and not unfinished
                 ):
                     pending = await finish_run(db, session_id, session.run_generation, "completed")
                     await db.commit()
-                    await publish(pending)
+                    await publish([*inbox_pending, *pending])
                     return
                 if session.status == SessionStatus.awaiting_confirmation.value:
                     pending_approval = any(
@@ -841,6 +955,7 @@ class AgentSupervisor:
                     ),
                 )
                 await db.commit()
+                await publish(inbox_pending)
                 if claimed.rowcount == 0:
                     return
                 await emit_event(db, "session.status", {"status": session.status}, session.id)
@@ -1017,6 +1132,11 @@ class AgentSupervisor:
                             session.id,
                         )
                     ]
+                    delivered = await self._deliver_inbox(db, session, pending=pending)
+                    if delivered is None:
+                        return
+                    if delivered:
+                        continue
                     pending.extend(
                         await finish_run(db, session_id, session.run_generation, "completed")
                     )
@@ -1129,6 +1249,29 @@ class AgentSupervisor:
             if session.stop_requested or session.status == SessionStatus.stopped.value:
                 return "stopped"
             if call.status == ToolCallStatus.running.value:
+                if call.name == "message_to_session":
+                    fence = CURRENT_FENCE.get()
+                    if fence is None or fence.session_id != session.id:
+                        raise FenceLostError("Message recovery requires the sender run fence")
+                    await fence_check(db, fence)
+                    await db.refresh(call)
+                    if call.status != "running":
+                        continue
+                    receipt_id = await db.scalar(
+                        select(SessionInbox.id).where(SessionInbox.dedupe_key == f"tool:{call.id}")
+                    )
+                    if receipt_id is not None:
+                        await self._store_tool_result(
+                            db,
+                            session,
+                            call,
+                            {
+                                "success": True,
+                                "output": {"inbox_id": receipt_id, "status": "queued"},
+                            },
+                        )
+                        processed = True
+                        continue
                 call.status = ToolCallStatus.error.value
                 call.result = {
                     "success": False,
@@ -1303,10 +1446,82 @@ class AgentSupervisor:
             raise
         return True
 
+    async def _enqueue_message(
+        self, db: Any, session: Session, call_id: str, target_id: str, content: str
+    ) -> dict[str, Any]:
+        receipt = await enqueue(db, session.id, target_id, content, f"tool:{call_id}")
+        status = await db.scalar(select(ToolCall.status).where(ToolCall.id == call_id))
+        if status != "running":
+            raise FenceLostError("Message call is no longer running")
+        return {"inbox_id": receipt.id, "status": "queued"}
+
+    async def _execute_message_call(self, db: Any, session: Session, call: ToolCall) -> bool:
+        session_id, call_id = session.id, call.id
+        for attempt in range(3):
+            try:
+                fence = CURRENT_FENCE.get()
+                if fence is None or fence.session_id != session_id:
+                    raise FenceLostError("Message posting requires the sender run fence")
+                await fence_check(db, fence)
+                session = await db.scalar(
+                    select(Session)
+                    .where(Session.id == session_id)
+                    .options(selectinload(Session.project))
+                    .execution_options(populate_existing=True)
+                )
+                call = await db.scalar(
+                    select(ToolCall)
+                    .where(ToolCall.id == call_id)
+                    .options(selectinload(ToolCall.approval))
+                    .execution_options(populate_existing=True)
+                )
+                if call.status != "running":
+                    return False
+                tool = self._tools.get(call.name, session.mode)
+                context = replace(
+                    self._tool_context(session),
+                    post_message=partial(
+                        self._enqueue_message,
+                        db,
+                        session,
+                        call.id,
+                    ),
+                )
+                try:
+                    output = await tool.execute(context, dict(call.arguments))
+                    result = {"success": True, "output": output}
+                except (ToolError, ValueError) as error:
+                    result = {"success": False, "error": str(error)}
+                await self._store_tool_result(db, session, call, result)
+                self._reconcile_signal.set()
+                return True
+            except DBAPIError as error:
+                await db.rollback()
+                if not retryable(error):
+                    raise
+                if attempt == 2:
+                    # Rollback expires ORM attributes. Reload under the sender fence before
+                    # recording the failure; the locked target is no longer needed.
+                    assert fence is not None
+                    await fence_check(db, fence)
+                    session = await db.get(Session, session_id)
+                    call = await db.get(ToolCall, call_id)
+                    await self._store_tool_result(
+                        db,
+                        session,
+                        call,
+                        {"success": False, "error": "Inbox temporarily busy; retry the message"},
+                    )
+                    return True
+                await asyncio.sleep(0.02 * (attempt + 1))
+        return False
+
     async def _execute_tool_call(self, db: Any, session: Session, call: ToolCall) -> bool:
         await self._check_tool_budget(db, session.id)
         if not await self._claim_tool_call(db, call):
             return False
+        if call.name == "message_to_session":
+            return await self._execute_message_call(db, session, call)
         try:
             tool = self._tools.get(call.name, session.mode)
             if not await self._source_execution_ready(db, session, call, tool):
@@ -1340,6 +1555,14 @@ class AgentSupervisor:
     async def _store_tool_result(
         self, db: Any, session: Session, call: ToolCall, result: dict[str, Any]
     ) -> None:
+        if call.name == "message_to_session":
+            fence = CURRENT_FENCE.get()
+            if fence is None or fence.session_id != session.id:
+                raise FenceLostError("Message results require the sender run fence")
+            await fence_check(db, fence)
+            status = await db.scalar(select(ToolCall.status).where(ToolCall.id == call.id))
+            if status != "running":
+                raise FenceLostError("Message call is no longer running")
         call.status = (
             ToolCallStatus.completed.value if result["success"] else ToolCallStatus.error.value
         )
@@ -1351,13 +1574,14 @@ class AgentSupervisor:
             tool_call_id=call.id,
             content=json.dumps(result, ensure_ascii=False),
         )
-        await db.commit()
-        await emit_event(
+        event = await add_event(
             db,
             "tool.completed",
             {"tool_call_id": call.id, "name": call.name, "status": call.status},
             session.id,
         )
+        await db.commit()
+        await publish([event])
 
     @staticmethod
     def _reasoning_for(session: Session, model: ResolvedModel) -> ReasoningDecision:
@@ -1484,6 +1708,10 @@ class AgentSupervisor:
                 commit=False,
             )
             child_id = child.id
+            fresh_parent = await db.get(Session, parent.id, populate_existing=True)
+            assert fresh_parent is not None
+            child.inbox_hop = fresh_parent.inbox_hop
+            child.notify_generation = None if wait else 1
             created_event = await add_event(
                 db,
                 "session.child_created",

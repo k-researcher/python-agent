@@ -23,6 +23,7 @@ class RiskLevel(enum.StrEnum):
 
 AuditCallback = Callable[[str, str, str, str, str, str | None], Awaitable[None]]
 SpawnChildCallback = Callable[[str, str, bool, str | None], Awaitable[dict[str, Any]]]
+PostMessageCallback = Callable[[str, str], Awaitable[dict[str, Any]]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +34,7 @@ class ToolContext:
     audit_egress: AuditCallback | None = None
     spawn_child: SpawnChildCallback | None = None
     sandbox: SandboxPolicy | None = None
+    post_message: PostMessageCallback | None = None
 
 
 class Tool(ABC):
