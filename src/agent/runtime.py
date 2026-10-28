@@ -24,6 +24,7 @@ from agent.config import Settings
 from agent.context_inference import TRANSIENT_KINDS, ContextInference, InferenceResult
 from agent.context_manager import ContextManager
 from agent.database import session_factory
+from agent.engine_access import check_engine_access
 from agent.events import (
     CURRENT_STREAMS,
     PendingEvent,
@@ -208,6 +209,7 @@ class AgentSupervisor:
         *,
         new_run: bool = True,
         expected_generation: int | None = None,
+        actor_user_id: str | None = None,
     ) -> bool:
         """Schedule the session. A new run starts a new generation; a resume continues it.
 
@@ -225,6 +227,15 @@ class AgentSupervisor:
         if expected_generation is not None and new_run:
             # A new run makes a new generation, so it can never match the expected one.
             raise ValueError("expected_generation needs new_run=False")
+        async with session_factory() as db:
+            record = await db.get(Session, session_id)
+            if record is not None and record.engine_profile is not None:
+                # A queued generation carries the identity of the already authorized
+                # creator. A direct new run must supply its actor explicitly.
+                actor = actor_user_id
+                if actor is None and expected_generation is not None:
+                    actor = (record.engine_state or {}).get("operator_user_id")
+                await check_engine_access(db, self.settings, record, actor)
         if expected_generation is not None and not await self._at_generation(
             session_id, expected_generation
         ):
@@ -544,7 +555,14 @@ class AgentSupervisor:
 
         await bounded_cleanup(close_resources(), clock, clock.now() + 2)
 
-    async def resolve_approval(self, approval_id: str, decision: str, comment: str | None) -> str:
+    async def resolve_approval(
+        self,
+        approval_id: str,
+        decision: str,
+        comment: str | None,
+        *,
+        actor_user_id: str | None = None,
+    ) -> str:
         async with session_factory() as db:
             session_id = await db.scalar(
                 select(ToolCall.session_id)
@@ -553,6 +571,10 @@ class AgentSupervisor:
             )
             if session_id is None:
                 raise LookupError("Approval not found")
+            record = await db.get(Session, session_id)
+            if record is not None and record.engine_profile is not None:
+                await check_engine_access(db, self.settings, record, actor_user_id)
+                raise ValueError("engine недоступен")
             await db.execute(select(Session).where(Session.id == session_id).with_for_update())
             query = (
                 select(Approval)
@@ -868,6 +890,19 @@ class AgentSupervisor:
 
     async def _run(self, session_id: str) -> None:
         async with session_factory() as db:
+            session = await db.get(Session, session_id)
+            if session is not None and session.engine_profile is not None:
+                # No runner is installed yet. This path must precede every model/tool path,
+                # including source discovery, summaries and model fallback selection.
+                try:
+                    await check_engine_access(
+                        db, self.settings, session, session.created_by_user_id
+                    )
+                except PermissionError as exc:
+                    raise RuntimeError(f"engine недоступен: {exc}") from exc
+                raise RuntimeError(
+                    "engine недоступен: исполнитель внешнего агента ещё не подключён"
+                )
             project = await db.scalar(select(Project).join(Session).where(Session.id == session_id))
         registry = self.registry
         if project is not None:

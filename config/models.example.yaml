@@ -80,3 +80,19 @@ routing:
 
 decisions:                          # слой решений, пока выключен
   enabled: false
+
+# Внешние агенты: только явный выбор engine_profile, без default и fallback.
+# Исполнитель пока недоступен; enabled не запускает CLI в этой версии.
+engine_profiles: {}
+# engine_profiles:
+#   personal:
+#     enabled: false
+#     adapter_module: agent.engine_adapters.claude
+#     # Второй допустимый модуль: agent.engine_adapters.codex
+#     binary: agent-cli
+#     model: configured-model-id
+#     effort: null
+#     timeouts: {turn: 600, approval: 120}
+#     process_limit: 1             # не больше max_parallel_sessions
+#     operator_user_id: local-user-id
+#     adapter_settings: {}

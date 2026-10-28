@@ -4,10 +4,10 @@ import os
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -48,6 +48,43 @@ class LLMProfileSettings(BaseModel):
     max_tokens: int = Field(default=8192, ge=1)
 
 
+SUPPORTED_ADAPTER_MODULES = frozenset(
+    {
+        "agent.engine_adapters.claude",
+        "agent.engine_adapters.codex",
+    }
+)
+
+
+class EngineProfileSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+    enabled: bool = False
+    adapter_module: str
+    binary: str = ""
+    model: str = ""
+    effort: str | None = None
+    timeouts: dict[str, Annotated[float, Field(gt=0)]] = Field(default_factory=dict)
+    process_limit: int = Field(default=1, ge=1)
+    operator_user_id: str = ""
+    adapter_settings: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("adapter_module")
+    @classmethod
+    def supported_module(cls, value: str) -> str:
+        if value not in SUPPORTED_ADAPTER_MODULES:
+            raise ValueError("Unsupported engine adapter module")
+        return value
+
+    @model_validator(mode="after")
+    def configured_when_enabled(self) -> Self:
+        if self.enabled and not all(
+            value.strip() for value in (self.binary, self.model, self.operator_user_id)
+        ):
+            raise ValueError("Enabled engine requires binary, model and operator_user_id")
+        return self
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=_env_file(),
@@ -65,6 +102,7 @@ class Settings(BaseSettings):
     worker_name: str = ""
     worker_lock_ttl_seconds: int = Field(default=3600, ge=60, le=86_400)
     worker_visibility_timeout_seconds: int = Field(default=300, ge=30, le=3600)
+    engine_profiles: dict[str, EngineProfileSettings] = Field(default_factory=dict)
 
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str = ""

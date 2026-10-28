@@ -30,6 +30,8 @@ from pydantic_core import InitErrorDetails
 from yaml.error import MarkedYAMLError
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
+from agent.config import EngineProfileSettings
+
 # openai: OpenAI-compatible /chat/completions (OpenAI, GLM, LM Studio, MLX, Ollama, gateways).
 # openai_responses: OpenAI Responses API (Codex/GPT reasoning models). anthropic: Messages API.
 ProviderKind = Literal["openai", "openai_responses", "anthropic", "jev"]
@@ -292,6 +294,7 @@ class ModelsConfig(_Spec):
     models: dict[ModelId, ModelSpec] = Field(min_length=1)
     routing: RoutingSpec
     decisions: DecisionsSpec = Field(default_factory=DecisionsSpec)
+    engine_profiles: dict[ModelId, EngineProfileSettings] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_references(self) -> Self:

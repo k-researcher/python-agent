@@ -135,6 +135,12 @@ class Session(Base):
     __tablename__ = "sessions"
     __table_args__ = (
         Index("ix_sessions_archived_updated_at", "archived", "updated_at"),
+        CheckConstraint(
+            "(llm_profile IS NOT NULL AND length(trim(llm_profile)) > 0 AND engine_profile IS NULL)"
+            " OR (llm_profile IS NULL AND engine_profile IS NOT NULL"
+            " AND length(trim(engine_profile)) > 0)",
+            name="ck_sessions_backend",
+        ),
         CheckConstraint("inbox_hop >= 0", name="ck_sessions_inbox_hop"),
         CheckConstraint(
             "notify_generation IS NULL OR (notify_generation > 0 AND parent_id IS NOT NULL)",
@@ -154,7 +160,11 @@ class Session(Base):
         ForeignKey("sessions.id"), nullable=True, index=True
     )
     mode: Mapped[str] = mapped_column(String(50), default="dev")
-    llm_profile: Mapped[str] = mapped_column(String(100), default="default", index=True)
+    llm_profile: Mapped[str | None] = mapped_column(
+        String(100).evaluates_none(), default="default", nullable=True, index=True
+    )
+    engine_profile: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    engine_state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     title: Mapped[str] = mapped_column(String(300))
     status: Mapped[str] = mapped_column(String(50), default=SessionStatus.pending.value)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)

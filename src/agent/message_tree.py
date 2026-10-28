@@ -116,8 +116,15 @@ async def append_message(db: AsyncSession, session_id: str, **fields: Any) -> Me
     return message
 
 
+async def _refuse_engine_history(db: AsyncSession, session_id: str) -> None:
+    profile = await db.scalar(sa.select(Session.engine_profile).where(Session.id == session_id))
+    if profile is not None:
+        raise TreeError("для внешнего агента пока недоступно", 409)
+
+
 async def _claim_idle(db: AsyncSession, session_id: str, *, start_run: bool) -> None:
     """Take an idle session for a tree change; a new generation makes stale executors fail."""
+    await _refuse_engine_history(db, session_id)
     values: dict[str, Any] = {
         "run_generation": Session.run_generation + 1,
         "owner_token": None,
@@ -357,6 +364,7 @@ async def fork(
     keeps the provider chain clean: the assistant text survives, while no orphaned references
     remain. An assistant row with no text (only tool calls) is skipped, so no empty turn remains.
     """
+    await _refuse_engine_history(db, session_id)
     await lock_session(db, session_id)
     state = (
         await db.execute(
