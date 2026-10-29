@@ -114,7 +114,8 @@ async def test_period_above_window_and_variable_repetition_can_pass():
 
 
 async def test_seeded_arbitrary_chunking_matches_whole_suffix_oracle():
-    async with asyncio.timeout(10):
+    # Only a hang guard: the throughput bound has its own test.
+    async with asyncio.timeout(30):
         rng = random.Random(912)
         for p in (32, 39, 121, 512):
             block = "".join(chr(rng.randrange(1024, 20000)) for _ in range(p))
