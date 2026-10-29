@@ -135,6 +135,12 @@ def _batch_result(outcome: BatchResult) -> dict[str, Any]:
 # A cut-off reply or a broken stream is retried this many times in a row before the run fails.
 MAX_CUT_OFF_REPLIES = 2
 MAX_STREAM_RETRIES = 2
+MAX_INVALID_CALL_REPLIES = 2
+INVALID_CALL_NOTICE = (
+    "Служебное уведомление агента: предыдущий ответ модели содержит некорректный вызов "
+    "инструмента и не использован, инструменты из него не запускались. Повтори шаг: укажи "
+    "имя инструмента из списка и аргументы строго по его схеме."
+)
 CUT_OFF_NOTICE = (
     "Служебное уведомление агента: предыдущий ответ модели обрезан лимитом вывода и не "
     "использован, инструменты из него не запускались. Сделай шаг меньше: запиши большой файл "
@@ -1020,6 +1026,20 @@ class AgentSupervisor:
         if publisher is not None:
             await publisher.reset()
 
+    def _invalid_call(
+        self, calls: list[dict[str, Any]], mode: str, model_ids: list[str]
+    ) -> str | None:
+        """Return the reason of the first invalid tool call, for the model to correct it."""
+        for call in calls:
+            fn = call["function"]
+            try:
+                self._tools.validate(
+                    fn["name"], mode, arguments_object(fn["arguments"]), model_ids=model_ids
+                )
+            except Exception as error:
+                return f"{fn['name']}: {error}"[:500]
+        return None
+
     async def _infer_logical(
         self,
         session_id: str,
@@ -1047,6 +1067,7 @@ class AgentSupervisor:
         decisions: dict[str, ReasoningDecision],
     ) -> InferenceResult | None:
         cut_offs = 0
+        invalid_replies = 0
         session_id = session.id
         original_decisions = decisions
         while True:
@@ -1183,19 +1204,50 @@ class AgentSupervisor:
                 if not allowed:
                     return None
                 continue
-            for call in response.tool_calls:
-                fn = call["function"]
-                try:
-                    self._tools.validate(
-                        fn["name"],
-                        session.mode,
-                        arguments_object(fn["arguments"]),
-                        model_ids=models.ids(),
+            problem = self._invalid_call(response.tool_calls, session.mode, models.ids())
+            if problem is not None:
+                # Like a cut-off reply: keep it for diagnosis, run nothing from it, and let
+                # the model correct the call in the next inference.
+                db.add(
+                    Message(
+                        session_id=session.id,
+                        role="assistant",
+                        kind="interrupted",
+                        content=response.content,
+                        tool_calls=[_history_safe_call(c) for c in normalized_calls] or None,
+                        token_count=response.completion_tokens or None,
+                        reasoning_content=response.reasoning,
+                        reasoning_effort=reasoning_effort,
                     )
-                except Exception as error:
+                )
+                invalid_replies += 1
+                if invalid_replies > MAX_INVALID_CALL_REPLIES:
+                    await db.commit()
                     raise guard_error(
                         LLMErrorKind.invalid_response, "Некорректный вызов инструмента"
-                    ) from error
+                    )
+                await append_message(
+                    db, session.id, role="user", content=f"{INVALID_CALL_NOTICE} Причина: {problem}"
+                )
+                await db.commit()
+                await self._reset_inference_stream(outcome.publisher)
+                await emit_event(
+                    db,
+                    "inference.retry",
+                    {
+                        "reason": "invalid_tool_call",
+                        "model_id": outcome.model.id,
+                        "retry": invalid_replies,
+                    },
+                    session.id,
+                )
+                allowed = await self._enforce_budget_before_step(
+                    db, session.id, session.run_generation or 0
+                )
+                await db.commit()
+                if not allowed:
+                    return None
+                continue
             return outcome
 
     async def _run_session(self, session_id: str) -> None:

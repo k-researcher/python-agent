@@ -6,7 +6,7 @@ from typing import Any
 
 from agent.api import supervisor
 from agent.llm import LLMResponse
-from agent.runtime import CUT_OFF_NOTICE
+from agent.runtime import CUT_OFF_NOTICE, INVALID_CALL_NOTICE, MAX_INVALID_CALL_REPLIES
 from tests.integration.helpers import authed_client
 
 
@@ -73,46 +73,76 @@ def test_tool_call_ids_stay_unique_across_approval_rounds(tmp_path: Path) -> Non
         supervisor.llm = original
 
 
-class InvalidArgumentsLLM:
+class InvalidCallsLLM:
+    """Send ``bad`` invalid tool calls, then a final answer."""
+
     endpoint = "https://fake.example/v1/chat/completions"
 
-    def __init__(self) -> None:
+    def __init__(self, bad: int, name: str = "write_file", arguments: str = '{"path": 5}') -> None:
+        self.bad = bad
+        self.name = name
+        self.arguments = arguments
         self.calls = 0
-        self.seen: list[str] = []
+        self.seen: list[list[dict[str, Any]]] = []
 
     async def chat(
         self, messages: list[dict[str, Any]], _t: list[dict[str, Any]], **_o: Any
     ) -> Any:
         self.calls += 1
-        if self.calls == 1:
-            bad = {
+        self.seen.append(messages)
+        if self.calls <= self.bad:
+            call = {
                 "id": "x",
                 "type": "function",
-                "function": {"name": "write_file", "arguments": '{"path": 5}'},
+                "function": {"name": self.name, "arguments": self.arguments},
             }
-            return LLMResponse(None, [bad], "tool_calls", 1, 1)
-        self.seen = [str(item.get("content")) for item in messages if item["role"] == "tool"]
+            return LLMResponse(None, [call], "tool_calls", 1, 1)
         return LLMResponse("fixed", [], "stop", 1, 1)
 
 
-def test_schema_invalid_arguments_fail_without_approval(tmp_path: Path) -> None:
+def run_invalid_calls(tmp_path: Path, fake: InvalidCallsLLM, expected: str) -> list[dict[str, Any]]:
     original = supervisor.llm
-    fake = InvalidArgumentsLLM()
     supervisor.llm = fake  # type: ignore[assignment]
     try:
         with authed_client() as client:
-            session_id = project_session(client, tmp_path, "schema")
-            wait_for(client, session_id, "error")
+            session_id = project_session(client, tmp_path, "invalid call")
+            wait_for(client, session_id, expected)
             assert client.get(f"/api/sessions/{session_id}/approvals").json() == []
-            assert client.get(f"/api/sessions/{session_id}").json()["error"]
-            assert not any(
-                row["role"] == "assistant" and row["kind"] == "normal"
-                for row in client.get(f"/api/sessions/{session_id}/messages").json()
-            )
-        assert fake.calls == 1
-        assert fake.seen == []
+            return list(client.get(f"/api/sessions/{session_id}/messages").json())
     finally:
         supervisor.llm = original
+
+
+def test_invalid_tool_call_gets_a_notice_and_the_next_step_completes(tmp_path: Path) -> None:
+    fake = InvalidCallsLLM(bad=1)
+    messages = run_invalid_calls(tmp_path, fake, "completed")
+    assert fake.calls == 2
+    # The invalid reply is kept for diagnosis only, no tool ran from it.
+    assert [m["kind"] for m in messages if m["role"] == "assistant"] == ["interrupted", "normal"]
+    assert not [m for m in messages if m["role"] == "tool"]
+    assert not (tmp_path / "5").exists()
+    # The model gets the exact reason and never sees the invalid call itself.
+    retry = fake.seen[1]
+    notice = retry[-1]
+    assert notice["role"] == "user"
+    assert notice["content"].startswith(INVALID_CALL_NOTICE)
+    assert "write_file" in notice["content"] and "path" in notice["content"]
+    assert not any(item.get("tool_calls") for item in retry)
+    assert messages[-1]["content"] == "fixed"
+
+
+def test_unknown_tool_name_is_explained_to_the_model(tmp_path: Path) -> None:
+    fake = InvalidCallsLLM(bad=1, name="no_such_tool", arguments="{}")
+    run_invalid_calls(tmp_path, fake, "completed")
+    assert "no_such_tool" in fake.seen[1][-1]["content"]
+
+
+def test_repeated_invalid_tool_calls_stop_without_running_a_tool(tmp_path: Path) -> None:
+    fake = InvalidCallsLLM(bad=100)
+    messages = run_invalid_calls(tmp_path, fake, "error")
+    assert fake.calls == 1 + MAX_INVALID_CALL_REPLIES
+    assert not [m for m in messages if m["role"] == "tool"]
+    assert all(m["kind"] == "interrupted" for m in messages if m["role"] == "assistant")
 
 
 class TruncatingLLM:

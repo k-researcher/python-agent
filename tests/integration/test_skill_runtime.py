@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from agent.api import supervisor
 from agent.llm import LLMResponse
+from agent.runtime import INVALID_CALL_NOTICE
 from tests.integration.helpers import authed_client
 
 
@@ -140,9 +141,15 @@ def test_skill_manifest_cannot_register_a_tool(
         client.portal.call(wait_run)
         state = client.get(f"/api/sessions/{session_id}").json()
         messages = client.get(f"/api/sessions/{session_id}/messages").json()
-        assert state["status"] == "error"
-        assert len(model.requests) == 1
+        # The unregistered tool never runs: the model gets the reason and answers without it.
+        assert state["status"] == "completed"
+        assert len(model.requests) == 2
         assert not any(message["role"] == "tool" for message in messages)
-        assert not any(
-            message["role"] == "assistant" and message["kind"] == "normal" for message in messages
-        )
+        retry_messages, retry_tools = model.requests[1]
+        assert retry_messages[-1]["content"].startswith(INVALID_CALL_NOTICE)
+        assert "untrusted_write" in retry_messages[-1]["content"]
+        assert all(tool["function"]["name"] != "untrusted_write" for tool in retry_tools)
+        assert [m["kind"] for m in messages if m["role"] == "assistant"] == [
+            "interrupted",
+            "normal",
+        ]
