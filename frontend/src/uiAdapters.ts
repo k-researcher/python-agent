@@ -66,7 +66,7 @@ export function toLayoutSessionTree(nodes: ApiSessionNode[]): LayoutSessionNode[
 export function toLayoutContext(
   stats: ApiContextStats | null,
 ): LayoutContextStats | null {
-  if (!stats) return null;
+  if (!stats || stats.status === "unknown" || stats.context_window === null) return null;
   return {
     approximate_tokens: stats.approximate_tokens,
     omitted_messages: stats.omitted_messages,
@@ -142,6 +142,9 @@ export function toChatToolResult(result: ApiToolResult | null): ChatToolResult |
     success: result.success,
     ...(result.output !== undefined ? { output: result.output } : {}),
     ...(result.error !== undefined ? { error: result.error } : {}),
+    ...(result.patch !== undefined ? { patch: result.patch } : {}),
+    ...(result.paths !== undefined ? { paths: result.paths } : {}),
+    ...(result.status !== undefined ? { status: result.status } : {}),
   };
 }
 
@@ -155,6 +158,11 @@ export function toChatApproval(approval: ApiApproval | null): ChatApproval | nul
     risk_level: approval.risk_level,
     status: approval.status,
     comment: approval.comment,
+    ...(approval.executor !== undefined ? { executor: approval.executor } : {}),
+    ...(approval.generation !== undefined ? { generation: approval.generation } : {}),
+    ...(approval.scope !== undefined ? { scope: approval.scope } : {}),
+    ...(approval.request_id !== undefined ? { request_id: approval.request_id } : {}),
+    ...(approval.expires_at !== undefined ? { expires_at: approval.expires_at } : {}),
   };
 }
 

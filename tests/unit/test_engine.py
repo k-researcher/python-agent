@@ -107,6 +107,9 @@ async def test_port_with_registered_fake_engine(tmp_path):
         async def answer(self, request_id, decision):
             pass
 
+        async def answer_user_input(self, request_id):
+            pass
+
         async def interrupt(self, turn_id):
             pass
 

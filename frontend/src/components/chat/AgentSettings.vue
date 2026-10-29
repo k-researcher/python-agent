@@ -8,13 +8,14 @@ const props = defineProps<{
   modelLabel: string;
   roleLabel: string;
   effort: string;
+  external?: boolean;
 }>();
 
 const open = ref(false);
 const container = ref<HTMLElement | null>(null);
 const button = ref<HTMLButtonElement | null>(null);
 const panel = ref<HTMLElement | null>(null);
-const summary = computed(() => `${props.modelLabel} · ${props.roleLabel} · ${reasoningLabel(props.effort)}`);
+const summary = computed(() => props.external ? `${props.modelLabel} · ${props.roleLabel}` : `${props.modelLabel} · ${props.roleLabel} · ${reasoningLabel(props.effort)}`);
 
 async function toggle(): Promise<void> {
   open.value = !open.value;

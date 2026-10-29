@@ -22,7 +22,12 @@ export interface Session extends SnapshotStamp {
   project_id: string;
   parent_id: string | null;
   mode: string;
-  llm_profile: string;
+  llm_profile: string | null;
+  engine_profile?: string | null;
+  engine_state?: {
+    health?: { status: string; diagnostic?: string | null };
+    usage?: { input_tokens: number | null; output_tokens: number | null; cache_tokens: number | null; reported_cost: string | null; estimated_cost: boolean } | null;
+  } | null;
   configuration?: Record<string, unknown>;
   title: string;
   status: string;
@@ -48,7 +53,8 @@ export interface ContextStats {
   approximate_tokens: number;
   omitted_messages: number;
   truncated_tool_results: number;
-  context_window: number;
+  context_window: number | null;
+  status?: "unknown";
   reserved_tokens: number;
   // Extended calibration/budget fields from the new API. Optional so older server
   // responses or existing rows continue to satisfy the type.
@@ -77,6 +83,7 @@ export interface ContextStats {
 }
 
 export interface PublicConfig {
+  engine_profiles?: Array<{ id: string; status: "available" | "unavailable" }>;
   llm_configured: boolean;
   llm_model: string;
   llm_destination: string;
@@ -128,6 +135,11 @@ export interface Message {
 }
 
 export interface Approval {
+  executor?: "python" | "engine";
+  generation?: number | null;
+  scope?: "request" | "turn";
+  request_id?: string | null;
+  expires_at?: string | null;
   id: string;
   tool_call_id: string;
   tool_name: string;
@@ -143,6 +155,7 @@ export interface NewSession {
   prompt: string;
   mode?: SessionMode;
   llm_profile?: string;
+  engine_profile?: string;
   reasoning_effort?: string;
   title?: string;
   auto_start?: boolean;
@@ -182,6 +195,9 @@ export interface SessionNode {
 
 /** Parsed result of a `role="tool"` message (stored as JSON text). */
 export interface ToolResult {
+  patch?: string;
+  paths?: string[];
+  status?: "proposed" | "applied";
   success: boolean;
   output?: unknown;
   error?: string;

@@ -66,6 +66,8 @@ function rejectForward(payload: RejectPayload): void {
       :approval-id="call.approval.id"
       :risk-level="call.approval.risk_level"
       :hotkeys="hotkeys"
+      :scope="call.approval.scope"
+      :executor="call.approval.executor"
       @approve="approveForward"
       @reject="rejectForward"
     />
@@ -101,7 +103,13 @@ function rejectForward(payload: RejectPayload): void {
           {{ call.result.error }}
         </div>
 
-        <div v-if="isShell" class="shell-result" data-testid="shell-result">
+        <div v-if="call.name === 'engine.diff' && call.result?.patch != null" class="engine-patch" data-testid="engine-patch">
+          <span>{{ call.result.status === "applied" ? "Применено" : "Предложено" }}</span>
+          <div v-for="path in call.result.paths" :key="path">{{ path }}</div>
+          <pre class="mono diff">{{ call.result.patch }}</pre>
+        </div>
+
+        <div v-else-if="isShell" class="shell-result" data-testid="shell-result">
           <pre v-if="shell.stdout || shell.stdout === ''" class="mono" data-testid="shell-stdout">
 stdout
 {{ shell.stdout || "—" }}</pre
@@ -233,7 +241,8 @@ stderr
 
 .json-panel pre,
 .shell-result pre,
-.edit-block pre {
+.edit-block pre,
+.engine-patch pre {
   margin: 0;
   padding: 0.45rem 0.55rem;
   background: var(--bg-subtle, #f4f4f6);

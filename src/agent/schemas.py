@@ -97,6 +97,7 @@ class SessionRead(BaseModel):
     mode: str
     llm_profile: str | None
     engine_profile: str | None = None
+    engine_state: dict[str, Any] | None = None
     configuration: dict[str, Any]
     title: str
     status: str
@@ -148,6 +149,8 @@ class MessageRead(BaseModel):
 class ApprovalDecision(BaseModel):
     decision: Literal["approve", "reject"]
     comment: str | None = Field(default=None, max_length=10_000)
+    generation: int | None = Field(default=None, ge=0)
+    executor: Literal["python", "engine"] | None = None
 
 
 class ApprovalRead(BaseModel):
@@ -159,6 +162,11 @@ class ApprovalRead(BaseModel):
     status: str
     comment: str | None
     created_at: UtcDatetime
+    generation: int | None = None
+    executor: str = "python"
+    scope: Literal["request", "turn"] = "request"
+    request_id: str | None = None
+    expires_at: UtcDatetime | None = None
 
 
 class EventRead(BaseModel):

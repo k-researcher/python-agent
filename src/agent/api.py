@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
 from fastapi import (
@@ -28,6 +28,7 @@ from agent.config import Settings, get_settings
 from agent.context_inference import ContextInference, ContextPreparationError, context_stats
 from agent.database import get_db, session_factory
 from agent.engine_access import check_engine_access
+from agent.engine_adapters import EngineRegistry, configured_profiles
 from agent.events import broker, emit_event, publish
 from agent.message_tree import IDLE_STATUSES, append_message
 from agent.model_registry import effective_registry, select_model
@@ -68,7 +69,16 @@ from agent.session_budget_store import (
 )
 from agent.session_service import create_session_record
 
-router = APIRouter(prefix="/api")
+
+async def _personal_session_route(request: Request, db: AsyncSession = Depends(get_db)) -> None:
+    session_id = request.path_params.get("session_id")
+    if session_id:
+        session = await db.get(Session, session_id)
+        if session is not None:
+            await _engine_access(db, session, request)
+
+
+router = APIRouter(prefix="/api", dependencies=[Depends(_personal_session_route)])
 settings: Settings = get_settings()
 supervisor = AgentSupervisor(settings)
 logger = logging.getLogger(__name__)
@@ -109,6 +119,7 @@ async def _session_read(db: AsyncSession, session: Session) -> SessionRead:
         mode=session.mode,
         llm_profile=session.llm_profile,
         engine_profile=session.engine_profile,
+        engine_state=engine_view(session),
         configuration=dict(session.configuration or {}),
         title=session.title,
         status=session.status,
@@ -136,6 +147,30 @@ async def _engine_access(db: AsyncSession, session: Session, request: Request) -
         raise HTTPException(403, str(exc)) from exc
 
 
+def engine_view(session: Session) -> dict[str, Any] | None:
+    if session.engine_profile is None:
+        return None
+    state = session.engine_state or {}
+    registry = EngineRegistry(configured_profiles(settings))
+    available = registry.available(session.engine_profile)
+    return {
+        "usage": state.get("usage"),
+        "health": (state.get("health") or {"status": "unknown", "diagnostic": None})
+        if available
+        else {"status": "unavailable", "diagnostic": "engine недоступен"},
+    }
+
+
+async def _hidden_engines(db: AsyncSession, actor: str | None) -> list[str]:
+    hidden = []
+    for session in await db.scalars(select(Session).where(Session.engine_profile.is_not(None))):
+        try:
+            await check_engine_access(db, settings, session, actor)
+        except PermissionError:
+            hidden.append(session.id)
+    return hidden
+
+
 @router.get("/health")
 async def health() -> dict[str, object]:
     """Public liveness probe; infrastructure details live behind auth in /ready."""
@@ -154,10 +189,18 @@ async def ready() -> dict[str, object]:
 
 
 @router.get("/config/public")
-async def public_config(db: AsyncSession = Depends(get_db)) -> dict[str, object]:
+async def public_config(request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, object]:
     models = await effective_registry(db, settings)
     default_model = models.get(models.default_id)
+    profiles = configured_profiles(settings)
+    registry = EngineRegistry(profiles)
+    actor = getattr(request.state, "actor_user_id", None)
     return {
+        "engine_profiles": [
+            {"id": name, "status": "available" if registry.available(name) else "unavailable"}
+            for name, profile in profiles.items()
+            if profile.enabled and actor and profile.operator_user_id == actor
+        ],
         "llm_configured": default_model.configured,
         "llm_model": default_model.model,
         "knowledge_base_enabled": settings.knowledge_base_enabled,
@@ -223,9 +266,14 @@ async def create_project(payload: ProjectCreate, db: AsyncSession = Depends(get_
 
 @router.get("/sessions", response_model=list[SessionRead])
 async def list_sessions(
-    archived: bool = Query(default=False), db: AsyncSession = Depends(get_db)
+    request: Request, archived: bool = Query(default=False), db: AsyncSession = Depends(get_db)
 ) -> list[SessionRead]:
-    query = select(Session).where(Session.archived == archived).order_by(Session.updated_at.desc())
+    hidden = await _hidden_engines(db, getattr(request.state, "actor_user_id", None))
+    query = (
+        select(Session)
+        .where(Session.archived == archived, Session.id.not_in(hidden))
+        .order_by(Session.updated_at.desc())
+    )
     sessions = list((await db.execute(query)).scalars())
     return [await _session_read(db, session) for session in sessions]
 
@@ -283,10 +331,19 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)) -> Se
 
 
 @router.get("/sessions/{session_id}/children", response_model=list[SessionRead])
-async def list_children(session_id: str, db: AsyncSession = Depends(get_db)) -> list[SessionRead]:
+async def list_children(
+    session_id: str, db: AsyncSession = Depends(get_db), request: Request = cast(Request, None)
+) -> list[SessionRead]:
     if await db.get(Session, session_id) is None:
         raise HTTPException(404, "Session not found")
-    query = select(Session).where(Session.parent_id == session_id).order_by(Session.created_at)
+    hidden = await _hidden_engines(
+        db, getattr(getattr(request, "state", None), "actor_user_id", None)
+    )
+    query = (
+        select(Session)
+        .where(Session.parent_id == session_id, Session.id.not_in(hidden))
+        .order_by(Session.created_at)
+    )
     sessions = list((await db.execute(query)).scalars())
     return [await _session_read(db, session) for session in sessions]
 
@@ -315,6 +372,8 @@ async def session_context(session_id: str, db: AsyncSession = Depends(get_db)) -
     ).scalar_one_or_none()
     if session is None:
         raise HTTPException(404, "Session not found")
+    if session.engine_profile is not None:
+        return {"status": "unknown", "context_window": None}
     models = await effective_registry(db, settings)
     model = select_model(models, session.llm_profile, strict=False)
     attributes.set_committed_value(session, "messages", await load_context_rows(db, session_id))
@@ -576,9 +635,14 @@ async def delete_session(session_id: str, db: AsyncSession = Depends(get_db)) ->
     ).scalar_one_or_none()
     if child_id is not None:
         raise HTTPException(409, "Delete or archive child sessions first")
+    audience = (
+        {"_engine_actor_user_id": session.created_by_user_id} if session.engine_profile else {}
+    )
     await db.execute(delete(Session).where(Session.id == session_id))
     await db.commit()
-    await broker.broadcast({"type": "session.deleted", "session_id": session_id, "payload": {}})
+    await broker.broadcast(
+        {"type": "session.deleted", "session_id": session_id, "payload": {}, **audience}
+    )
 
 
 @router.get("/sessions/{session_id}/approvals", response_model=list[ApprovalRead])
@@ -605,6 +669,11 @@ async def list_approvals(
             status=item.status,
             comment=item.comment,
             created_at=item.created_at,
+            generation=item.generation,
+            executor=item.executor,
+            scope=cast(Literal["request", "turn"], item.scope),
+            request_id=item.tool_call.native_request_id,
+            expires_at=item.expires_at,
         )
         for item in approvals
     ]
@@ -628,14 +697,21 @@ async def resolve_approval(
     if session is None:
         raise HTTPException(404, "Approval not found")
     await _engine_access(db, session, request)
-    if session.engine_profile is not None:
-        raise HTTPException(409, "engine недоступен")
-    reason = await _session_blocked(db, session, new_run=False)
+    reason = (
+        None
+        if session.engine_profile is not None
+        else await _session_blocked(db, session, new_run=False)
+    )
     if reason is not None:
         raise HTTPException(409, f"The session budget is exhausted: {reason}")
     try:
         session_id = await supervisor.resolve_approval(
-            approval_id, payload.decision, payload.comment
+            approval_id,
+            payload.decision,
+            payload.comment,
+            actor_user_id=getattr(request.state, "actor_user_id", None),
+            generation=payload.generation,
+            executor=payload.executor,
         )
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -646,11 +722,20 @@ async def resolve_approval(
 
 @router.get("/events", response_model=list[EventRead])
 async def list_events(
+    request: Request,
     after_id: int = 0,
     limit: int = Query(default=100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ) -> list[Event]:
-    query = select(Event).where(Event.id > after_id).order_by(Event.id).limit(limit)
+    hidden = await _hidden_engines(db, getattr(request.state, "actor_user_id", None))
+    query = (
+        select(Event)
+        .where(
+            Event.id > after_id, or_(Event.session_id.is_(None), Event.session_id.not_in(hidden))
+        )
+        .order_by(Event.id)
+        .limit(limit)
+    )
     return list((await db.execute(query)).scalars())
 
 
@@ -677,6 +762,45 @@ async def _websocket_allowed(websocket: WebSocket) -> bool:
     return check.ok
 
 
+async def _websocket_event_visible(
+    websocket: WebSocket, event: dict[str, Any], cache: dict[str, bool]
+) -> bool:
+    """``cache`` holds per-connection answers for existing sessions; the caller clears it
+    at each auth recheck, so a changed profile or operator takes effect within that period."""
+    session_id = event.get("session_id")
+    if not session_id:
+        return True
+    if "_engine_actor_user_id" not in event and session_id in cache:
+        return cache[session_id]
+    async with session_factory() as db:
+        session = await db.get(Session, session_id)
+        if "_engine_actor_user_id" not in event:
+            if session is None:
+                # Queued payloads cannot regain public visibility after deletion.
+                return event.get("type") == "session.deleted"
+            if session.engine_profile is None:
+                cache[session_id] = True
+                return True
+        check = await check_request(
+            db, settings, websocket.headers, websocket.cookies, "GET", require_origin=True
+        )
+        if not check.ok:
+            return False
+        actor = check.auth.user_id if check.auth else None
+        if "_engine_actor_user_id" in event:
+            return actor is not None and actor == event["_engine_actor_user_id"]
+        assert session is not None
+        try:
+            await check_engine_access(
+                db, settings, session, check.auth.user_id if check.auth else None
+            )
+        except PermissionError:
+            cache[session_id] = False
+            return False
+    cache[session_id] = True
+    return True
+
+
 async def websocket_endpoint(websocket: WebSocket) -> None:
     # Host, Origin and the session cookie are verified before the handshake is accepted.
     if not await _websocket_allowed(websocket):
@@ -686,6 +810,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.send_json({"type": "connected", "payload": {"service": "python-agent"}})
     loop = asyncio.get_running_loop()
     last_sent = last_checked = loop.time()
+    visible: dict[str, bool] = {}
     try:
         async with broker.subscribe() as queue:
             while True:
@@ -695,9 +820,18 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         await websocket.close(code=4401, reason="Session expired or revoked")
                         return
                     last_checked = loop.time()
+                    visible.clear()
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=WS_AUTH_RECHECK_SECONDS)
-                    await websocket.send_json(event)
+                    if not await _websocket_event_visible(websocket, event, visible):
+                        continue
+                    await websocket.send_json(
+                        {
+                            key: value
+                            for key, value in event.items()
+                            if key != "_engine_actor_user_id"
+                        }
+                    )
                     last_sent = loop.time()
                 except TimeoutError:
                     if loop.time() - last_sent >= WS_HEARTBEAT_SECONDS:
@@ -725,6 +859,7 @@ async def session_snapshot(
     session_id: str,
     resource: str,
     db: AsyncSession = Depends(get_db),
+    request: Request = cast(Request, None),
 ) -> dict[str, Any]:
     """Versioned resource for an atomic client reload.
 
@@ -739,7 +874,7 @@ async def session_snapshot(
     elif resource == "approvals":
         data = await list_approvals(session_id, pending_only=False, db=db)
     elif resource == "children":
-        data = await list_children(session_id, db)
+        data = await list_children(session_id, db, request)
     elif resource == "audit":
         data = await list_outbound_audit(session_id, limit=200, db=db)
     elif resource == "context":

@@ -255,7 +255,14 @@ export const useSessionStore = defineStore("session", () => {
   ): Promise<void> {
     const id = sessionId.value;
     const gen = generation;
-    await api.resolveApproval(approvalId, decision, comment);
+    const approval = approvals.value.find(item => item.id === approvalId);
+    if (approval?.executor === "engine") {
+      await api.resolveApproval(approvalId, decision, comment, {
+        generation: approval.generation ?? null, executor: "engine",
+      });
+    } else {
+      await api.resolveApproval(approvalId, decision, comment);
+    }
     if (!isCurrent(id, gen)) return;
     await reloadAll();
   }
@@ -348,6 +355,9 @@ export const useSessionStore = defineStore("session", () => {
         }
         void reloadAll().catch(() => {});
         break;
+      case "engine.usage":
+      case "engine.diff":
+      case "engine.health":
       case "approval.required":
       case "approval.resolved":
       case "approval.cancelled":

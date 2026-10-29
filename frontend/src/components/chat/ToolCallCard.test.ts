@@ -216,3 +216,27 @@ describe("ToolCallCard", () => {
     expect(wrapper.find('[data-testid="tool-detail"]').exists()).toBe(false);
   });
 });
+
+it("renders a neutral patch with its actual application status", async () => {
+  const wrapper = mountCard(makeCall({
+    name: "engine.diff", status: "completed",
+    result: { success: true, patch: "+new\n-old", paths: ["a.txt"], status: "proposed" },
+  }));
+  await wrapper.get('.tool-head').trigger("click");
+  expect(wrapper.get('[data-testid="engine-patch"]').text()).toContain("+new");
+  expect(wrapper.text()).toContain("Предложено");
+  expect(wrapper.text()).toContain("a.txt");
+});
+
+it("labels a turn-scoped approval and forwards only that request", async () => {
+  const wrapper = mountCard(makeCall({ status: "awaiting_approval", approval: {
+    id: "native", tool_call_id: "call", tool_name: "write", arguments: {}, risk_level: "observed",
+    status: "pending", comment: null, executor: "engine", generation: 3, scope: "turn", request_id: "req",
+  } }));
+  expect(wrapper.text()).toContain("до конца хода");
+  await wrapper.get('[data-testid="approve-btn"]').trigger("click");
+  expect(wrapper.emitted("approve")).toEqual([["native"]]);
+  await wrapper.get('[data-testid="reject-btn"]').trigger("click");
+  await wrapper.get('[data-testid="reject-submit"]').trigger("click");
+  expect(wrapper.emitted("reject")).toEqual([[{ approvalId: "native", comment: "" }]]);
+});

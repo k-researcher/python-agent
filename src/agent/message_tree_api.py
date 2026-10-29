@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent.api import _dispatch_session_run, _engine_access
+from agent.api import _dispatch_session_run, _engine_access, _personal_session_route
 from agent.database import get_db
 from agent.message_tree import (
     TreeError,
@@ -37,7 +37,7 @@ from agent.message_tree import (
 from agent.models import Message, Session
 from agent.schemas import MessageRead, SessionRead
 
-router = APIRouter(prefix="/api")
+router = APIRouter(prefix="/api", dependencies=[Depends(_personal_session_route)])
 
 
 async def _claimed_generation(db: AsyncSession, session_id: str) -> int:

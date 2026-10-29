@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.events import PendingEvent, add_event
 from agent.message_tree import append_message
-from agent.models import EngineTurn, Message, Session, ToolCall
+from agent.models import Approval, EngineTurn, Message, Session, ToolCall
 
 UNKNOWN_RESULT = "результат неизвестен, проверьте файлы"
 
@@ -31,6 +31,33 @@ async def finish_engine_turns(
     if not turns:
         return []
     pending = []
+    approvals = list(
+        await db.scalars(
+            select(Approval)
+            .join(ToolCall)
+            .where(
+                ToolCall.session_id == session_id,
+                Approval.executor == "engine",
+                Approval.generation == generation,
+                Approval.delivered_at.is_(None),
+                Approval.status.in_(["pending", "approved", "rejected"]),
+            )
+        )
+    )
+    for approval in approvals:
+        approval.status, approval.resolved_at = "cancelled", datetime.now(UTC)
+        pending.append(
+            await add_event(
+                db,
+                "approval.cancelled",
+                {
+                    "approval_id": approval.id,
+                    "generation": generation,
+                    "executor": "engine",
+                },
+                session_id,
+            )
+        )
     for turn in turns:
         stream = (turn.last_item_ids or {}).get("_stream", {})
         if stream and not stream.get("closed"):

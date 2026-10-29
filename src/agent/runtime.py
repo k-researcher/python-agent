@@ -584,6 +584,8 @@ class AgentSupervisor:
         comment: str | None,
         *,
         actor_user_id: str | None = None,
+        generation: int | None = None,
+        executor: str | None = None,
     ) -> str:
         async with session_factory() as db:
             session_id = await db.scalar(
@@ -595,8 +597,19 @@ class AgentSupervisor:
                 raise LookupError("Approval not found")
             record = await db.get(Session, session_id)
             if record is not None and record.engine_profile is not None:
-                await check_engine_access(db, self.settings, record, actor_user_id)
-                raise ValueError("engine недоступен")
+                from agent.engine_approvals import resolve_native
+
+                return await resolve_native(
+                    db,
+                    self.settings,
+                    record,
+                    approval_id,
+                    decision,
+                    comment,
+                    actor_user_id,
+                    generation,
+                    executor,
+                )
             await db.execute(select(Session).where(Session.id == session_id).with_for_update())
             query = (
                 select(Approval)

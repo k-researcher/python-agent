@@ -7,7 +7,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import type { RejectPayload } from "./types";
 
 const props = withDefaults(
-  defineProps<{ approvalId: string; riskLevel: string; hotkeys?: boolean }>(),
+  defineProps<{ approvalId: string; riskLevel: string; hotkeys?: boolean; scope?: "request" | "turn"; executor?: "python" | "engine" }>(),
   { hotkeys: false },
 );
 
@@ -75,6 +75,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 
 <template>
   <div class="approval" data-testid="approval">
+    <p v-if="executor === 'engine'">{{ scope === "turn" ? "Разрешение действует до конца хода" : "Разрешение только для этого запроса" }}</p>
     <div class="approval-head">
       <span class="risk" :data-risk="riskLevel" data-testid="risk-label">{{ riskLabel }}</span>
       <div class="actions">

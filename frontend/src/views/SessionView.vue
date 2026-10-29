@@ -67,12 +67,22 @@ watch(
 // Session header data
 const session = computed(() => sessionStore.session);
 const timelineItems = computed(() => toChatTimelineItems(sessionStore.timeline));
+const external = computed(() => !!session.value?.engine_profile);
 const modelLabel = computed(() => {
+  if (external.value) return `Внешний агент · ${session.value?.engine_profile}`;
   const profile = appStore.config?.llm_profiles.find((model) => model.name === session.value?.llm_profile);
   return profile ? `${profile.name} · ${profile.model}` : session.value?.llm_profile ?? "По умолчанию";
 });
 const modeLabel = computed(() => resolveModeLabel(session.value?.mode));
-const modelSummary = computed(() => appStore.config?.llm_profiles.find((model) => model.name === session.value?.llm_profile)?.model ?? session.value?.llm_profile ?? "По умолчанию");
+const engineHealthLabel = computed(() => {
+  const health = session.value?.engine_state?.health;
+  if (health?.diagnostic) return health.diagnostic;
+  if (["available", "ready"].includes(health?.status ?? "")) return "Внешний агент доступен";
+  if (health?.status === "unknown") return "Состояние внешнего агента не проверено";
+  return "engine недоступен";
+});
+const engineUsage = computed(() => session.value?.engine_state?.usage);
+const modelSummary = computed(() => external.value ? modelLabel.value : appStore.config?.llm_profiles.find((model) => model.name === session.value?.llm_profile)?.model ?? session.value?.llm_profile ?? "По умолчанию");
 
 const busy = computed(() => {
   if (isSending.value) return true;
@@ -82,6 +92,7 @@ const busy = computed(() => {
 });
 
 const efforts = computed<string[]>(() => {
+  if (external.value) return [];
   const profile = appStore.config?.llm_profiles.find(
     (p) => p.name === session.value?.llm_profile,
   );
@@ -140,7 +151,7 @@ async function onSend(payload: SendPayload): Promise<void> {
   try {
     await sessionStore.send(
       pendingText,
-      payload.effort !== "auto" ? payload.effort : undefined,
+      !external.value && payload.effort !== "auto" ? payload.effort : undefined,
     );
     clearDraft();
   } catch (cause) {
@@ -192,11 +203,19 @@ function onOpenChild(id: string): void {
           :model-label="modelSummary"
           :role-label="modeLabel"
           :effort="selectedEffort"
+          :external="external"
         />
         </div>
         <div class="session-meta">
           <span class="session-status" :data-status="session.status" data-testid="session-status">{{ sessionStatusLabel(session.status) }}</span>
         </div>
+        <p v-if="external" data-testid="engine-health">{{ engineHealthLabel }}</p>
+        <p v-if="external && engineUsage" data-testid="engine-usage">
+          Вход: {{ engineUsage.input_tokens ?? "неизвестно" }} ·
+          Выход: {{ engineUsage.output_tokens ?? "неизвестно" }} ·
+          Кэш: {{ engineUsage.cache_tokens ?? "неизвестно" }} ·
+          Стоимость: {{ engineUsage.reported_cost ?? "неизвестна" }}{{ engineUsage.estimated_cost && engineUsage.reported_cost != null ? " (оценка)" : "" }}
+        </p>
         <p v-if="session.error" class="session-error" data-testid="session-error">
           {{ session.error }}
         </p>
@@ -227,7 +246,7 @@ function onOpenChild(id: string): void {
       >
         <template #options>
           <div class="agent-control" title="Модель задаётся при создании сессии">
-            <span>Модель</span>
+            <span>{{ external ? "Внешний агент" : "Модель" }}</span>
             <span class="agent-value" data-testid="session-profile">{{ modelLabel }}</span>
           </div>
           <div class="agent-control" title="Роль задаётся при создании сессии">

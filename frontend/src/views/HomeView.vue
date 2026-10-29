@@ -39,6 +39,8 @@ onBeforeUnmount(() => {
 });
 
 const configuredModels = computed(() => toModelOptions(appStore.config));
+const externalProfiles = computed(() => appStore.config?.engine_profiles ?? []);
+const engineProfile = computed(() => selectedProfileId.value.startsWith("engine:") ? selectedProfileId.value.slice(7) : null);
 const defaultProfile = computed(() => appStore.config?.default_llm_profile ?? null);
 
 // If no model was chosen and a default exists, fall back to it.
@@ -52,10 +54,12 @@ const defaultModelLabel = computed(() => {
   return profile ? `По умолчанию · ${profile.label}` : "По умолчанию";
 });
 const modelSummary = computed(() => {
+  if (engineProfile.value) return `Внешний агент · ${engineProfile.value}`;
   const profile = appStore.config?.llm_profiles.find((model) => model.name === effectiveProfileId.value && model.configured);
   return profile?.model ?? "По умолчанию";
 });
 const efforts = computed(() => {
+  if (engineProfile.value) return [];
   const profile = appStore.config?.llm_profiles.find((model) => model.name === effectiveProfileId.value);
   return [...new Set(["auto", ...(profile?.reasoning_efforts ?? [])])];
 });
@@ -110,8 +114,9 @@ async function onCreateSession(payload: SendPayload): Promise<void> {
       project_id: projectId,
       prompt: pendingText,
       mode: mode.value,
-      llm_profile: effectiveProfileId.value || undefined,
-      reasoning_effort: payload.effort !== "auto" ? payload.effort : undefined,
+      llm_profile: engineProfile.value ? undefined : effectiveProfileId.value || undefined,
+      engine_profile: engineProfile.value ?? undefined,
+      reasoning_effort: !engineProfile.value && payload.effort !== "auto" ? payload.effort : undefined,
       auto_start: true,
     });
     if (generation !== lifecycleGeneration) return;
@@ -137,6 +142,7 @@ async function onCreateSession(payload: SendPayload): Promise<void> {
         :model-label="modelSummary"
         :role-label="modeLabel(mode)"
         :effort="selectedEffort"
+        :external="!!engineProfile"
       />
     </header>
     <div class="home-content">
@@ -161,17 +167,20 @@ async function onCreateSession(payload: SendPayload): Promise<void> {
     >
       <template #options>
       <label class="agent-control">
-        <span>Модель</span>
+        <span>Модель / внешний агент</span>
         <select
           v-model="selectedProfileId"
           data-testid="model-select"
-          :disabled="isCreating || configuredModels.length === 0"
+          :disabled="isCreating || (configuredModels.length === 0 && externalProfiles.length === 0)"
         >
           <option value="">
             {{ defaultModelLabel }}
           </option>
           <option v-for="model in configuredModels" :key="model.id" :value="model.id">
             {{ model.label }}
+          </option>
+          <option v-for="profile in externalProfiles" :key="`engine:${profile.id}`" :value="`engine:${profile.id}`">
+            Внешний агент · {{ profile.id }}{{ profile.status === "unavailable" ? " · недоступен" : "" }}
           </option>
         </select>
       </label>

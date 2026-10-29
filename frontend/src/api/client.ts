@@ -136,10 +136,11 @@ export const api = {
     approvalId: string,
     decision: "approve" | "reject",
     comment?: string,
+    identity?: { generation: number | null; executor: "engine" },
   ): Promise<{ session_id: string; decision: string }> =>
     request(`/api/approvals/${approvalId}`, {
       method: "POST",
-      body: JSON.stringify({ decision, comment: comment || null }),
+      body: JSON.stringify({ decision, comment: comment || null, ...identity }),
     }),
   stop: (sessionId: string): Promise<{ stopped: boolean }> =>
     request(`/api/sessions/${sessionId}/stop`, { method: "POST" }),

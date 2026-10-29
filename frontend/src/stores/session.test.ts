@@ -887,3 +887,23 @@ describe("session store open races", () => {
     expect(store.session?.status).toBe("completed");
   });
 });
+
+it("restores native approvals on reconnect reload and sends their generation and executor", async () => {
+  vi.restoreAllMocks();
+  setActivePinia(createPinia());
+  const pending = approval({ executor: "engine", generation: 4, scope: "turn", request_id: "native" });
+  vi.spyOn(api, "session").mockResolvedValue(sessionRecord("s1", { engine_profile: "personal", llm_profile: null }));
+  vi.spyOn(api, "messages").mockResolvedValue([msg(1, { role: "assistant", tool_calls: [toolCall("call_1", "write", "{}")] })]);
+  vi.spyOn(api, "approvals").mockResolvedValue([]);
+  vi.spyOn(api, "children").mockResolvedValue([]);
+  vi.spyOn(api, "audit").mockResolvedValue([]);
+  vi.spyOn(api, "context").mockResolvedValue(contextStats());
+  const resolve = vi.spyOn(api, "resolveApproval").mockResolvedValue({ session_id: "s1", decision: "reject" });
+  const store = useSessionStore();
+  await store.open("s1");
+  vi.mocked(api.approvals).mockResolvedValue([pending]);
+  await store.reloadAll(); // The reconnect callback uses this same snapshot reload.
+  expect(store.timeline.find(item => item.kind === "tool")).toMatchObject({ call: { status: "awaiting_approval", approval: pending } });
+  await store.resolve("ap1", "reject", "no");
+  expect(resolve).toHaveBeenCalledWith("ap1", "reject", "no", { generation: 4, executor: "engine" });
+});

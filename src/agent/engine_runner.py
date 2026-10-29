@@ -10,8 +10,10 @@ import socket
 import traceback
 from contextlib import suppress
 from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -31,12 +33,13 @@ from agent.engine import (
     ToolCallEvent,
     ToolResultEvent,
     UsageEvent,
+    UserInputEvent,
 )
 from agent.engine_journal import UNKNOWN_RESULT
 from agent.events import PendingEvent, StreamPublisher, add_event, publish
 from agent.inference_guard import Clock, LoopClock, bounded_cleanup, retain
 from agent.message_tree import append_message
-from agent.models import EngineTurn, Message, Project, Session, ToolCall, new_id
+from agent.models import Approval, EngineTurn, Message, Project, Session, ToolCall, new_id
 from agent.modes import tool_profile
 from agent.run_finish import finish_run
 from agent.session_fence import FenceLostError, RunFence, fence_check
@@ -53,6 +56,7 @@ _EVENT_TYPES = (
     ErrorEvent,
     DoneEvent,
     ApprovalEvent,
+    UserInputEvent,
 )
 
 
@@ -124,11 +128,16 @@ def validate_event(event: EngineEvent) -> None:
         or type(event.retryable) is not bool
     ):
         raise ValueError("Invalid error engine event")
+    elif isinstance(event, UserInputEvent):
+        if not isinstance(event.request_id, str) or not 1 <= len(event.request_id) <= 200:
+            raise ValueError("Invalid user input engine event")
     elif isinstance(event, ApprovalEvent) and (
         not event.request_id
         or not isinstance(event.request_id, str)
         or len(event.request_id) > 200
         or not isinstance(event.action, str)
+        or not event.action
+        or not event.item_id
         or not isinstance(event.parameters, dict)
         or event.scope not in ("turn", "request")
     ):
@@ -149,6 +158,8 @@ class EngineRunner:
         self.clock = clock or LoopClock()
         self.turn_id: str | None = None
         self.pending_requests: set[str] = set()
+        self.seen_requests: set[str] = set()
+        self.approval_ids: dict[str, str] = {}
         self.publisher = StreamPublisher(fence.session_id)
         self.turn_key = ""
         self.reply_id: int | None = None
@@ -165,6 +176,15 @@ class EngineRunner:
             spec, input_text, resume_id = prepared
             async with asyncio.timeout(self.profile.timeouts.get("open", 30)):
                 health = await self.engine.health()
+                async with self.factory() as db:
+                    await fence_check(db, self.fence)
+                    session = await db.get(Session, self.fence.session_id)
+                    assert session is not None
+                    health_state = {"status": health.status, "diagnostic": health.diagnostic}
+                    session.engine_state = {**(session.engine_state or {}), "health": health_state}
+                    health_event = await add_event(db, "engine.health", health_state, session.id)
+                    await db.commit()
+                await publish([health_event])
                 if health.status != "ready" or not health.supported or not health.isolation_capable:
                     raise RuntimeError(
                         "engine недоступен: обязательная защита или протокол недоступны"
@@ -194,6 +214,8 @@ class EngineRunner:
                         and isinstance(event.request_id, str)
                         and event.request_id
                     ):
+                        if event.request_id in self.seen_requests:
+                            raise ValueError("Duplicate native approval request")
                         self.pending_requests.add(event.request_id)
                     validate_event(event)
                     await self.consume(event)
@@ -311,11 +333,16 @@ class EngineRunner:
             raise ValueError("Engine turn identity changed")
         self.turn_id = event.turn_id or self.turn_id
         if isinstance(event, ApprovalEvent):
-            # Permission requests fail closed without an approval handler.
-            await self.engine.answer(event.request_id, "deny")
-            self.pending_requests.discard(event.request_id)
+            await self.approve(event)
+            return
+        if isinstance(event, UserInputEvent):
+            async with self.factory() as db:
+                await fence_check(db, self.fence)
+                async with asyncio.timeout(1):
+                    await self.engine.answer_user_input(event.request_id)
+                await db.commit()
             await self.finish(
-                "interrupted", "Запрос разрешения отклонён: обработка разрешений пока недоступна"
+                "interrupted", "Интерактивный ввод пользователя пока не поддерживается"
             )
             return
         if isinstance(event, ErrorEvent):
@@ -548,6 +575,235 @@ class EngineRunner:
         if close_stream:
             self.publisher.close()
 
+    async def approve(self, event: ApprovalEvent) -> None:
+        self.seen_requests.add(event.request_id)
+        ttl = self.profile.timeouts.get("approval", 300)
+        deadline = self.clock.now() + ttl
+        pending: list[PendingEvent] = []
+        close_stream = False
+        async with self.factory() as db:
+            await fence_check(db, self.fence)
+            session = await db.get(Session, self.fence.session_id)
+            turn = await db.get(EngineTurn, self.turn_key)
+            assert session is not None and turn is not None
+            duplicate = await db.scalar(
+                select(ToolCall.id).where(
+                    ToolCall.session_id == session.id,
+                    ToolCall.executor == "engine",
+                    ToolCall.native_request_id == event.request_id,
+                    ToolCall.id.in_(
+                        select(Approval.tool_call_id).where(
+                            Approval.generation == self.fence.generation
+                        )
+                    ),
+                )
+            )
+            if duplicate:
+                raise ValueError("Duplicate native approval request")
+            cursor = dict(turn.last_item_ids or {})
+            if self.reply_id and not self.publisher.closed:
+                pending.append(
+                    await add_event(
+                        db,
+                        "message.created",
+                        {
+                            "role": "assistant",
+                            "message_id": self.reply_id,
+                            **self.publisher.identity,
+                        },
+                        session.id,
+                    )
+                )
+                cursor["_stream"] = {**cursor.get("_stream", {}), "closed": True}
+                close_stream = True
+            call_id = cursor.get(f"tool_call:{event.item_id}", {}).get("call_id")
+            call = await db.get(ToolCall, call_id) if call_id else None
+            if call is None:
+                call = ToolCall(
+                    id=new_id(),
+                    session_id=session.id,
+                    name=event.action,
+                    arguments=event.parameters,
+                    risk_level="observed",
+                    executor="engine",
+                    native_item_id=event.item_id,
+                    native_request_id=event.request_id,
+                    status="awaiting_confirmation",
+                )
+                db.add(call)
+                message = await append_message(
+                    db,
+                    session.id,
+                    role="assistant",
+                    content=None,
+                    tool_calls=[
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": json.dumps(event.parameters),
+                            },
+                        }
+                    ],
+                )
+                pending.append(
+                    await add_event(
+                        db,
+                        "message.created",
+                        {"role": "assistant", "message_id": message.id},
+                        session.id,
+                    )
+                )
+            else:
+                if call.native_request_id or call.result is not None:
+                    raise ValueError("Native tool already has a decision or result")
+                call.arguments = event.parameters
+                call.native_request_id = event.request_id
+                call.status = "awaiting_confirmation"
+            await db.flush()
+            approval = Approval(
+                id=new_id(),
+                tool_call_id=call.id,
+                generation=self.fence.generation,
+                executor="engine",
+                scope=event.scope,
+                expires_at=datetime.now(UTC) + timedelta(seconds=ttl),
+            )
+            db.add(approval)
+            await db.flush()
+            self.approval_ids[event.request_id] = approval.id
+            cursor[f"tool_call:{event.item_id}"] = {"call_id": call.id}
+            turn.last_item_ids, turn.native_turn_id = cursor, self.turn_id
+            self.reply_id = None
+            session.status = "awaiting_confirmation"
+            pending.append(
+                await add_event(
+                    db,
+                    "approval.required",
+                    {
+                        "approval_id": approval.id,
+                        "tool_call_id": call.id,
+                        "request_id": event.request_id,
+                        "generation": self.fence.generation,
+                        "executor": "engine",
+                        "scope": event.scope,
+                        "expires_at": approval.expires_at.isoformat()
+                        if approval.expires_at
+                        else None,
+                    },
+                    session.id,
+                )
+            )
+            pending.append(
+                await add_event(
+                    db, "session.status", {"status": "awaiting_confirmation"}, session.id
+                )
+            )
+            await db.commit()
+        if close_stream:
+            self.publisher.close()
+        await publish(pending)
+        while True:
+            async with self.factory() as db:
+                await fence_check(db, self.fence)
+                record = await db.get(Approval, self.approval_ids[event.request_id])
+                assert record is not None
+                status = record.status
+                await db.commit()
+            if self.clock.now() >= deadline or status not in {"pending", "approved", "rejected"}:
+                await self.answer_request(event.request_id, "deny", cancelled=True)
+                await self.finish(
+                    "interrupted", "Срок ожидания разрешения истёк или запрос отменён"
+                )
+                return
+            if status != "pending":
+                delivered = await self.answer_request(
+                    event.request_id, "allow" if status == "approved" else "deny", deadline=deadline
+                )
+                if not delivered:
+                    await self.finish("interrupted", "Срок ожидания разрешения истёк")
+                    return
+                async with self.factory() as db:
+                    await fence_check(db, self.fence)
+                    session = await db.get(Session, self.fence.session_id)
+                    assert session is not None
+                    session.status = "running"
+                    event_row = await add_event(
+                        db, "session.status", {"status": "running"}, session.id
+                    )
+                    await db.commit()
+                await publish([event_row])
+                return
+            await self.clock.until(min(deadline, self.clock.now() + 0.05))
+
+    async def answer_request(
+        self,
+        request_id: str,
+        decision: Literal["allow", "deny"],
+        *,
+        cancelled: bool = False,
+        deadline: float | None = None,
+    ) -> bool:
+        # A deny during teardown is safe after lease loss; an allow requires the live fence.
+        answered = False
+        try:
+            async with self.factory() as db:
+                if cancelled:
+                    db.sync_session.info["fence_exempt"] = True
+                else:
+                    await fence_check(db, self.fence)
+                approval_id = self.approval_ids.get(request_id)
+                approval = (
+                    await db.scalar(
+                        select(Approval).where(Approval.id == approval_id).with_for_update()
+                    )
+                    if approval_id
+                    else None
+                )
+                if approval is not None:
+                    if approval.delivered_at is not None:
+                        answered = True
+                        return False
+                    if not cancelled and (
+                        (deadline is not None and self.clock.now() >= deadline)
+                        or approval.expires_at is None
+                        or approval.expires_at.replace(tzinfo=UTC) <= datetime.now(UTC)
+                    ):
+                        cancelled, decision = True, "deny"
+                    if cancelled:
+                        approval.status, approval.resolved_at = "cancelled", datetime.now(UTC)
+                    elif approval.status not in {"approved", "rejected"}:
+                        raise FenceLostError("Native approval was withdrawn")
+                elif not cancelled:
+                    raise ValueError("Native approval record is missing")
+                await db.flush()
+                # Keep the row lock across bounded port IO so Stop cannot win before allow.
+                try:
+                    async with asyncio.timeout(1):
+                        await self.engine.answer(request_id, decision)
+                    answered = True
+                except Exception:
+                    answered = True
+                    if approval is not None:
+                        approval.status, approval.resolved_at = "interrupted", datetime.now(UTC)
+                    await db.commit()
+                    raise
+                if approval is not None:
+                    approval.delivered_at = datetime.now(UTC)
+                    call = await db.get(ToolCall, approval.tool_call_id)
+                    if (
+                        not cancelled
+                        and call is not None
+                        and call.status == "awaiting_confirmation"
+                    ):
+                        call.status = "running"
+                await db.commit()
+                return not cancelled
+        finally:
+            if answered:
+                self.pending_requests.discard(request_id)
+
     async def tool_result(
         self, db: AsyncSession, call: ToolCall, pending: list[PendingEvent]
     ) -> None:
@@ -599,7 +855,7 @@ class EngineRunner:
         async def cancel_requests() -> None:
             for request_id in tuple(self.pending_requests):
                 with suppress(Exception):
-                    await self.engine.answer(request_id, "deny")
+                    await self.answer_request(request_id, "deny", cancelled=True)
             self.pending_requests.clear()
             await self.engine.interrupt(self.turn_id or self.submission_id)
 

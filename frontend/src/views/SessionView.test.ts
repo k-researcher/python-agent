@@ -257,3 +257,22 @@ describe("SessionView", () => {
     ).toBe("не потерять текст");
   });
 });
+
+it("shows engine usage and unavailable health without history mutations or tuning", async () => {
+  const store = prepareSession();
+  Object.assign(store.session!, { llm_profile: null, engine_profile: "personal", engine_state: {
+    health: { status: "unavailable", diagnostic: "engine недоступен" },
+    usage: { input_tokens: 12, output_tokens: 3, cache_tokens: null, reported_cost: null, estimated_cost: true },
+  } });
+  const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+  await flushPromises();
+  expect(wrapper.get('[data-testid="engine-health"]').text()).toContain("недоступен");
+  expect(wrapper.get('[data-testid="engine-usage"]').text()).toContain("12");
+  expect(wrapper.get('[data-testid="engine-usage"]').text()).toContain("неизвестна");
+  expect(wrapper.find('[data-testid="composer-effort"]').exists()).toBe(false);
+  expect(wrapper.find('[data-testid="edit-message"]').exists()).toBe(false);
+  expect(wrapper.find('[data-testid="regenerate"]').exists()).toBe(false);
+  expect(wrapper.find('[data-testid="fork"]').exists()).toBe(false);
+  expect(wrapper.find('[data-testid="switch-branch"]').exists()).toBe(false);
+  wrapper.unmount();
+});
