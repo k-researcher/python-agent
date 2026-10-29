@@ -1,0 +1,16 @@
+[
+ {"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"text-1","delta":"Hello "}},
+ {"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"text-1","delta":"world"}},
+ {"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"id":"text-1","type":"agentMessage","text":"Hello world"}}},
+ {"method":"item/reasoning/summaryTextDelta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"reason-1","summaryIndex":0,"delta":"Think"}},
+ {"method":"item/reasoning/textDelta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"reason-1","contentIndex":0,"delta":"Details"}},
+ {"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"id":"reason-1","type":"reasoning","summary":["Think"],"content":["Details"]}}},
+ {"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":1,"item":{"id":"cmd-1","type":"commandExecution","command":"pwd","commandActions":[],"cwd":"/project","status":"inProgress"}}},
+ {"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"id":"cmd-1","type":"commandExecution","command":"pwd","commandActions":[],"cwd":"/project","status":"completed","aggregatedOutput":"/project","exitCode":0}}},
+ {"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","startedAtMs":1,"item":{"id":"file-1","type":"fileChange","changes":[{"path":"a.txt","kind":{"type":"add"},"diff":"+hello"}],"status":"inProgress"}}},
+ {"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"id":"file-1","type":"fileChange","changes":[{"path":"a.txt","kind":{"type":"add"},"diff":"+hello"}],"status":"completed"}}},
+ {"method":"turn/diff/updated","params":{"threadId":"thread-1","turnId":"turn-1","diff":"diff --git a/a.txt b/a.txt\n+hello"}},
+ {"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"total":{"inputTokens":15,"cachedInputTokens":10,"outputTokens":3,"reasoningOutputTokens":2,"totalTokens":18},"last":{"inputTokens":15,"cachedInputTokens":10,"outputTokens":3,"reasoningOutputTokens":2,"totalTokens":18},"modelContextWindow":10000}}},
+ {"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1800000000},"secondary":{"usedPercent":100,"windowDurationMins":10080,"resetsAt":1801000000},"rateLimitReachedType":"rate_limit_reached"}}},
+ {"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[],"status":"completed"}}}
+]

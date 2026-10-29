@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent.config import EngineProfileSettings
 from agent.engine import (
+    ApprovalCancellation,
     ApprovalEvent,
     DiffEvent,
     DoneEvent,
@@ -781,7 +782,10 @@ class EngineRunner:
                 # Keep the row lock across bounded port IO so Stop cannot win before allow.
                 try:
                     async with asyncio.timeout(1):
-                        await self.engine.answer(request_id, decision)
+                        if cancelled and isinstance(self.engine, ApprovalCancellation):
+                            await self.engine.cancel_approval(request_id)
+                        else:
+                            await self.engine.answer(request_id, decision)
                     answered = True
                 except Exception:
                     answered = True
