@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 from collections.abc import Callable, Mapping
 from typing import cast
 
@@ -44,6 +45,16 @@ class EngineRegistry:
         if profile_id not in self.profiles:
             raise ValueError("Engine profile is not configured")
         self.factories[profile_id] = factory
+
+    def available(self, profile_id: str) -> bool:
+        """Check installation without importing an adapter or constructing an engine."""
+        profile = self.profiles.get(profile_id)
+        if profile is None or not profile.enabled:
+            return False
+        return (
+            profile_id in self.factories
+            or importlib.util.find_spec(profile.adapter_module) is not None
+        )
 
     def get(self, profile_id: str) -> Engine | None:
         profile = self.profiles.get(profile_id)

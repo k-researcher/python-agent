@@ -10,15 +10,14 @@ This module is decoupled from the agent runtime. It needs no API access.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
-import os
-import signal
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from agent.engine_process import clean_env as _clean_env
+from agent.engine_process import terminate_group as _terminate_group
 from agent.modes import tool_profile
 
 EventKind = Literal["message", "reasoning", "command", "file_change", "usage", "error", "other"]
@@ -35,11 +34,6 @@ _SANDBOX_DEV = "workspace-write"
 
 _MAX_LINE_LENGTH = 1024 * 1024
 _STDERR_TAIL_LIMIT = 2000
-_KILL_GRACE_SECONDS = 2.0
-
-# The child process gets only these environment variables. They are enough to
-# run a program. Credential files and secret variables stay private.
-_ALLOWED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,16 +213,6 @@ async def run_external(
         await asyncio.gather(reader_task, stderr_task, return_exceptions=True)
 
 
-def _clean_env() -> dict[str, str]:
-    """Return the child environment with a small allow-list.
-
-    The allow-list keeps the process runnable and the environment private.
-    Secret variables and credential files never reach the child process.
-    The result is a dict even when it is empty: None would pass the full environment.
-    """
-    return {name: os.environ[name] for name in _ALLOWED_ENV if name in os.environ}
-
-
 class _RunStorage:
     """Collect events and stderr text during one run."""
 
@@ -357,20 +341,3 @@ async def _consume_stderr(stream: asyncio.StreamReader | None, storage: _RunStor
             keep = b"".join(storage.stderr_parts)[-_STDERR_TAIL_LIMIT:]
             storage.stderr_parts = [keep]
             storage.stderr_size = len(keep)
-
-
-async def _terminate_group(process: asyncio.subprocess.Process) -> None:
-    """Stop the whole process group: SIGTERM, a grace period, then SIGKILL.
-
-    The group can outlive its leader, for example a command that the CLI started.
-    Thus the group gets the signals also when the leader has already exited.
-    """
-    group_id = process.pid
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(group_id, signal.SIGTERM)
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(process.wait(), timeout=_KILL_GRACE_SECONDS)
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(group_id, signal.SIGKILL)
-    # Reap the leader so that no zombie process stays.
-    await process.wait()

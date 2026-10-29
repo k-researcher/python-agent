@@ -261,6 +261,9 @@ class ToolCall(Base):
     arguments: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     risk_level: Mapped[str] = mapped_column(String(50))
+    executor: Mapped[str] = mapped_column(String(20), default="python", server_default="python")
+    native_item_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    native_request_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     source_revision: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(50), default=ToolCallStatus.pending.value)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -272,6 +275,28 @@ class ToolCall(Base):
     approval: Mapped[Approval | None] = relationship(
         back_populates="tool_call", cascade="all, delete-orphan", uselist=False
     )
+
+
+class EngineTurn(Base):
+    __tablename__ = "engine_turns"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id", "generation", "input_message_id", name="uq_engine_turns_input"
+        ),
+        CheckConstraint(
+            "state IN ('prepared', 'dispatched', 'done')", name="ck_engine_turns_state"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
+    generation: Mapped[int] = mapped_column(Integer)
+    input_message_id: Mapped[int] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"))
+    submission_id: Mapped[str] = mapped_column(String(36), unique=True, default=new_id)
+    native_turn_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    state: Mapped[str] = mapped_column(String(20), default="prepared")
+    last_item_ids: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    outcome: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
 class Approval(Base):

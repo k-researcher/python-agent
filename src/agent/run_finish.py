@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any, Literal
 
-from sqlalchemy import exists, select, update
+from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.events import PendingEvent, add_event
@@ -88,7 +89,18 @@ async def finish_run(
         if source == "recovery":
             if status != "interrupted":
                 raise ValueError("Recovery must record an interrupted status")
-            conditions.append(Session.status == "running")
+            conditions.append(
+                or_(
+                    and_(Session.engine_profile.is_(None), Session.status == "running"),
+                    and_(
+                        Session.engine_profile.is_not(None),
+                        Session.status.in_(
+                            ["pending", "running", "awaiting_confirmation", "awaiting_child"]
+                        ),
+                        or_(Session.owner_token.is_(None), Session.lease_until < datetime.now(UTC)),
+                    ),
+                )
+            )
             values.update(
                 run_generation=Session.run_generation + 1, owner_token=None, lease_until=None
             )
@@ -146,10 +158,17 @@ async def finish_run(
     ):
         db.sync_session.info["finishing_fence"] = fence
         db.sync_session.info["finishing_run"] = (session_id, generation, status)
+    from agent.engine_journal import finish_engine_turns
+
+    engine_events = (
+        await finish_engine_turns(db, session_id, generation, status, reason)
+        if session is not None and session.engine_profile is not None
+        else []
+    )
     payload: dict[str, Any] = {"status": status, "generation": generation}
     if reason is not None:
         payload["reason"] = reason
     if error is not None:
         payload["error"] = error
     event_type = "session.error" if status == "error" else "session.status"
-    return [await add_event(db, event_type, payload, session_id)]
+    return [await add_event(db, event_type, payload, session_id), *engine_events]
