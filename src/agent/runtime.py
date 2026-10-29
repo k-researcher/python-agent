@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import traceback
 import uuid
 from contextlib import nullcontext, suppress
 from contextvars import ContextVar
@@ -729,7 +730,11 @@ class AgentSupervisor:
         keeper = asyncio.create_task(self._keep_lease(fence, run), name=f"lease-{session_id}")
         try:
             await self._run(session_id)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            # The completed database frames can still own a SQLite cursor after
+            # connection close. Release it before lease cleanup opens a writer.
+            # The task's result is not retrieved until after this finally block.
+            traceback.clear_frames(error.__traceback__)
             raise
         except FenceLostError:
             logger.warning("Session %s: the run lost its fence and stops", session_id)

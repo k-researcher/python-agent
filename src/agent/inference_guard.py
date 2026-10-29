@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import traceback
 from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import suppress
 from contextvars import ContextVar
@@ -38,8 +39,13 @@ def retain[T](task: asyncio.Future[T]) -> asyncio.Future[T]:
 
     def done(completed: asyncio.Future[T]) -> None:
         _RETAINED.discard(completed)
-        if not completed.cancelled():
+        # Task cancellation can retain a traceback with an unfinished database
+        # cursor. asyncio.wait() does not retrieve it. Consume it even when the
+        # supervisor keeps the completed task, so connection close can finish.
+        try:
             completed.exception()
+        except asyncio.CancelledError as error:
+            traceback.clear_frames(error.__traceback__)
 
     task.add_done_callback(done)
     return task
