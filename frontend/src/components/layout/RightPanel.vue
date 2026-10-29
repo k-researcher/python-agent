@@ -5,6 +5,7 @@
 import { computed, nextTick, ref } from "vue";
 import { Bot, ClipboardList, Puzzle, Activity, ChevronRight } from "lucide-vue-next";
 import type { ContextStats } from "./types";
+import { formatLocalTime } from "../../time";
 
 const props = withDefaults(
   defineProps<{
@@ -298,7 +299,9 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
               <span class="audit-row__status" data-audit-status>{{ entry.status }}</span>
             </div>
             <div class="audit-row__dest muted mono">{{ entry.destination }}</div>
-            <div class="audit-row__time muted">{{ entry.created_at }}</div>
+            <time class="audit-row__time muted" :datetime="entry.created_at">{{
+              formatLocalTime(entry.created_at, { seconds: true })
+            }}</time>
           </div>
         </li>
       </ul>
@@ -582,6 +585,7 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
 
 .audit-row__dest,
 .audit-row__time {
+  display: block;
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;

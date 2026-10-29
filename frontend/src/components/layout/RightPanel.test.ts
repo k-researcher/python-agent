@@ -480,6 +480,17 @@ describe("RightPanel — tools, agents, audit", () => {
     expect(entries[0].find('[data-audit-status]').text()).toBe("ok");
   });
 
+  it("shows the audit time in the local time zone, not the raw server value", async () => {
+    const wrapper = mountPanel();
+    await wrapper.findAll('[role="tab"]')[3].trigger("click");
+    const time = wrapper.get(".audit-row__time");
+    expect(time.text()).not.toContain("T10:00:00Z");
+    expect(time.text()).toContain(
+      new Date("2026-10-06T10:00:00Z").toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+    );
+    expect(time.attributes("datetime")).toBe("2026-10-06T10:00:00Z");
+  });
+
   it("shows an empty audit state", async () => {
     const wrapper = mountPanel({ audit: [] });
     await wrapper.findAll('[role="tab"]')[3].trigger("click");

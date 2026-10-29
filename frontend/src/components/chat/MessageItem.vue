@@ -7,18 +7,13 @@ import type { ChatMessage } from "./types";
 import MarkdownView from "./MarkdownView.vue";
 import ReasoningBlock from "./ReasoningBlock.vue";
 import { reasoningLabel } from "./reasoning";
+import { formatLocalTime } from "../../time";
 
 const props = defineProps<{ message: ChatMessage }>();
 
 const isUser = computed(() => props.message.role === "user");
 
-const formattedTime = computed(() => {
-  const raw = props.message.created_at;
-  if (!raw) return "";
-  const date = new Date(raw);
-  if (Number.isNaN(date.getTime())) return "";
-  return date.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
-});
+const formattedTime = computed(() => formatLocalTime(props.message.created_at));
 
 const effortLabel = computed(() => {
   const effort = props.message.reasoning_effort;

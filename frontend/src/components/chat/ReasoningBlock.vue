@@ -1,8 +1,8 @@
 <script setup lang="ts">
 // Collapsible "reasoning" block. Collapsed by default; while streaming it
-// shows an animated "Думаю…" hint instead of the finished text.
+// shows an animated "Думаю…" hint and can be expanded to follow the live text.
 
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 
 const props = withDefaults(defineProps<{ text?: string; streaming?: boolean }>(), {
   text: "",
@@ -10,20 +10,34 @@ const props = withDefaults(defineProps<{ text?: string; streaming?: boolean }>()
 });
 
 const expanded = ref(false);
+const body = ref<HTMLElement | null>(null);
+// The live text follows the end until the user scrolls up, and again after they scroll back down.
+const followEnd = ref(true);
 
 const charCount = computed(() => props.text.length);
 
-const headerLabel = computed<string>(() => {
-  if (props.streaming) return "Думаю…";
+const countLabel = computed<string>(() => {
   const count = charCount.value;
   const suffix = count === 1 ? "символ" : count >= 2 && count <= 4 ? "символа" : "символов";
-  return `Рассуждения · ${count} ${suffix}`;
+  return `${count} ${suffix}`;
 });
 
 function toggle(): void {
-  if (props.streaming) return;
   expanded.value = !expanded.value;
 }
+
+function onScroll(): void {
+  const el = body.value;
+  if (el) followEnd.value = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+}
+
+watch(
+  () => props.text,
+  () => {
+    if (props.streaming && followEnd.value && body.value) body.value.scrollTop = body.value.scrollHeight;
+  },
+  { flush: "post" },
+);
 </script>
 
 <template>
@@ -31,15 +45,22 @@ function toggle(): void {
     <button
       type="button"
       class="reasoning-toggle"
-      :disabled="streaming"
       :aria-expanded="expanded"
       data-testid="reasoning-toggle"
       @click="toggle"
     >
       <span class="caret" :class="{ open: expanded }">▸</span>
-      <span :class="{ 'thinking-dots': streaming }">{{ headerLabel }}</span>
+      <template v-if="streaming"><span class="thinking-dots">Думаю…</span> · {{ countLabel }}</template>
+      <span v-else>Рассуждения · {{ countLabel }}</span>
     </button>
-    <div v-if="expanded" class="reasoning-body" data-testid="reasoning-body">
+    <div
+      v-if="expanded"
+      ref="body"
+      class="reasoning-body"
+      :class="{ live: streaming }"
+      data-testid="reasoning-body"
+      @scroll="onScroll"
+    >
       <pre class="reasoning-text">{{ text }}</pre>
     </div>
   </div>
@@ -62,11 +83,8 @@ function toggle(): void {
   font-size: 0.78rem;
   cursor: pointer;
 }
-.reasoning-toggle:hover:not(:disabled) {
+.reasoning-toggle:hover {
   background: var(--bg-subtle, #f4f4f6);
-}
-.reasoning-toggle:disabled {
-  cursor: default;
 }
 
 .caret {
@@ -93,6 +111,10 @@ function toggle(): void {
   padding: 0.5rem 0.65rem;
   border-left: 2px solid var(--border, #e6e6e9);
   color: var(--text-muted, #6b6b76);
+}
+.reasoning-body.live {
+  max-height: 40vh;
+  overflow-y: auto;
 }
 
 .reasoning-text {

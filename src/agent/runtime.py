@@ -33,10 +33,10 @@ from agent.events import (
     CURRENT_STREAMS,
     PendingEvent,
     StreamPublisher,
-    StreamRun,
     add_event,
     emit_event,
     publish,
+    resume_stream_run,
 )
 from agent.inference_guard import (
     CURRENT_RUN_GUARD,
@@ -757,9 +757,11 @@ class AgentSupervisor:
             generation is not None and fence.generation != generation
         ):
             raise FenceLostError("The fence does not belong to this run")
+        async with session_factory() as db:
+            stream_run = await resume_stream_run(db, session_id, fence.generation)
         run_guard_token = CURRENT_RUN_GUARD.set(None)
         token = CURRENT_FENCE.set(fence)
-        stream_token = CURRENT_STREAMS.set(StreamRun(fence.generation))
+        stream_token = CURRENT_STREAMS.set(stream_run)
         run = asyncio.current_task()
         keeper = asyncio.create_task(self._keep_lease(fence, run), name=f"lease-{session_id}")
         try:

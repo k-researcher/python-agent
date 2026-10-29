@@ -13,6 +13,7 @@ from typing import Any
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.config import Settings
@@ -161,6 +162,28 @@ class StreamRun:
 
 
 CURRENT_STREAMS: ContextVar[StreamRun | None] = ContextVar("stream_run", default=None)
+
+
+async def resume_stream_run(db: AsyncSession, session_id: str, generation: int) -> StreamRun:
+    """Continue the stream numbers of a run that paused, for example for an approval.
+
+    A client drops a stream whose number it already saw with another stream id, so the
+    numbers of one generation must not start again.
+    """
+    payloads = await db.scalars(
+        select(Event.payload).where(Event.session_id == session_id, Event.type == "message.created")
+    )
+    last = max(
+        (
+            payload["stream_no"]
+            for payload in payloads
+            if type(payload.get("generation")) is int
+            and payload["generation"] == generation
+            and type(payload.get("stream_no")) is int
+        ),
+        default=0,
+    )
+    return StreamRun(generation, last)
 
 
 class StreamPublisher:
