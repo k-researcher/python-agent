@@ -135,6 +135,12 @@ class Session(Base):
     __tablename__ = "sessions"
     __table_args__ = (
         Index("ix_sessions_archived_updated_at", "archived", "updated_at"),
+        CheckConstraint(
+            "(llm_profile IS NOT NULL AND length(trim(llm_profile)) > 0 AND engine_profile IS NULL)"
+            " OR (llm_profile IS NULL AND engine_profile IS NOT NULL"
+            " AND length(trim(engine_profile)) > 0)",
+            name="ck_sessions_backend",
+        ),
         CheckConstraint("inbox_hop >= 0", name="ck_sessions_inbox_hop"),
         CheckConstraint(
             "notify_generation IS NULL OR (notify_generation > 0 AND parent_id IS NOT NULL)",
@@ -154,7 +160,11 @@ class Session(Base):
         ForeignKey("sessions.id"), nullable=True, index=True
     )
     mode: Mapped[str] = mapped_column(String(50), default="dev")
-    llm_profile: Mapped[str] = mapped_column(String(100), default="default", index=True)
+    llm_profile: Mapped[str | None] = mapped_column(
+        String(100).evaluates_none(), default="default", nullable=True, index=True
+    )
+    engine_profile: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    engine_state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     title: Mapped[str] = mapped_column(String(300))
     status: Mapped[str] = mapped_column(String(50), default=SessionStatus.pending.value)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -251,6 +261,9 @@ class ToolCall(Base):
     arguments: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     risk_level: Mapped[str] = mapped_column(String(50))
+    executor: Mapped[str] = mapped_column(String(20), default="python", server_default="python")
+    native_item_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    native_request_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     source_revision: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(50), default=ToolCallStatus.pending.value)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -262,6 +275,28 @@ class ToolCall(Base):
     approval: Mapped[Approval | None] = relationship(
         back_populates="tool_call", cascade="all, delete-orphan", uselist=False
     )
+
+
+class EngineTurn(Base):
+    __tablename__ = "engine_turns"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id", "generation", "input_message_id", name="uq_engine_turns_input"
+        ),
+        CheckConstraint(
+            "state IN ('prepared', 'dispatched', 'done')", name="ck_engine_turns_state"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
+    generation: Mapped[int] = mapped_column(Integer)
+    input_message_id: Mapped[int] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"))
+    submission_id: Mapped[str] = mapped_column(String(36), unique=True, default=new_id)
+    native_turn_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    state: Mapped[str] = mapped_column(String(20), default="prepared")
+    last_item_ids: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    outcome: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
 class Approval(Base):

@@ -54,10 +54,16 @@ models:
       history: current_turn             # рассуждения возвращаются модели в цикле инструментов
   light:                            # служебные задачи (названия, суммаризация) и fallback
     provider: gateway
-    model: gemma-4-26b
+    model: deepseek-v4-flash
     context_window: 256000
+    # Без "none" модель сначала рассуждает: при малом max_tokens ответ приходит пустым.
     max_tokens: 8192
-    reasoning: {supported: false}
+    reasoning:
+      supported: true
+      allowed_efforts: [none, high]
+      default_effort: none              # служебным задачам рассуждения не нужны
+      wire_parameter: reasoning_effort
+      history: current_turn
   # local:                          # локальная модель
   #   provider: local_server
   #   model: local-model-id         # точный ID модели на сервере
@@ -80,3 +86,19 @@ routing:
 
 decisions:                          # слой решений, пока выключен
   enabled: false
+
+# Внешние агенты: только явный выбор engine_profile, без default и fallback.
+# Исполнитель пока недоступен; enabled не запускает CLI в этой версии.
+engine_profiles: {}
+# engine_profiles:
+#   personal:
+#     enabled: false
+#     adapter_module: agent.engine_adapters.claude
+#     # Второй допустимый модуль: agent.engine_adapters.codex
+#     binary: agent-cli
+#     model: configured-model-id
+#     effort: null
+#     timeouts: {turn: 600, approval: 120}
+#     process_limit: 1             # не больше max_parallel_sessions
+#     operator_user_id: local-user-id
+#     adapter_settings: {}

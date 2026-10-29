@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import traceback
 import uuid
 from contextlib import nullcontext, suppress
 from contextvars import ContextVar
@@ -24,6 +25,10 @@ from agent.config import Settings
 from agent.context_inference import TRANSIENT_KINDS, ContextInference, InferenceResult
 from agent.context_manager import ContextManager
 from agent.database import session_factory
+from agent.engine_access import check_engine_access
+from agent.engine_adapters import EngineRegistry, configured_profiles
+from agent.engine_journal import recover_engines
+from agent.engine_runner import EngineRunner
 from agent.events import (
     CURRENT_STREAMS,
     PendingEvent,
@@ -198,9 +203,19 @@ class AgentSupervisor:
         # until they end, and cancelled by Stop of the session and by shutdown.
         self._finishing: dict[asyncio.Task[None], str] = {}
         self._semaphore = asyncio.Semaphore(settings.max_parallel_sessions)
+        self._engine_registry: EngineRegistry | None = None
+        self._engine_slots: dict[str, asyncio.Semaphore] = {}
+        self._engine_sessions: dict[str, asyncio.Lock] = {}
+        self._engine_tasks: set[asyncio.Task[Any]] = set()
         self._reconcile_signal = asyncio.Event()
         self.task_queue = RedisTaskQueue(settings) if settings.execution_mode == "redis" else None
         install_commit_guard()
+
+    @property
+    def engine_registry(self) -> EngineRegistry:
+        if self._engine_registry is None:
+            self._engine_registry = EngineRegistry(configured_profiles(self.settings))
+        return self._engine_registry
 
     async def start(
         self,
@@ -208,6 +223,7 @@ class AgentSupervisor:
         *,
         new_run: bool = True,
         expected_generation: int | None = None,
+        actor_user_id: str | None = None,
     ) -> bool:
         """Schedule the session. A new run starts a new generation; a resume continues it.
 
@@ -225,6 +241,15 @@ class AgentSupervisor:
         if expected_generation is not None and new_run:
             # A new run makes a new generation, so it can never match the expected one.
             raise ValueError("expected_generation needs new_run=False")
+        async with session_factory() as db:
+            record = await db.get(Session, session_id)
+            if record is not None and record.engine_profile is not None:
+                # A queued generation carries the identity of the already authorized
+                # creator. A direct new run must supply its actor explicitly.
+                actor = actor_user_id
+                if actor is None and expected_generation is not None:
+                    actor = (record.engine_state or {}).get("operator_user_id")
+                await check_engine_access(db, self.settings, record, actor)
         if expected_generation is not None and not await self._at_generation(
             session_id, expected_generation
         ):
@@ -279,6 +304,10 @@ class AgentSupervisor:
         """Dispatch durable pending intents whose executor is absent or expired."""
         token = CURRENT_FENCE.set(None)
         try:
+            async with session_factory() as db:
+                recovered = await recover_engines(db)
+                await db.commit()
+            await publish(recovered)
             await self._reconcile_inbox()
         finally:
             CURRENT_FENCE.reset(token)
@@ -478,7 +507,9 @@ class AgentSupervisor:
                 if targets:
                     await asyncio.wait(targets)
 
-        await bounded_cleanup(settle(), clock, clock.now() + 2)
+        await bounded_cleanup(
+            settle(), clock, clock.now() + (5 if targets & self._engine_tasks else 2)
+        )
 
     def _tasks_of_generation(self, session_id: str, generation: int) -> set[asyncio.Task[None]]:
         """Return the unfinished current task of the session when it runs ``generation``."""
@@ -542,9 +573,18 @@ class AgentSupervisor:
             if self.task_queue is not None:
                 await self.task_queue.close()
 
-        await bounded_cleanup(close_resources(), clock, clock.now() + 2)
+        await bounded_cleanup(
+            close_resources(), clock, clock.now() + (5 if set(tasks) & self._engine_tasks else 2)
+        )
 
-    async def resolve_approval(self, approval_id: str, decision: str, comment: str | None) -> str:
+    async def resolve_approval(
+        self,
+        approval_id: str,
+        decision: str,
+        comment: str | None,
+        *,
+        actor_user_id: str | None = None,
+    ) -> str:
         async with session_factory() as db:
             session_id = await db.scalar(
                 select(ToolCall.session_id)
@@ -553,6 +593,10 @@ class AgentSupervisor:
             )
             if session_id is None:
                 raise LookupError("Approval not found")
+            record = await db.get(Session, session_id)
+            if record is not None and record.engine_profile is not None:
+                await check_engine_access(db, self.settings, record, actor_user_id)
+                raise ValueError("engine недоступен")
             await db.execute(select(Session).where(Session.id == session_id).with_for_update())
             query = (
                 select(Approval)
@@ -707,7 +751,11 @@ class AgentSupervisor:
         keeper = asyncio.create_task(self._keep_lease(fence, run), name=f"lease-{session_id}")
         try:
             await self._run(session_id)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            # The completed database frames can still own a SQLite cursor after
+            # connection close. Release it before lease cleanup opens a writer.
+            # The task's result is not retrieved until after this finally block.
+            traceback.clear_frames(error.__traceback__)
             raise
         except FenceLostError:
             logger.warning("Session %s: the run lost its fence and stops", session_id)
@@ -868,6 +916,42 @@ class AgentSupervisor:
 
     async def _run(self, session_id: str) -> None:
         async with session_factory() as db:
+            session = await db.get(Session, session_id)
+            if session is not None and session.engine_profile is not None:
+                try:
+                    await check_engine_access(
+                        db, self.settings, session, session.created_by_user_id
+                    )
+                except PermissionError as exc:
+                    raise RuntimeError(f"engine недоступен: {exc}") from exc
+                profile_id = session.engine_profile
+                profiles = configured_profiles(self.settings)
+                profile = profiles.get(profile_id)
+                self.engine_registry.profiles = profiles
+                # Release the read transaction before the runner opens a writer.
+                await db.rollback()
+                fence = CURRENT_FENCE.get()
+                assert fence is not None
+                lock = self._engine_sessions.setdefault(session_id, asyncio.Lock())
+                if profile is None or not self.engine_registry.available(profile_id):
+                    raise RuntimeError("engine недоступен")
+                slots = self._engine_slots.setdefault(
+                    profile_id, asyncio.Semaphore(profile.process_limit)
+                )
+                task = asyncio.current_task()
+                assert task is not None
+                self._engine_tasks.add(task)
+                try:
+                    async with lock, slots:
+                        async with session_factory() as check_db:
+                            await fence_check(check_db, fence)
+                        engine = self.engine_registry.get(profile_id)
+                        if engine is None:
+                            raise RuntimeError("engine недоступен")
+                        await EngineRunner(session_factory, engine, profile, fence).run()
+                finally:
+                    self._engine_tasks.discard(task)
+                return
             project = await db.scalar(select(Project).join(Session).where(Session.id == session_id))
         registry = self.registry
         if project is not None:

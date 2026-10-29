@@ -10,6 +10,8 @@ import asyncio
 import os
 import sqlite3
 import tempfile
+import time
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -32,6 +34,24 @@ os.environ["AGENT_ALLOWED_HOSTS"] = '["testserver", "localhost", "127.0.0.1"]'
 os.environ["AGENT_EXTRA_ORIGINS"] = '["http://testserver"]'
 
 
+def backup_database(source_path: Path, target_path: Path, *, timeout: float = 5) -> None:
+    """Bound SQLite backup retries, which ignore the connection busy timeout."""
+    deadline = time.monotonic() + timeout
+
+    def progress(_status: int, _remaining: int, _total: int) -> None:
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Test database backup timed out: {source_path} -> {target_path}. "
+                "A previous test may have left a connection or transaction open."
+            )
+
+    with (
+        closing(sqlite3.connect(source_path, timeout=0)) as source,
+        closing(sqlite3.connect(target_path, timeout=0)) as target,
+    ):
+        source.backup(target, pages=128, progress=progress, sleep=0.01)
+
+
 @pytest.fixture(scope="session")
 def empty_runtime_database() -> Path:
     from agent.database import engine, init_database
@@ -39,8 +59,7 @@ def empty_runtime_database() -> Path:
     asyncio.run(init_database(recover_running=False))
     asyncio.run(engine.dispose())
     snapshot = _DATA_DIR / "empty.db"
-    with sqlite3.connect(_DATA_DIR / "agent.db") as source, sqlite3.connect(snapshot) as target:
-        source.backup(target)
+    backup_database(_DATA_DIR / "agent.db", snapshot)
     return snapshot
 
 
@@ -50,8 +69,4 @@ def isolate_runtime_database(empty_runtime_database: Path) -> None:
     from agent.database import engine
 
     asyncio.run(engine.dispose())
-    with (
-        sqlite3.connect(empty_runtime_database) as source,
-        sqlite3.connect(_DATA_DIR / "agent.db") as target,
-    ):
-        source.backup(target)
+    backup_database(empty_runtime_database, _DATA_DIR / "agent.db")

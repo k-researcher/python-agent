@@ -311,7 +311,7 @@ async def collect(
                     session_id=session.id,
                     role="main" if session.parent_id is None else "child",
                     name=(session.title or "")[:40],
-                    model=session.llm_profile,
+                    model=session.llm_profile or session.engine_profile or "",
                     mode=session.mode,
                     status=session.status,
                     duration_seconds=max(0, int((current - created_at).total_seconds())),

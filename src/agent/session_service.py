@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import platform
+import socket
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -9,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.config import Settings
 from agent.context_summary import language_rule
+from agent.engine_access import require_operator, require_personal_project
+from agent.engine_adapters import configured_profiles
 from agent.message_tree import append_message
 from agent.model_registry import effective_registry, select_model
 from agent.models import Project, Session, SessionStatus
@@ -38,6 +44,7 @@ async def create_session_record(
     mode: str,
     *,
     llm_profile: str | None = None,
+    engine_profile: str | None = None,
     title: str | None = None,
     parent_id: str | None = None,
     actor_user_id: str | None = None,
@@ -47,10 +54,32 @@ async def create_session_record(
     run_generation: int = 0,
     commit: bool = True,
 ) -> Session:
-    model = select_model(await effective_registry(db, settings), llm_profile, role=mode)
-    selected_profile = model.id
     configuration = dict(configuration or {})
-    validate_effort(model, configuration.get("reasoning_effort"))
+    engine_state = None
+    selected_profile = None
+    if engine_profile is not None:
+        if llm_profile is not None:
+            raise ValueError("Exactly one backend is required: llm_profile or engine_profile")
+        profile = configured_profiles(settings).get(engine_profile)
+        if profile is None or not profile.enabled:
+            raise ValueError("Engine profile is unavailable or disabled")
+        require_personal_project(project)
+        require_operator(profile, actor_user_id)
+        engine_state = {
+            "thread_id": None,
+            "operator_user_id": actor_user_id,
+            "project_root": str(Path(project.root_path).resolve(strict=True)),
+            "host": socket.gethostname(),
+            "os_uid": os.getuid() if hasattr(os, "getuid") else None,
+            "profile_revision": hashlib.sha256(
+                json.dumps(profile.model_dump(), sort_keys=True).encode()
+            ).hexdigest(),
+            "history_cursor": None,
+        }
+    else:
+        model = select_model(await effective_registry(db, settings), llm_profile, role=mode)
+        selected_profile = model.id
+        validate_effort(model, configuration.get("reasoning_effort"))
     prompt_file = settings.prompts_dir / f"{mode}.md"
     if not prompt_file.is_file():
         raise ValueError(f"Prompt is missing for mode {mode}")
@@ -80,6 +109,8 @@ async def create_session_record(
         created_by_user_id=actor_user_id,
         mode=mode,
         llm_profile=selected_profile,
+        engine_profile=engine_profile,
+        engine_state=engine_state,
         title=title or prompt.strip().replace("\n", " ")[:120],
         status=SessionStatus.pending.value,
         configuration=configuration,

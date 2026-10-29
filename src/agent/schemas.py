@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agent.modes import SessionMode
 
@@ -75,10 +75,17 @@ class SessionCreate(BaseModel):
     prompt: str = Field(min_length=1, max_length=2_000_000)
     mode: SessionMode = "dev"
     llm_profile: str | None = Field(default=None, min_length=1, max_length=100)
+    engine_profile: str | None = Field(default=None, min_length=1, max_length=100)
     reasoning_effort: str | None = Field(default=None, max_length=20)
     title: str | None = Field(default=None, max_length=300)
     auto_start: bool = True
     budget: SessionBudgetRequest | None = None
+
+    @model_validator(mode="after")
+    def one_backend(self) -> Self:
+        if self.engine_profile is not None and self.llm_profile is not None:
+            raise ValueError("llm_profile and engine_profile are mutually exclusive")
+        return self
 
 
 class SessionRead(BaseModel):
@@ -88,7 +95,8 @@ class SessionRead(BaseModel):
     project_id: str
     parent_id: str | None
     mode: str
-    llm_profile: str
+    llm_profile: str | None
+    engine_profile: str | None = None
     configuration: dict[str, Any]
     title: str
     status: str

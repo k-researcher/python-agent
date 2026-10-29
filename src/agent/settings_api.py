@@ -132,7 +132,7 @@ async def _keep_session_models(
         )
     ).all()
     if in_use:
-        names = ", ".join(sorted(in_use))
+        names = ", ".join(sorted(name for name in in_use if name is not None))
         raise HTTPException(409, f"Sessions use these models; archive them first: {names}")
 
 

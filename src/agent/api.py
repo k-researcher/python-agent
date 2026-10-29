@@ -27,6 +27,7 @@ from agent.checkpoints import load_context_rows
 from agent.config import Settings, get_settings
 from agent.context_inference import ContextInference, ContextPreparationError, context_stats
 from agent.database import get_db, session_factory
+from agent.engine_access import check_engine_access
 from agent.events import broker, emit_event, publish
 from agent.message_tree import IDLE_STATUSES, append_message
 from agent.model_registry import effective_registry, select_model
@@ -107,6 +108,7 @@ async def _session_read(db: AsyncSession, session: Session) -> SessionRead:
         parent_id=session.parent_id,
         mode=session.mode,
         llm_profile=session.llm_profile,
+        engine_profile=session.engine_profile,
         configuration=dict(session.configuration or {}),
         title=session.title,
         status=session.status,
@@ -121,6 +123,17 @@ async def _session_read(db: AsyncSession, session: Session) -> SessionRead:
 async def _session_blocked(db: AsyncSession, session: Session, *, new_run: bool) -> str | None:
     """Return why the budget blocks this session, or None when it may proceed."""
     return await budget_block_reason(db, settings, session, datetime.now(UTC), new_run=new_run)
+
+
+async def _engine_access(db: AsyncSession, session: Session, request: Request) -> None:
+    if session.engine_profile is None:
+        return
+    try:
+        await check_engine_access(
+            db, settings, session, getattr(getattr(request, "state", None), "actor_user_id", None)
+        )
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
 
 
 @router.get("/health")
@@ -239,17 +252,25 @@ async def create_session(
             payload.prompt,
             payload.mode,
             llm_profile=payload.llm_profile,
+            engine_profile=payload.engine_profile,
             title=payload.title,
             actor_user_id=getattr(request.state, "actor_user_id", None),
             configuration={"depth": 0}
             | ({"reasoning_effort": payload.reasoning_effort} if payload.reasoning_effort else {}),
             budget=payload.budget,
         )
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     await emit_event(db, "session.created", {"status": session.status}, session.id)
     if payload.auto_start:
-        await supervisor.start(session.id)
+        if session.engine_profile is not None:
+            await supervisor.start(
+                session.id, actor_user_id=getattr(request.state, "actor_user_id", None)
+            )
+        else:
+            await supervisor.start(session.id)
     return await _session_read(db, session)
 
 
@@ -365,12 +386,25 @@ async def _claim_session_run(
     return session
 
 
-async def _dispatch_session_run(db: AsyncSession, session_id: str, generation: int) -> bool:
+async def _dispatch_session_run(
+    db: AsyncSession, session_id: str, generation: int, *, actor_user_id: str | None = None
+) -> bool:
     from agent.events import publish
     from agent.run_finish import finish_run
 
     try:
-        started = await supervisor.start(session_id, new_run=False, expected_generation=generation)
+        record = await db.get(Session, session_id)
+        if record is not None and record.engine_profile is not None:
+            started = await supervisor.start(
+                session_id,
+                new_run=False,
+                expected_generation=generation,
+                actor_user_id=actor_user_id,
+            )
+        else:
+            started = await supervisor.start(
+                session_id, new_run=False, expected_generation=generation
+            )
         if not started:
             state = (
                 await db.execute(
@@ -407,13 +441,20 @@ async def _dispatch_session_run(db: AsyncSession, session_id: str, generation: i
 
 @router.post("/sessions/{session_id}/messages", response_model=MessageRead, status_code=201)
 async def add_message(
-    session_id: str, payload: MessageCreate, db: AsyncSession = Depends(get_db)
+    session_id: str,
+    payload: MessageCreate,
+    db: AsyncSession = Depends(get_db),
+    request: Request = cast(Request, None),
 ) -> Message:
     from sqlalchemy.exc import DBAPIError
 
     from agent.session_inbox import deliver, lock_session, retryable, validate_text
 
     validate_text(payload.content, bounded=False)
+    session = await db.get(Session, session_id)
+    if session is None:
+        raise HTTPException(404, "Session not found")
+    await _engine_access(db, session, request)
     for attempt in range(3):
         try:
             await lock_session(db, session_id)
@@ -430,7 +471,7 @@ async def add_message(
         raise HTTPException(409, f"The session budget is exhausted: {reason}")
     session = await _claim_session_run(db, session_id, allow_initial_pending=True)
 
-    if payload.reasoning_effort is not None:
+    if payload.reasoning_effort is not None and session.engine_profile is None:
         model = select_model(
             await effective_registry(db, settings), session.llm_profile, strict=False
         )
@@ -456,7 +497,12 @@ async def add_message(
     await db.flush()
     await db.commit()
     await publish(inbox_events)
-    await _dispatch_session_run(db, session.id, session.run_generation)
+    await _dispatch_session_run(
+        db,
+        session.id,
+        session.run_generation,
+        actor_user_id=getattr(getattr(request, "state", None), "actor_user_id", None),
+    )
     try:
         await broker.broadcast(
             {
@@ -473,16 +519,28 @@ async def add_message(
 
 
 @router.post("/sessions/{session_id}/start", status_code=202)
-async def start_session(session_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, bool]:
+async def start_session(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    request: Request = cast(Request, None),
+) -> dict[str, bool]:
     session = await db.get(Session, session_id)
     if session is None:
         raise HTTPException(404, "Session not found")
+    await _engine_access(db, session, request)
     reason = await _session_blocked(db, session, new_run=True)
     if reason is not None:
         raise HTTPException(409, f"The session budget is exhausted: {reason}")
     session = await _claim_session_run(db, session_id, allow_initial_pending=True)
     await db.commit()
-    return {"started": await _dispatch_session_run(db, session.id, session.run_generation)}
+    return {
+        "started": await _dispatch_session_run(
+            db,
+            session.id,
+            session.run_generation,
+            actor_user_id=getattr(getattr(request, "state", None), "actor_user_id", None),
+        )
+    }
 
 
 @router.post("/sessions/{session_id}/stop")
@@ -554,7 +612,10 @@ async def list_approvals(
 
 @router.post("/approvals/{approval_id}")
 async def resolve_approval(
-    approval_id: str, payload: ApprovalDecision, db: AsyncSession = Depends(get_db)
+    approval_id: str,
+    payload: ApprovalDecision,
+    db: AsyncSession = Depends(get_db),
+    request: Request = cast(Request, None),
 ) -> dict[str, str]:
     session = (
         await db.execute(
@@ -566,6 +627,9 @@ async def resolve_approval(
     ).scalar_one_or_none()
     if session is None:
         raise HTTPException(404, "Approval not found")
+    await _engine_access(db, session, request)
+    if session.engine_profile is not None:
+        raise HTTPException(409, "engine недоступен")
     reason = await _session_blocked(db, session, new_run=False)
     if reason is not None:
         raise HTTPException(409, f"The session budget is exhausted: {reason}")

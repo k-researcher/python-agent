@@ -36,6 +36,8 @@ def prepare_schema(connection: Connection) -> None:
     config.attributes["connection"] = connection
     command.upgrade(config, "0015")
     command.upgrade(config, "0016")
+    command.upgrade(config, "0017")
+    command.upgrade(config, "0018")
 
 
 @pytest.mark.parametrize("stop_kind", ["plain", "scoped", "cascade"])
@@ -786,6 +788,9 @@ async def test_inbox_migration_roundtrip_uses_native_environment(
         )
         await connection.commit()
         await connection.run_sync(migrate, "upgrade", "0016")
+        await connection.commit()
+        # Restore the runtime schema before reading it through the current ORM.
+        await connection.run_sync(migrate, "upgrade", "0018")
         await connection.commit()
         if engine.dialect.name == "sqlite":
             assert (await connection.execute(text("PRAGMA foreign_key_check"))).all() == []

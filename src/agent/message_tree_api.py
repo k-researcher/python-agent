@@ -24,7 +24,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent.api import _dispatch_session_run
+from agent.api import _dispatch_session_run, _engine_access
 from agent.database import get_db
 from agent.message_tree import (
     TreeError,
@@ -177,6 +177,7 @@ async def fork_endpoint(
         source = await db.get(Session, session_id)
         if source is None:
             raise TreeError("Session not found", 404)
+        await _engine_access(db, source, request)
         title = payload.title or f"{source.title} (ветка)"
         session = await fork(
             db,

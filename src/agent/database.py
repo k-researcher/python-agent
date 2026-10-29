@@ -67,7 +67,7 @@ async def init_database(
         rows = (
             await db.execute(
                 select(Session.id, Session.run_generation).where(
-                    Session.status == SessionStatus.running.value
+                    Session.status == SessionStatus.running.value, Session.engine_profile.is_(None)
                 )
             )
         ).all()
@@ -83,6 +83,9 @@ async def init_database(
                     reason="executor_restart",
                 )
             )
+        from agent.engine_journal import recover_engines
+
+        pending.extend(await recover_engines(db))
         await db.commit()
         await publish(pending)
 
