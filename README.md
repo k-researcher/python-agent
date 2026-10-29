@@ -47,18 +47,19 @@ cd frontend && npm install && npm run build && cd ..
 uv run pyagent
 ```
 
-Перед запуском заполните ключ провайдера в `.env` и опишите модели в
-`config/models.yaml` (шаблон — `config/models.example.yaml`):
+Перед запуском опишите модели в `config/models.yaml` (шаблон — `config/models.example.yaml`)
+и впишите ключ провайдера в строку `AGENT_LLM_API_KEY=` файла `.env`. Не добавляйте
+вторую такую строку.
 
 ```bash
 cp config/models.example.yaml config/models.yaml
-echo 'AGENT_LLM_API_KEY=...' >> .env
 uv run pyagent config check --strict
 ```
 
 ### Модели и провайдеры
 
 Подключение Сбера: [мини-инструкция для GigaChat](docs/gigachat-setup.md).
+Подключение DeepSeek: [пошаговая инструкция](docs/deepseek-setup.md).
 
 Конфигурация моделей состоит из двух слоёв:
 
