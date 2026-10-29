@@ -54,10 +54,16 @@ models:
       history: current_turn             # рассуждения возвращаются модели в цикле инструментов
   light:                            # служебные задачи (названия, суммаризация) и fallback
     provider: gateway
-    model: gemma-4-26b
+    model: deepseek-v4-flash
     context_window: 256000
+    # Без "none" модель сначала рассуждает: при малом max_tokens ответ приходит пустым.
     max_tokens: 8192
-    reasoning: {supported: false}
+    reasoning:
+      supported: true
+      allowed_efforts: [none, high]
+      default_effort: none              # служебным задачам рассуждения не нужны
+      wire_parameter: reasoning_effort
+      history: current_turn
   # local:                          # локальная модель
   #   provider: local_server
   #   model: local-model-id         # точный ID модели на сервере

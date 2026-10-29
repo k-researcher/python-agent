@@ -76,8 +76,9 @@ def test_example_loads_and_resolves_secrets() -> None:
     assert model.reasoning.default_effort == "high"
     assert model.reasoning.wire_parameter == "reasoning_effort"
     light = registry.get("light")
-    assert light.model == "gemma-4-26b"
-    assert not light.reasoning.supported
+    assert light.model == "deepseek-v4-flash"
+    assert light.reasoning.supported
+    assert light.reasoning.default_effort == "none"
     assert registry.warnings == []
     assert _SECRET not in repr(model) + repr(registry)
     with pytest.raises(FrozenInstanceError):
