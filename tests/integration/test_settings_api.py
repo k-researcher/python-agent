@@ -312,7 +312,12 @@ def test_connection_uses_key_and_writes_empty_payload_audit(
     )
     response = client.post(f"{PREFIX}/providers/cloud/test")
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "status": 200, "models": ["model-one"]}
+    assert response.json() == {
+        "ok": True,
+        "status": 200,
+        "models": ["model-one"],
+        "details": [{"id": "model-one", "context_window": None, "kind": None}],
+    }
     assert UI_KEY not in response.text
 
     async def check_audit() -> None:
@@ -331,6 +336,108 @@ def test_connection_uses_key_and_writes_empty_payload_audit(
 
     assert client.portal is not None
     client.portal.call(check_audit)
+
+
+def _mock_connection(monkeypatch: pytest.MonkeyPatch, respond: Any) -> None:
+    monkeypatch.setattr(
+        settings_api,
+        "connection_client",
+        lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), timeout=10, follow_redirects=False
+        ),
+    )
+
+
+def test_connection_reports_context_window_from_the_listing(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "wide", "context_length": 131072},
+                    {"id": "plain"},
+                    {"id": "broken", "context_length": "large"},
+                ]
+            },
+        )
+
+    _mock_connection(monkeypatch, respond)
+    details = client.post(f"{PREFIX}/providers/cloud/test").json()["details"]
+    assert details == [
+        {"id": "wide", "context_window": 131072, "kind": None},
+        {"id": "plain", "context_window": None, "kind": None},
+        {"id": "broken", "context_window": None, "kind": None},
+    ]
+    # A remote provider gets only the standard listing request.
+    assert requests == ["https://example.com/v1/models"]
+
+
+def test_connection_reads_local_server_model_details(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "chat-model"}, {"id": "embedder"}]})
+        assert "Authorization" not in request.headers
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "chat-model", "type": "llm", "max_context_length": 262144},
+                    {"id": "embedder", "type": "embeddings", "max_context_length": 2048},
+                    {"id": "not-listed", "type": "llm", "max_context_length": 4096},
+                ]
+            },
+        )
+
+    _mock_connection(monkeypatch, respond)
+    result = client.post(f"{PREFIX}/providers/idle/test").json()
+    assert result["ok"] is True
+    assert result["models"] == ["chat-model", "embedder"]
+    assert result["details"] == [
+        {"id": "chat-model", "context_window": 262144, "kind": "llm"},
+        {"id": "embedder", "context_window": 2048, "kind": "embeddings"},
+    ]
+    assert requests == ["http://localhost:1234/v1/models", "http://localhost:1234/api/v0/models"]
+
+    async def check_audit() -> None:
+        async with session_factory() as db:
+            rows = (
+                await db.scalars(
+                    select(OutboundAudit)
+                    .where(OutboundAudit.category == "llm")
+                    .order_by(OutboundAudit.created_at)
+                )
+            ).all()
+            assert [(row.operation, row.status) for row in rows] == [
+                ("list_models", "completed"),
+                ("list_model_details", "completed"),
+            ]
+
+    assert client.portal is not None
+    client.portal.call(check_audit)
+
+
+def test_connection_keeps_the_listing_when_local_details_fail(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "chat-model"}]})
+        return httpx.Response(404, text="Not found")
+
+    _mock_connection(monkeypatch, respond)
+    result = client.post(f"{PREFIX}/providers/idle/test").json()
+    assert result["ok"] is True
+    assert result["details"] == [{"id": "chat-model", "context_window": None, "kind": None}]
 
 
 @pytest.mark.parametrize("failure", ["timeout", "redirect", "malformed", "http_error"])
@@ -418,3 +525,17 @@ def test_models_in_use_by_sessions_cannot_be_removed(client: TestClient, tmp_pat
     assert client.post(f"/api/sessions/{session_id}/stop").status_code == 200
     assert client.post(f"/api/sessions/{session_id}/archive").status_code == 200
     assert client.delete(f"{PREFIX}/models/spare?disable=true").status_code == 200
+
+
+def test_model_id_with_a_slash_can_be_added_changed_and_removed(client: TestClient) -> None:
+    # Local servers name models like "publisher/model"; the ID keeps the slash.
+    model_id = "publisher/chat-model"
+    body = {"provider": "idle", "model": model_id, "context_window": 32768, "max_tokens": 4096}
+    response = client.put(f"{PREFIX}/models/{model_id}", json=body)
+    assert response.status_code == 200
+    assert model(response.json(), model_id)["context_window"] == 32768
+    response = client.put(f"{PREFIX}/models/{model_id}", json={"max_tokens": 2048})
+    assert model(response.json(), model_id)["max_tokens"] == 2048
+    response = client.delete(f"{PREFIX}/models/{model_id}")
+    assert response.status_code == 200
+    assert all(item["id"] != model_id for item in response.json()["models"])

@@ -153,6 +153,36 @@ export async function installWsMock(page: Page): Promise<void> {
   );
 }
 
+export const mockModelSettings = {
+  providers: [
+    {
+      id: "gateway",
+      kind: "openai",
+      base_url: "https://llm.example.com/v1",
+      api_key_env: "AGENT_LLM_API_KEY",
+      api_key_set: true,
+      api_key_hint: "…abcd",
+      configured: true,
+      disabled: false,
+      origin: "file",
+    },
+  ],
+  models: [
+    {
+      id: "model-a",
+      provider: "gateway",
+      model: "remote-a",
+      context_window: 128000,
+      max_tokens: 8192,
+      pricing: null,
+      disabled: false,
+      origin: "file",
+    },
+  ],
+  routing: { default: "model-a", fallback: [], roles: {}, light: null },
+  warnings: [],
+};
+
 /** The server wraps every session resource in one envelope with the run stamp. */
 export function snapshotEnvelope(data: unknown) {
   return { data, run_generation: 0, revision: 1, consistent: true };
@@ -213,6 +243,11 @@ export async function installRoutes(page: Page): Promise<void> {
     }
     if (path === "/ws") {
       await route.abort();
+      return;
+    }
+
+    if (path === "/api/settings/models" && req.method() === "GET") {
+      await json(route, 200, mockModelSettings);
       return;
     }
 

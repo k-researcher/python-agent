@@ -6,6 +6,7 @@ import hashlib
 from collections.abc import Callable, Coroutine
 from dataclasses import replace
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -16,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import Response
 
+from agent import model_config
 from agent.config import Settings, get_settings
 from agent.database import get_db
 from agent.events import emit_event
@@ -182,7 +184,8 @@ async def put_provider(
     return await _changed(db, effective)
 
 
-@router.put("/models/{model_id}")
+# ":path" lets a model ID keep its slash, as in "publisher/model".
+@router.put("/models/{model_id:path}")
 async def put_model(
     model_id: ModelId, body: ModelPatch, db: Database, settings: Configuration
 ) -> dict[str, Any]:
@@ -270,11 +273,73 @@ async def delete_provider(
     return await _delete_element("providers", provider_id, disable, db, settings)
 
 
-@router.delete("/models/{model_id}")
+@router.delete("/models/{model_id:path}")
 async def delete_model(
     model_id: ModelId, db: Database, settings: Configuration, disable: bool = False
 ) -> dict[str, Any]:
     return await _delete_element("models", model_id, disable, db, settings)
+
+
+# Listing fields that carry the context length; the first valid one wins.
+_CONTEXT_FIELDS = ("max_context_length", "context_length", "context_window")
+
+
+def _context_window(item: dict[str, Any]) -> int | None:
+    for name in _CONTEXT_FIELDS:
+        value = item.get(name)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def _native_listing_url(base_url: str) -> str | None:
+    """Return the native model listing of a local server, which gives the context length."""
+    parts = urlsplit(base_url.rstrip("/"))
+    if parts.hostname not in model_config._LOCAL_HOSTS or not parts.path.endswith("/v1"):
+        return None
+    return urlunsplit((parts.scheme, parts.netloc, parts.path[:-3] + "/api/v0/models", "", ""))
+
+
+def _empty_audit(destination: str, operation: str) -> OutboundAudit:
+    return OutboundAudit(
+        category="llm",
+        destination=destination,
+        operation=operation,
+        payload_bytes=0,
+        payload_sha256=hashlib.sha256(b"").hexdigest(),
+        status="started",
+    )
+
+
+async def _native_details(
+    db: AsyncSession, destination: str, key: str
+) -> dict[str, dict[str, Any]]:
+    """Read the context length and type of each model; a failure gives no details."""
+    audit = _empty_audit(destination, "list_model_details")
+    db.add(audit)
+    await db.commit()
+    details: dict[str, dict[str, Any]] = {}
+    try:
+        async with connection_client() as client:
+            response = await client.get(
+                destination, headers={"Authorization": f"Bearer {key}"} if key else {}
+            )
+        audit.detail = str(response.status_code)
+        if response.is_success:
+            data = response.json()
+            items = data.get("data") if isinstance(data, dict) else None
+            for item in items if isinstance(items, list) else []:
+                if isinstance(item, dict) and isinstance(item.get("id"), str):
+                    kind = item.get("type")
+                    details[item["id"]] = {
+                        "context_window": _context_window(item),
+                        "kind": kind if isinstance(kind, str) else None,
+                    }
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, UnicodeError):
+        audit.detail = "Model details unavailable"
+    audit.status = "completed" if details else "error"
+    await db.commit()
+    return details
 
 
 def connection_client() -> httpx.AsyncClient:
@@ -294,17 +359,11 @@ async def test_provider_connection(
     if provider.api_key_env is not None and not key:
         return {"ok": False, "status": None, "models": [], "message": "API key is not configured"}
     destination = f"{provider.base_url.rstrip('/')}/models"
-    audit = OutboundAudit(
-        category="llm",
-        destination=destination,
-        operation="list_models",
-        payload_bytes=0,
-        payload_sha256=hashlib.sha256(b"").hexdigest(),
-        status="started",
-    )
+    audit = _empty_audit(destination, "list_models")
     db.add(audit)
     await db.commit()
-    result: dict[str, Any] = {"ok": False, "status": None, "models": []}
+    result: dict[str, Any] = {"ok": False, "status": None, "models": [], "details": []}
+    listed: list[dict[str, Any]] = []
     try:
         async with connection_client() as client:
             response = await client.get(
@@ -315,13 +374,14 @@ async def test_provider_connection(
             data = response.json()
             if not isinstance(data, dict) or not isinstance(data.get("data"), list):
                 raise ValueError("Invalid model listing")
-            result["models"] = [
-                item["id"]
+            listed = [
+                item
                 for item in data["data"]
                 if isinstance(item, dict)
                 and isinstance(item.get("id"), str)
                 and (not key or key not in item["id"])
             ]
+            result["models"] = [item["id"] for item in listed]
             result["ok"] = True
         else:
             result["message"] = "Provider returned a non-success HTTP status"
@@ -332,4 +392,16 @@ async def test_provider_connection(
     audit.status = "completed" if result["ok"] else "error"
     audit.detail = str(result["status"]) if result["status"] is not None else result["message"]
     await db.commit()
+    if result["ok"]:
+        native = _native_listing_url(provider.base_url)
+        extra = await _native_details(db, native, key) if native else {}
+        result["details"] = [
+            {
+                "id": item["id"],
+                "context_window": _context_window(item),
+                "kind": None,
+            }
+            | {name: value for name, value in extra.get(item["id"], {}).items() if value}
+            for item in listed
+        ]
     return result
