@@ -120,6 +120,7 @@ export const useSessionStore = defineStore("session", () => {
   type Reload = { token: number; dirty: boolean; promise: Promise<void> };
   let reload: Reload | null = null;
   const terminal = new Set(["completed", "stopped", "error", "interrupted"]);
+  const openRun = new Set(["pending", "running", "awaiting_confirmation"]);
 
   function resetStream(): void {
     if (activeStreamId != null) finishedStreamIds.add(activeStreamId);
@@ -131,7 +132,8 @@ export const useSessionStore = defineStore("session", () => {
   function confirmRun(next: number, status: string): boolean {
     if (next < runGeneration) return false;
     if (next > runGeneration) {
-      if (status !== "running" && status !== "pending" && !terminal.has(status)) return false;
+      // A run that waits for an approval is open too: a session can be opened in this state.
+      if (!openRun.has(status) && !terminal.has(status)) return false;
       epoch += 1;
       resetStream();
       finishedStreamIds = new Set();

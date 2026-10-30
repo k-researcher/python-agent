@@ -258,3 +258,11 @@ it("does not apply approvals before the matching messages arrive", async () => {
   expect(store.session?.revision).toBe(2);
   expect(store.context?.approximate_tokens).toBe(2);
 });
+
+it("opens a session that waits for an approval", async () => {
+  vi.mocked(api.session).mockResolvedValue(session(1, 2, "awaiting_confirmation"));
+  const store = useSessionStore();
+  await store.open("s");
+  expect(store.session?.id).toBe("s");
+  expect(store.session?.status).toBe("awaiting_confirmation");
+});
