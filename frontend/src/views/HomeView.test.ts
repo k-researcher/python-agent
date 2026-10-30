@@ -229,3 +229,17 @@ describe("HomeView", () => {
     expect(wrapper.get('[data-testid="composer-input"]').attributes("disabled")).toBeUndefined();
   });
 });
+
+it("selects an allowed external profile without model or CLI tuning", async () => {
+  const store = prepareStore();
+  store.config!.engine_profiles = [{ id: "personal", status: "available" }];
+  const create = vi.spyOn(store, "createSession").mockResolvedValue({ id: "native" } as never);
+  const wrapper = mount(HomeView, { global: { plugins: [router] } });
+  expect(wrapper.text()).toContain("Модель / внешний агент");
+  await wrapper.get('[data-testid="model-select"]').setValue("engine:personal");
+  expect(wrapper.find('[data-testid="composer-effort"]').exists()).toBe(false);
+  await wrapper.getComponent({ name: "Composer" }).vm.$emit("send", { text: "work", effort: "auto" });
+  await flushPromises();
+  expect(create).toHaveBeenCalledWith(expect.objectContaining({ engine_profile: "personal", llm_profile: undefined }));
+  wrapper.unmount();
+});

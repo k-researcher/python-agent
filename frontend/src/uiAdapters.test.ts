@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   toChatTimelineItems,
+  toChatApproval,
+  toChatToolResult,
   toChatMessage,
   toChatToolCallView,
   toChildSessions,
@@ -148,6 +150,15 @@ describe("layout adapters", () => {
       ],
     };
     expect(toModelOptions(config)).toEqual([{ id: "p1", label: "p1 · model-a" }]);
+    const checked = {
+      ...config,
+      llm_profiles: [
+        { name: "ok", model: "a", destination: "dst", configured: true, available: "ok" as const },
+        { name: "dead", model: "b", destination: "dst", configured: true, available: "failed" as const },
+        { name: "unchecked", model: "c", destination: "dst", configured: true, available: null },
+      ],
+    };
+    expect(toModelOptions(checked).map((option) => option.id)).toEqual(["ok", "unchecked"]);
     expect(toModelOptions(null)).toEqual([]);
   });
 
@@ -232,4 +243,11 @@ describe("layout adapters", () => {
     expect(tools.find((t) => t.name === "http_get")?.enabled).toBe(true);
     expect(tools.find((t) => t.name === "knowledge_search")?.enabled).toBe(false);
   });
+});
+
+it("keeps native patch and approval scope across the timeline adapter", () => {
+  const request = { id: "approval", tool_call_id: "call", tool_name: "write", arguments: {}, risk_level: "observed", status: "pending", comment: null, executor: "engine" as const, generation: 2, scope: "turn" as const, request_id: "native" };
+  const result = { success: true, patch: "+new", paths: ["a.txt"], status: "proposed" as const };
+  expect(toChatApproval(request)).toEqual(request);
+  expect(toChatToolResult(result)).toEqual(result);
 });

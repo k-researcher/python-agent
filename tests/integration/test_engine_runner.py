@@ -254,7 +254,7 @@ async def test_protocol_failure_is_terminal_without_retry(
         assert fake.closed.is_set()
 
 
-async def test_approval_denied_interrupts_without_waiting(tmp_path, monkeypatch):
+async def test_unknown_approval_denied_interrupts_without_waiting(tmp_path, monkeypatch):
     async with asyncio.timeout(4):
         fake = FakeEngine(
             [
@@ -263,7 +263,7 @@ async def test_approval_denied_interrupts_without_waiting(tmp_path, monkeypatch)
                     request_id="permission",
                     action="write",
                     parameters={},
-                    scope="turn",
+                    scope="session",
                 ),
                 DoneEvent(status="completed", reason=None),
             ]
@@ -272,9 +272,9 @@ async def test_approval_denied_interrupts_without_waiting(tmp_path, monkeypatch)
         await supervisor.run_job(sid, 1)
         session, _, turns, outcomes = await rows(sid)
         assert fake.answers == [("permission", "deny")]
-        assert fake.interrupts == ["native-turn"]
-        assert session.status == "interrupted" and "разрешен" in outcomes[0].reason
-        assert turns[0].outcome["status"] == "interrupted"
+        assert fake.interrupts == [turns[0].submission_id]
+        assert session.status == "error" and "Invalid approval" in outcomes[0].reason
+        assert turns[0].outcome["status"] == "error"
 
 
 @pytest.mark.parametrize("stop_kind", ["stop", "lease", "shutdown"])

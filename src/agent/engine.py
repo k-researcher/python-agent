@@ -137,6 +137,14 @@ class ApprovalEvent(EventEnvelope):
     scope: Literal["request", "turn"]
 
 
+@dataclass(frozen=True, kw_only=True)
+class UserInputEvent(EventEnvelope):
+    """Unsupported interactive input; the adapter sends an empty native answer."""
+
+    kind: Literal["user_input"] = field(default="user_input", init=False)
+    request_id: str
+
+
 type EngineEvent = (
     TextEvent
     | ReasoningEvent
@@ -148,6 +156,7 @@ type EngineEvent = (
     | ErrorEvent
     | DoneEvent
     | ApprovalEvent
+    | UserInputEvent
 )
 
 
@@ -159,6 +168,14 @@ class Engine(Protocol):
         self, thread: ThreadRef, input: str, submission_id: str
     ) -> AsyncIterator[EngineEvent]: ...
     async def answer(self, request_id: str, decision: Literal["allow", "deny"]) -> None: ...
+    async def answer_user_input(self, request_id: str) -> None: ...
     async def interrupt(self, turn_id: str) -> None: ...
     async def read_limits(self) -> Limits | None: ...
     async def close(self) -> None: ...
+
+
+@runtime_checkable
+class ApprovalCancellation(Protocol):
+    """Optional distinction between an operator rejection and run cancellation."""
+
+    async def cancel_approval(self, request_id: str) -> None: ...

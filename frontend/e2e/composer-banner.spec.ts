@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { ensureLeftPanelOpen, openApp, viewportWidthOf } from "./helpers";
+import { ensureLeftPanelOpen, expectNoHorizontalOverflow, openApp, viewportWidthOf } from "./helpers";
 
 async function assertComposerInsideMain(page: Page): Promise<void> {
   const composer = page.getByTestId("composer");
@@ -20,7 +20,7 @@ async function assertComposerInsideMain(page: Page): Promise<void> {
 
 for (const view of [{ name: "home", path: "/" }, { name: "session", path: "/s/s1" }]) {
   for (const shortViewport of [false, true]) {
-    test(`${view.name}: composer fits with settings notice${shortViewport ? " in short viewport" : ""}`, async ({ page }, testInfo) => {
+    test(`${view.name}: composer fits with a long draft${shortViewport ? " in short viewport" : ""}`, async ({ page }, testInfo) => {
       if (shortViewport) {
         await page.setViewportSize({ width: viewportWidthOf(testInfo), height: 480 });
       }
@@ -33,9 +33,6 @@ for (const view of [{ name: "home", path: "/" }, { name: "session", path: "/s/s1
       }
       await expect(page).toHaveURL(new URL(view.path, page.url()).href);
       await expect(page.getByTestId("composer-input")).toBeVisible();
-      await ensureLeftPanelOpen(page);
-      await page.getByRole("button", { name: "Настройки", exact: true }).click();
-      await expect(page.getByTestId("shell-notice")).toBeVisible();
       if (viewportWidthOf(testInfo) <= 760) {
         await page.locator('[data-toggle="left"]').click();
       }
@@ -47,3 +44,13 @@ for (const view of [{ name: "home", path: "/" }, { name: "session", path: "/s/s1
     });
   }
 }
+
+test("settings open the model screen", async ({ page }, testInfo) => {
+  await openApp(page, testInfo);
+  await ensureLeftPanelOpen(page);
+  await page.getByRole("button", { name: "Настройки", exact: true }).click();
+  await expect(page).toHaveURL(/\/settings\/models$/);
+  await expect(page.getByTestId("models-settings")).toBeVisible();
+  await expect(page.locator('[data-model="model-a"]')).toBeVisible();
+  await expectNoHorizontalOverflow(page);
+});

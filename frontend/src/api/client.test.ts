@@ -74,6 +74,26 @@ describe("api client request", () => {
     }
   });
 
+  it("joins a validation error list into one readable message", async () => {
+    stubFetch(async () =>
+      jsonResponse(422, {
+        detail: [
+          { loc: ["routing", "default"], msg: "Value error, unknown model reference" },
+          { msg: "Input should be greater than or equal to 4096" },
+          { nothing: true },
+        ],
+      }),
+    );
+    const error = await request("/api/settings/models/routing", { method: "PUT" }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    if (error instanceof ApiError) {
+      expect(error.status).toBe(422);
+      expect(error.message).toBe(
+        "routing.default: Value error, unknown model reference; Input should be greater than or equal to 4096",
+      );
+    }
+  });
+
   it("falls back to the HTTP status text when the body has no detail", async () => {
     stubFetch(async () => jsonResponse(500, { oops: true }));
     const error = await request("/api/nope").catch((e: unknown) => e);

@@ -7,6 +7,7 @@ import {
   mockMessages,
   mockSessions,
   mockContext,
+  routeSnapshot,
 } from "./helpers";
 
 test.describe("geometry polish", () => {
@@ -19,9 +20,7 @@ test.describe("geometry polish", () => {
   ]) {
     test(`compression metadata keeps its complete label and value (${stage})`, async ({ page }, testInfo) => {
       await openApp(page, testInfo);
-      await page.route("**/api/sessions/s1/context", (route) => route.fulfill({
-        json: { ...mockContext, stage },
-      }));
+      await routeSnapshot(page, "s1", "context", () => ({ ...mockContext, stage }));
       await page.goto("/s/s1");
       await ensureRightPanelOpen(page);
       const row = page.locator("[data-context-stage]").locator("..");
@@ -101,9 +100,7 @@ test.describe("geometry polish", () => {
   test("long session title keeps its tooltip and stays within the heading", async ({ page }, testInfo) => {
     const longTitle = "Очень длинный заголовок существующей сессии ".repeat(20);
     await openApp(page, testInfo);
-    await page.route("**/api/sessions/s1", (route) => route.fulfill({
-      json: { ...mockSessions[0], title: longTitle },
-    }));
+    await routeSnapshot(page, "s1", "session", () => ({ ...mockSessions[0], title: longTitle }));
     await ensureLeftPanelOpen(page);
     await page.locator('[data-node-key="n:s1"]').click();
     const title = page.getByTestId("session-title");
@@ -140,49 +137,37 @@ test.describe("geometry polish", () => {
     });
   });
 
-  test("long code scrolls inside pre with its copy button above the text", async ({ page }, testInfo) => {
+  test("long code wraps inside the block with its toolbar inside the corner", async ({ page }, testInfo) => {
     const longCode = "const value = '" + "a".repeat(1000) + "';";
     await openApp(page, testInfo);
-    await page.route("**/api/sessions/s1/messages", (route) => route.fulfill({
-      json: [{
+    await routeSnapshot(page, "s1", "messages", () => ([{
         ...mockMessages[0],
         id: 30,
         role: "assistant",
         kind: "normal",
         content: "```text\n" + longCode + "\n```",
-      }],
-    }));
+      }]));
     await page.goto("/s/s1");
     const block = page.locator(".code-block").first();
     const pre = block.locator("pre");
     await expect(pre).toBeVisible();
-    await expect(block.locator(".copy-btn")).toBeVisible();
     await expect(pre.locator("code")).toHaveText(longCode);
-    await expect.poll(() => pre.evaluate((element) => {
-      const toolbar = element.parentElement?.querySelector(".code-block__toolbar");
-      const button = toolbar?.querySelector(".copy-btn");
-      if (!toolbar || !button) return { connected: element.isConnected, toolbarPresent: false };
-      const preTop = element.getBoundingClientRect().top;
+    await block.hover();
+    await expect(block.locator(".copy-btn")).toBeVisible();
+    const geometry = () => pre.evaluate((element) => {
+      const button = element.parentElement?.querySelector(".copy-btn");
+      if (!button) return null;
+      const box = element.getBoundingClientRect();
+      const btn = button.getBoundingClientRect();
       return {
-        connected: element.isConnected,
-        toolbarPresent: true,
-        overflowing: element.scrollWidth > element.clientWidth,
-        siblings: toolbar.parentElement === element.parentElement,
-        toolbarBefore: element.previousElementSibling === toolbar,
-        toolbarAbove: toolbar.getBoundingClientRect().bottom <= preTop + 1,
-        buttonAbove: button.getBoundingClientRect().bottom <= preTop + 1,
-        overflowX: getComputedStyle(element).overflowX,
+        overflowing: element.scrollWidth > element.clientWidth + 1,
+        buttonInside: btn.top >= box.top && btn.right <= box.right + 1 && btn.bottom <= box.bottom,
+        whiteSpace: getComputedStyle(element).whiteSpace,
       };
-    })).toEqual({
-      connected: true,
-      toolbarPresent: true,
-      overflowing: true,
-      siblings: true,
-      toolbarBefore: true,
-      toolbarAbove: true,
-      buttonAbove: true,
-      overflowX: "auto",
     });
+    await expect.poll(geometry).toEqual({ overflowing: false, buttonInside: true, whiteSpace: "pre-wrap" });
+    await block.locator(".wrap-btn").click();
+    await expect.poll(geometry).toEqual({ overflowing: true, buttonInside: true, whiteSpace: "pre" });
     await expectNoHorizontalOverflow(page);
     await testInfo.attach("long-code", {
       body: await page.screenshot(),

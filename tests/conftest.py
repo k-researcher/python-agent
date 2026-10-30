@@ -34,6 +34,46 @@ os.environ["AGENT_ALLOWED_HOSTS"] = '["testserver", "localhost", "127.0.0.1"]'
 os.environ["AGENT_EXTRA_ORIGINS"] = '["http://testserver"]'
 
 
+def _worker_postgres_database() -> None:
+    """Give each parallel test worker its own empty PostgreSQL database.
+
+    The PostgreSQL race and migration tests build their schema in the database of
+    RUN_FINISH_TEST_POSTGRES_URL. Parallel workers must not share it.
+    """
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    url = os.environ.get("RUN_FINISH_TEST_POSTGRES_URL")
+    if not worker or not url:
+        return
+    from sqlalchemy.engine import make_url
+
+    base = make_url(url)
+    name = f"{base.database}_{worker}"
+
+    async def recreate() -> None:
+        import asyncpg
+
+        connection = await asyncpg.connect(
+            host=base.host,
+            port=base.port,
+            user=base.username,
+            password=base.password,
+            database=base.database,
+        )
+        try:
+            await connection.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+            await connection.execute(f'CREATE DATABASE "{name}"')
+        finally:
+            await connection.close()
+
+    asyncio.run(recreate())
+    os.environ["RUN_FINISH_TEST_POSTGRES_URL"] = base.set(database=name).render_as_string(
+        hide_password=False
+    )
+
+
+_worker_postgres_database()
+
+
 def backup_database(source_path: Path, target_path: Path, *, timeout: float = 5) -> None:
     """Bound SQLite backup retries, which ignore the connection busy timeout."""
     deadline = time.monotonic() + timeout

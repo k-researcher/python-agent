@@ -33,10 +33,11 @@ from agent.events import (
     CURRENT_STREAMS,
     PendingEvent,
     StreamPublisher,
-    StreamRun,
     add_event,
+    broker,
     emit_event,
     publish,
+    resume_stream_run,
 )
 from agent.inference_guard import (
     CURRENT_RUN_GUARD,
@@ -60,6 +61,7 @@ from agent.models import (
     Project,
     Session,
     SessionInbox,
+    SessionRunOutcome,
     SessionStatus,
     ToolCall,
     ToolCallStatus,
@@ -135,6 +137,12 @@ def _batch_result(outcome: BatchResult) -> dict[str, Any]:
 # A cut-off reply or a broken stream is retried this many times in a row before the run fails.
 MAX_CUT_OFF_REPLIES = 2
 MAX_STREAM_RETRIES = 2
+MAX_INVALID_CALL_REPLIES = 2
+INVALID_CALL_NOTICE = (
+    "Служебное уведомление агента: предыдущий ответ модели содержит некорректный вызов "
+    "инструмента и не использован, инструменты из него не запускались. Повтори шаг: укажи "
+    "имя инструмента из списка и аргументы строго по его схеме."
+)
 CUT_OFF_NOTICE = (
     "Служебное уведомление агента: предыдущий ответ модели обрезан лимитом вывода и не "
     "использован, инструменты из него не запускались. Сделай шаг меньше: запиши большой файл "
@@ -199,6 +207,8 @@ class AgentSupervisor:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         # The generation that each task in _tasks was scheduled for (None: not known).
         self._task_generation: dict[str, int | None] = {}
+        # A waited child's continuation uses its parent's slot, including after approval.
+        self._waited_children: set[str] = set()
         # Tasks of older generations that still finish, with their session; kept referenced
         # until they end, and cancelled by Stop of the session and by shutdown.
         self._finishing: dict[asyncio.Task[None], str] = {}
@@ -584,6 +594,8 @@ class AgentSupervisor:
         comment: str | None,
         *,
         actor_user_id: str | None = None,
+        generation: int | None = None,
+        executor: str | None = None,
     ) -> str:
         async with session_factory() as db:
             session_id = await db.scalar(
@@ -595,8 +607,19 @@ class AgentSupervisor:
                 raise LookupError("Approval not found")
             record = await db.get(Session, session_id)
             if record is not None and record.engine_profile is not None:
-                await check_engine_access(db, self.settings, record, actor_user_id)
-                raise ValueError("engine недоступен")
+                from agent.engine_approvals import resolve_native
+
+                return await resolve_native(
+                    db,
+                    self.settings,
+                    record,
+                    approval_id,
+                    decision,
+                    comment,
+                    actor_user_id,
+                    generation,
+                    executor,
+                )
             await db.execute(select(Session).where(Session.id == session_id).with_for_update())
             query = (
                 select(Approval)
@@ -722,7 +745,11 @@ class AgentSupervisor:
     ) -> None:
         token = CURRENT_FENCE.set(None)
         try:
-            async with self._semaphore if use_slot else nullcontext():
+            async with (
+                self._semaphore
+                if use_slot and session_id not in self._waited_children
+                else nullcontext()
+            ):
                 await self._execute_run(session_id, generation, owned_fence)
         finally:
             CURRENT_FENCE.reset(token)
@@ -744,9 +771,11 @@ class AgentSupervisor:
             generation is not None and fence.generation != generation
         ):
             raise FenceLostError("The fence does not belong to this run")
+        async with session_factory() as db:
+            stream_run = await resume_stream_run(db, session_id, fence.generation)
         run_guard_token = CURRENT_RUN_GUARD.set(None)
         token = CURRENT_FENCE.set(fence)
-        stream_token = CURRENT_STREAMS.set(StreamRun(fence.generation))
+        stream_token = CURRENT_STREAMS.set(stream_run)
         run = asyncio.current_task()
         keeper = asyncio.create_task(self._keep_lease(fence, run), name=f"lease-{session_id}")
         try:
@@ -1005,6 +1034,20 @@ class AgentSupervisor:
         if publisher is not None:
             await publisher.reset()
 
+    def _invalid_call(
+        self, calls: list[dict[str, Any]], mode: str, model_ids: list[str]
+    ) -> str | None:
+        """Return the reason of the first invalid tool call, for the model to correct it."""
+        for call in calls:
+            fn = call["function"]
+            try:
+                self._tools.validate(
+                    fn["name"], mode, arguments_object(fn["arguments"]), model_ids=model_ids
+                )
+            except Exception as error:
+                return f"{fn['name']}: {error}"[:500]
+        return None
+
     async def _infer_logical(
         self,
         session_id: str,
@@ -1032,6 +1075,7 @@ class AgentSupervisor:
         decisions: dict[str, ReasoningDecision],
     ) -> InferenceResult | None:
         cut_offs = 0
+        invalid_replies = 0
         session_id = session.id
         original_decisions = decisions
         while True:
@@ -1168,19 +1212,50 @@ class AgentSupervisor:
                 if not allowed:
                     return None
                 continue
-            for call in response.tool_calls:
-                fn = call["function"]
-                try:
-                    self._tools.validate(
-                        fn["name"],
-                        session.mode,
-                        arguments_object(fn["arguments"]),
-                        model_ids=models.ids(),
+            problem = self._invalid_call(response.tool_calls, session.mode, models.ids())
+            if problem is not None:
+                # Like a cut-off reply: keep it for diagnosis, run nothing from it, and let
+                # the model correct the call in the next inference.
+                db.add(
+                    Message(
+                        session_id=session.id,
+                        role="assistant",
+                        kind="interrupted",
+                        content=response.content,
+                        tool_calls=[_history_safe_call(c) for c in normalized_calls] or None,
+                        token_count=response.completion_tokens or None,
+                        reasoning_content=response.reasoning,
+                        reasoning_effort=reasoning_effort,
                     )
-                except Exception as error:
+                )
+                invalid_replies += 1
+                if invalid_replies > MAX_INVALID_CALL_REPLIES:
+                    await db.commit()
                     raise guard_error(
                         LLMErrorKind.invalid_response, "Некорректный вызов инструмента"
-                    ) from error
+                    )
+                await append_message(
+                    db, session.id, role="user", content=f"{INVALID_CALL_NOTICE} Причина: {problem}"
+                )
+                await db.commit()
+                await self._reset_inference_stream(outcome.publisher)
+                await emit_event(
+                    db,
+                    "inference.retry",
+                    {
+                        "reason": "invalid_tool_call",
+                        "model_id": outcome.model.id,
+                        "retry": invalid_replies,
+                    },
+                    session.id,
+                )
+                allowed = await self._enforce_budget_before_step(
+                    db, session.id, session.run_generation or 0
+                )
+                await db.commit()
+                if not allowed:
+                    return None
+                continue
             return outcome
 
     async def _run_session(self, session_id: str) -> None:
@@ -1968,6 +2043,12 @@ class AgentSupervisor:
             assert fresh_parent is not None
             child.inbox_hop = fresh_parent.inbox_hop
             child.notify_generation = None if wait else 1
+            events: list[PendingEvent] = []
+            if wait and fresh_parent.status != SessionStatus.running.value:
+                fresh_parent.status = SessionStatus.running.value
+                events.append(
+                    await add_event(db, "session.status", {"status": "running"}, parent.id)
+                )
             created_event = await add_event(
                 db,
                 "session.child_created",
@@ -1983,10 +2064,10 @@ class AgentSupervisor:
                     raise FenceLostError("The new child run could not be claimed")
             else:
                 await db.commit()
-            await publish([created_event])
+            await publish([*events, created_event])
 
-        stopped = False
         if wait:
+            self._waited_children.add(child_id)
             # Register the waited run, so that a Stop of the child cancels it.
             task = asyncio.create_task(
                 self._run_guarded(child_id, 1, use_slot=False, owned_fence=child_fence),
@@ -1995,43 +2076,100 @@ class AgentSupervisor:
             self._tasks[child_id] = task
             self._task_generation[child_id] = 1
             try:
-                done, _pending = await asyncio.wait(
-                    {task}, timeout=self.settings.max_child_wait_seconds
-                )
-                if not done:
-                    await self.stop(child_id)
-                    raise RuntimeError("Child agent exceeded its wait timeout")
+                await self._wait_child_terminal(parent.id, child_id, task)
+            except BudgetExceeded:
+                await self.stop_scoped(child_id, 1)
+                raise
             except asyncio.CancelledError:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                await self.stop_scoped(child_id, 1)
                 raise
             finally:
-                if self._tasks.get(child_id) is task:
+                self._waited_children.discard(child_id)
+                if self._tasks.get(child_id) is task and task.done():
                     del self._tasks[child_id]
-            # Stop commits the terminal state before it cancels the run.
-            stopped = task.cancelled()
-            failure = None if stopped else task.exception()
-            if failure is not None:
-                raise failure
         else:
             await self.start(child_id, new_run=False, expected_generation=1)
 
         async with session_factory() as db:
             child_record = await db.get(Session, child_id)
-            final_message = (
-                await db.execute(
+            answers = (
+                await db.scalars(
                     select(Message)
-                    .where(Message.session_id == child_id, Message.role == "assistant")
+                    .where(
+                        Message.session_id == child_id,
+                        Message.role == "assistant",
+                        Message.run_generation == 1,
+                        Message.kind == "normal",
+                        Message.skipped.is_(False),
+                    )
                     .order_by(Message.id.desc())
-                    .limit(1)
                 )
-            ).scalar_one_or_none()
+            ).all()
+            final_message = next(
+                (row for row in answers if not row.tool_calls and (row.content or "").strip()),
+                None,
+            )
             status = child_record.status if child_record else "missing"
-            if stopped and status not in TERMINAL_STATUSES:
-                status = SessionStatus.stopped.value
+            outcome = await db.get(SessionRunOutcome, (child_id, 1))
+            if outcome is not None:
+                status = outcome.status
             return {
                 "session_id": child_id,
                 "status": status,
                 "llm_profile": child_record.llm_profile if child_record else selected_profile,
                 "response": final_message.content if final_message else None,
             }
+
+    async def _wait_child_terminal(
+        self, parent_id: str, child_id: str, initial: asyncio.Task[None]
+    ) -> None:
+        """Wait across approvals without returning an unfinished tool call as an answer."""
+        loop = asyncio.get_running_loop()
+        remaining = float(self.settings.max_child_wait_seconds)
+        checked_at = loop.time()
+        paused = False
+        async with broker.subscribe() as updates:
+            while True:
+                async with session_factory() as db:
+                    child = await db.get(Session, child_id)
+                    outcome = await db.get(SessionRunOutcome, (child_id, 1))
+                    await self._check_tool_budget(db, parent_id)
+                if outcome is not None:
+                    return
+                if child is None or child.run_generation != 1:
+                    raise RuntimeError("The waited child run is no longer available")
+                if child.status in TERMINAL_STATUSES:
+                    return
+                current = self._tasks.get(child_id, initial)
+                if current.done() and not current.cancelled():
+                    failure = current.exception()
+                    if failure is not None:
+                        raise failure
+                now = loop.time()
+                awaiting_approval = child.status == SessionStatus.awaiting_confirmation.value
+                if not paused and not awaiting_approval:
+                    remaining -= now - checked_at
+                checked_at = now
+                paused = awaiting_approval
+                if not paused and remaining <= 0:
+                    await self.stop_scoped(child_id, 1)
+                    raise RuntimeError("Child agent exceeded its wait timeout")
+                # Events wake the waiter promptly. A slow fallback also covers a lost
+                # publish and another worker, without polling human approvals in a loop.
+                delay = 1.0 if paused else min(0.5, max(0, remaining))
+                try:
+                    async with asyncio.timeout(delay):
+                        while True:
+                            event = await updates.get()
+                            if event.get("session_id") in {child_id, parent_id} and event.get(
+                                "type"
+                            ) in {
+                                "session.status",
+                                "session.error",
+                                "approval.required",
+                                "approval.resolved",
+                                "approval.cancelled",
+                            }:
+                                break
+                except TimeoutError:
+                    pass

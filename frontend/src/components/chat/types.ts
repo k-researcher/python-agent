@@ -16,6 +16,11 @@ export interface ChatMessage {
 
 /** A tool approval request (structurally compatible with the backend Approval). */
 export interface Approval {
+  executor?: "python" | "engine";
+  generation?: number | null;
+  scope?: "request" | "turn";
+  request_id?: string | null;
+  expires_at?: string | null;
   id: string;
   tool_call_id: string;
   tool_name: string;
@@ -35,6 +40,9 @@ export type ToolStatus =
 
 /** Result of one tool call, taken from the matching role="tool" message. */
 export interface ToolResult {
+  patch?: string;
+  paths?: string[];
+  status?: "proposed" | "applied";
   success: boolean;
   output?: unknown;
   error?: string;

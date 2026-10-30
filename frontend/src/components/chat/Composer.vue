@@ -142,7 +142,7 @@ function send(): void {
     <Teleport :to="controlsHost ?? 'body'" :disabled="!controlsHost">
     <div class="controls" :class="{ 'controls--hosted': controlsHost }" role="group" aria-label="Параметры агента" data-testid="agent-controls">
       <slot name="options" />
-      <label class="agent-control effort">
+      <label v-if="efforts.length" class="agent-control effort">
         <span>Рассуждения</span>
         <select v-model="effort" :disabled="busy" aria-label="Уровень рассуждений" data-testid="composer-effort">
           <option v-for="level in efforts" :key="level" :value="level">{{ reasoningLabel(level) }}</option>
@@ -225,7 +225,7 @@ button.send:disabled {
 
 button.stop {
   background: var(--danger, #dc2626);
-  color: #fff;
+  color: var(--accent-contrast, #fff);
   border-color: var(--danger, #dc2626);
 }
 

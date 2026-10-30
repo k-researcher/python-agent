@@ -76,12 +76,12 @@ describe("extractLanguage", () => {
 describe("highlightCodeBlocks", () => {
   it("returns html unchanged when it has no code blocks", async () => {
     const input = "<p>без кода</p>";
-    await expect(highlightCodeBlocks(input, false)).resolves.toBe(input);
+    await expect(highlightCodeBlocks(input)).resolves.toBe(input);
   });
 
   it("highlights a known language and keeps the source readable", async () => {
     const input = "<pre><code class=\"language-js\">const x = 1</code></pre>";
-    const out = await highlightCodeBlocks(input, false);
+    const out = await highlightCodeBlocks(input);
     expect(out).toContain("shiki");
     expect(out).toContain("const");
   });
@@ -90,7 +90,7 @@ describe("highlightCodeBlocks", () => {
     // DOMPurify-based environs may drop the <pre> wrapper; normalization
     // must restore it so the block is still highlighted.
     const input = "<code class=\"language-js\">let a = 1</code>";
-    const out = await highlightCodeBlocks(input, false);
+    const out = await highlightCodeBlocks(input);
     const container = document.createElement("div");
     container.innerHTML = out;
     expect(container.querySelector("pre.shiki")).not.toBeNull();
@@ -99,26 +99,16 @@ describe("highlightCodeBlocks", () => {
 
   it("keeps a plain block when the language cannot be highlighted", async () => {
     const input = "<pre><code class=\"language-definitely-not-a-real-lang\">tmp</code></pre>";
-    const out = await highlightCodeBlocks(input, false);
+    const out = await highlightCodeBlocks(input);
     expect(out).toContain("tmp");
   });
 
-  it("emits both light and dark theme styles for a code block", async () => {
+  it("uses the same soft dark theme as the tool cards", async () => {
     const input = "<pre><code class=\"language-js\">const y = 2</code></pre>";
-    const out = await highlightCodeBlocks(input, true);
-    expect(out).toContain("github-light");
-    expect(out).toContain("github-dark");
-  });
-
-  it("tags the active theme so light and dark are selectable per render", async () => {
-    const input = "<pre><code class=\"language-js\">const z = 3</code></pre>";
-    const light = await highlightCodeBlocks(input, false);
-    const dark = await highlightCodeBlocks(input, true);
-    // Both renders carry both theme classes (dual-theme shiki output), but
-    // only the requested theme is marked active.
-    expect(/shiki-themes github-light github-dark/.test(light)).toBe(true);
-    expect(/shiki-themes github-light github-dark/.test(dark)).toBe(true);
-    expect(light).toContain('data-active-theme="light"');
-    expect(dark).toContain('data-active-theme="dark"');
+    const out = await highlightCodeBlocks(input);
+    expect(out).toContain("github-dark-dimmed");
+    expect(out).not.toContain("github-light");
+    // The app tokens set the background, so the theme's inline colours are dropped.
+    expect(out).not.toContain("background-color");
   });
 });

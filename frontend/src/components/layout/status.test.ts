@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sessionStatusLabel, statusDotClass } from "./status";
+import { auditStatusLabel, sessionStatusLabel, statusDotClass, statusTone } from "./status";
 
 describe("statusDotClass", () => {
   it("maps the spec statuses to their dedicated dot classes", () => {
@@ -36,5 +36,26 @@ describe("sessionStatusLabel", () => {
 
   it.each(["", "future_status", "constructor", "__proto__"])("handles unknown %s", (status) => {
     expect(sessionStatusLabel(status)).toBe("Неизвестный статус");
+  });
+});
+
+describe("auditStatusLabel", () => {
+  it("translates the outbound request statuses and keeps an unknown one as it is", () => {
+    expect(auditStatusLabel("started")).toBe("Идёт");
+    expect(auditStatusLabel("completed")).toBe("Выполнено");
+    expect(auditStatusLabel("error")).toBe("Ошибка");
+    expect(auditStatusLabel("cancelled")).toBe("Отменено");
+    expect(auditStatusLabel("ok")).toBe("ok");
+  });
+});
+
+describe("statusTone", () => {
+  it("gives each known status its colour and leaves the others grey", () => {
+    expect(statusTone("running")).toEqual({ "--status-color": "var(--info)" });
+    expect(statusTone("completed")).toEqual({ "--status-color": "var(--success)" });
+    expect(statusTone("error")).toEqual({ "--status-color": "var(--danger)" });
+    expect(statusTone("awaiting_confirmation")).toEqual({ "--status-color": "var(--warning)" });
+    expect(statusTone("stopped")).toEqual({});
+    expect(statusTone("constructor")).toEqual({});
   });
 });

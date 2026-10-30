@@ -5,6 +5,7 @@ import { ApiError } from "./api/client";
 import LoginView from "./views/LoginView.vue";
 import HomeView from "./views/HomeView.vue";
 import SessionView from "./views/SessionView.vue";
+import SettingsModelsView from "./views/SettingsModelsView.vue";
 
 let authenticated: boolean | null = null;
 let authGeneration = 0;
@@ -61,6 +62,7 @@ export const router = createRouter({
   routes: [
     { path: "/", name: "home", component: HomeView },
     { path: "/s/:id", name: "session", component: SessionView, props: true },
+    { path: "/settings/models", name: "settings-models", component: SettingsModelsView },
     { path: "/login", name: "login", component: LoginView },
     { path: "/:pathMatch(.*)*", redirect: { name: "home" } },
   ],

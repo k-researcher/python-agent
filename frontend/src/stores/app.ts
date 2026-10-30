@@ -68,6 +68,14 @@ export const useAppStore = defineStore("app", () => {
     reconcileProject();
   }
 
+  /** Read the public config again, for example after the model settings change. */
+  async function loadConfig(): Promise<void> {
+    const expectedGeneration = generation;
+    const cfg = await api.config();
+    if (expectedGeneration !== generation) return;
+    config.value = cfg;
+  }
+
   async function createProject(name: string, rootPath: string): Promise<Project> {
     const expectedGeneration = generation;
     const project = await api.createProject(name, rootPath);
@@ -144,6 +152,7 @@ export const useAppStore = defineStore("app", () => {
     selectedProjectId,
     reset,
     load,
+    loadConfig,
     createProject,
     createSession,
     sessionTree,

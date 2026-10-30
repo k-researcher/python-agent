@@ -6,6 +6,8 @@ from pathlib import Path
 from fastapi.responses import FileResponse, JSONResponse
 
 SESSION_ROUTE = re.compile(r"s/[A-Za-z0-9_-]+\Z")
+# Client routes without a parameter; a direct link or a reload of them gets the app page.
+APP_ROUTES = frozenset({"login", "settings/models"})
 
 
 def frontend_response(directory: Path, path: str) -> FileResponse | JSONResponse:
@@ -15,7 +17,7 @@ def frontend_response(directory: Path, path: str) -> FileResponse | JSONResponse
         candidate.relative_to(root)
         if path and candidate.is_file():
             return FileResponse(candidate)
-        if path and path != "login" and SESSION_ROUTE.fullmatch(path) is None:
+        if path and path not in APP_ROUTES and SESSION_ROUTE.fullmatch(path) is None:
             return JSONResponse({"detail": "Not found"}, status_code=404)
         index = (root / "index.html").resolve(strict=True)
         index.relative_to(root)

@@ -66,13 +66,26 @@ watch(
 
 // Session header data
 const session = computed(() => sessionStore.session);
+const waitingChildren = computed(() => sessionStore.children.filter(
+  child => child.status === "awaiting_confirmation",
+));
 const timelineItems = computed(() => toChatTimelineItems(sessionStore.timeline));
+const external = computed(() => !!session.value?.engine_profile);
 const modelLabel = computed(() => {
+  if (external.value) return `Внешний агент · ${session.value?.engine_profile}`;
   const profile = appStore.config?.llm_profiles.find((model) => model.name === session.value?.llm_profile);
   return profile ? `${profile.name} · ${profile.model}` : session.value?.llm_profile ?? "По умолчанию";
 });
 const modeLabel = computed(() => resolveModeLabel(session.value?.mode));
-const modelSummary = computed(() => appStore.config?.llm_profiles.find((model) => model.name === session.value?.llm_profile)?.model ?? session.value?.llm_profile ?? "По умолчанию");
+const engineHealthLabel = computed(() => {
+  const health = session.value?.engine_state?.health;
+  if (health?.diagnostic) return health.diagnostic;
+  if (["available", "ready"].includes(health?.status ?? "")) return "Внешний агент доступен";
+  if (health?.status === "unknown") return "Состояние внешнего агента не проверено";
+  return "engine недоступен";
+});
+const engineUsage = computed(() => session.value?.engine_state?.usage);
+const modelSummary = computed(() => external.value ? modelLabel.value : appStore.config?.llm_profiles.find((model) => model.name === session.value?.llm_profile)?.model ?? session.value?.llm_profile ?? "По умолчанию");
 
 const busy = computed(() => {
   if (isSending.value) return true;
@@ -82,6 +95,7 @@ const busy = computed(() => {
 });
 
 const efforts = computed<string[]>(() => {
+  if (external.value) return [];
   const profile = appStore.config?.llm_profiles.find(
     (p) => p.name === session.value?.llm_profile,
   );
@@ -140,7 +154,7 @@ async function onSend(payload: SendPayload): Promise<void> {
   try {
     await sessionStore.send(
       pendingText,
-      payload.effort !== "auto" ? payload.effort : undefined,
+      !external.value && payload.effort !== "auto" ? payload.effort : undefined,
     );
     clearDraft();
   } catch (cause) {
@@ -192,15 +206,35 @@ function onOpenChild(id: string): void {
           :model-label="modelSummary"
           :role-label="modeLabel"
           :effort="selectedEffort"
+          :external="external"
         />
         </div>
         <div class="session-meta">
-          <span class="session-status" :data-status="session.status" data-testid="session-status">{{ sessionStatusLabel(session.status) }}</span>
+          <span class="session-status status-pill" :data-status="session.status" data-testid="session-status">{{ sessionStatusLabel(session.status) }}</span>
         </div>
+        <p v-if="external" data-testid="engine-health">{{ engineHealthLabel }}</p>
+        <p v-if="external && engineUsage" data-testid="engine-usage">
+          Вход: {{ engineUsage.input_tokens ?? "неизвестно" }} ·
+          Выход: {{ engineUsage.output_tokens ?? "неизвестно" }} ·
+          Кэш: {{ engineUsage.cache_tokens ?? "неизвестно" }} ·
+          Стоимость: {{ engineUsage.reported_cost ?? "неизвестна" }}{{ engineUsage.estimated_cost && engineUsage.reported_cost != null ? " (оценка)" : "" }}
+        </p>
         <p v-if="session.error" class="session-error" data-testid="session-error">
           {{ session.error }}
         </p>
       </header>
+
+      <div v-if="waitingChildren.length" class="child-waiting" role="status" data-testid="child-waiting">
+        <p>Дочерние агенты ждут вашего подтверждения. Откройте запрос и проверьте действие.</p>
+        <button v-for="child in waitingChildren" :key="child.id" type="button"
+          class="child-waiting__link" @click="onOpenChild(child.id)">
+          Открыть запрос: {{ child.title }}
+        </button>
+      </div>
+      <button v-if="session.parent_id" type="button" class="parent-link"
+        data-testid="parent-session" @click="onOpenChild(session.parent_id)">
+        К родительской сессии
+      </button>
 
       <ChatTimeline
         v-if="timelineItems.length > 0 || sessionStore.streaming"
@@ -227,7 +261,7 @@ function onOpenChild(id: string): void {
       >
         <template #options>
           <div class="agent-control" title="Модель задаётся при создании сессии">
-            <span>Модель</span>
+            <span>{{ external ? "Внешний агент" : "Модель" }}</span>
             <span class="agent-value" data-testid="session-profile">{{ modelLabel }}</span>
           </div>
           <div class="agent-control" title="Роль задаётся при создании сессии">
@@ -269,6 +303,27 @@ function onOpenChild(id: string): void {
   border-bottom: 1px solid var(--border);
 }
 
+.child-waiting {
+  flex-shrink: 0;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-subtle);
+}
+.child-waiting p { margin: 0 0 6px; }
+.child-waiting__link, .parent-link {
+  display: block;
+  max-width: 100%;
+  padding: 6px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  text-decoration: underline;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.parent-link { margin: 0 16px; flex-shrink: 0; }
+
 .session-heading {
   display: flex;
   flex-wrap: wrap;
@@ -297,39 +352,20 @@ function onOpenChild(id: string): void {
   color: var(--text-muted);
 }
 
-.session-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 1px 8px;
-  border-radius: 999px;
-  background: var(--bg-subtle);
-  color: var(--text);
-}
-
-.session-status::before {
-  content: "";
-  flex: none;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--session-status-color, var(--text-muted));
-}
-
 .session-status[data-status="running"] {
-  --session-status-color: var(--info);
+  --status-color: var(--info);
 }
 
 .session-status[data-status="awaiting_confirmation"] {
-  --session-status-color: var(--warning);
+  --status-color: var(--warning);
 }
 
 .session-status[data-status="completed"] {
-  --session-status-color: var(--success);
+  --status-color: var(--success);
 }
 
 .session-status[data-status="error"] {
-  --session-status-color: var(--danger);
+  --status-color: var(--danger);
 }
 
 .session-error {

@@ -312,6 +312,11 @@ class Approval(Base):
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    executor: Mapped[str] = mapped_column(String(20), default="python", server_default="python")
+    scope: Mapped[str] = mapped_column(String(20), default="request", server_default="request")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     tool_call: Mapped[ToolCall] = relationship(back_populates="approval")
 

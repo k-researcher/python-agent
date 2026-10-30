@@ -28,6 +28,15 @@ export function setCsrfToken(value: string): void {
 
 const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
+/** A validation error comes as a list of {loc, msg}; join it into one readable line. */
+function validationText(detail: unknown): string | null {
+  if (!Array.isArray(detail)) return null;
+  const parts = detail
+    .filter((item): item is { loc?: unknown; msg: string } => typeof item?.msg === "string")
+    .map((item) => (Array.isArray(item.loc) && item.loc.length ? `${item.loc.join(".")}: ${item.msg}` : item.msg));
+  return parts.length ? parts.join("; ") : null;
+}
+
 export async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const method = (options?.method ?? "GET").toUpperCase();
   const response = await fetch(url, {
@@ -41,7 +50,7 @@ export async function request<T>(url: string, options?: RequestInit): Promise<T>
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ detail: response.statusText }));
-    const detail = typeof body.detail === "string" ? body.detail : null;
+    const detail = typeof body.detail === "string" ? body.detail : validationText(body.detail);
     throw new ApiError(detail ?? `HTTP ${response.status}`, response.status);
   }
   if (response.status === 204) return undefined as T;
@@ -136,10 +145,11 @@ export const api = {
     approvalId: string,
     decision: "approve" | "reject",
     comment?: string,
+    identity?: { generation: number | null; executor: "engine" },
   ): Promise<{ session_id: string; decision: string }> =>
     request(`/api/approvals/${approvalId}`, {
       method: "POST",
-      body: JSON.stringify({ decision, comment: comment || null }),
+      body: JSON.stringify({ decision, comment: comment || null, ...identity }),
     }),
   stop: (sessionId: string): Promise<{ stopped: boolean }> =>
     request(`/api/sessions/${sessionId}/stop`, { method: "POST" }),

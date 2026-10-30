@@ -1,0 +1,10 @@
+[
+  {"type":"stream_event","session_id":"session-1","parent_tool_use_id":null,"event":{"type":"message_start","message":{"id":"message-1","role":"assistant","content":[]}}},
+  {"type":"stream_event","session_id":"session-1","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}},
+  {"type":"stream_event","session_id":"session-1","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Check"}}},
+  {"type":"stream_event","session_id":"session-1","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}},
+  {"type":"stream_event","session_id":"session-1","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello"}}},
+  {"type":"assistant","session_id":"session-1","parent_tool_use_id":null,"message":{"id":"message-1","role":"assistant","content":[{"type":"thinking","thinking":"Check","signature":"opaque"},{"type":"text","text":"Hello"},{"type":"tool_use","id":"tool-1","name":"Read","input":{"file_path":"a.txt"}}]}},
+  {"type":"user","session_id":"session-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":[{"type":"text","text":"contents"}],"is_error":false}]}},
+  {"type":"rate_limit_event","session_id":"session-1","rate_limit_info":{"status":"allowed_warning","resetsAt":2000000000,"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":0.25,"resetsAt":2000000000,"status":"allowed"},"seven_day":{"utilization":1,"resetsAt":2000500000,"status":"rejected"}}}}
+]

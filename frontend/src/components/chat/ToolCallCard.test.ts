@@ -22,6 +22,25 @@ function mountCard(call: ToolCallView, extraProps: Record<string, unknown> = {})
 }
 
 describe("ToolCallCard", () => {
+  it.each([
+    ["read_file", "read"],
+    ["list_dir", "read"],
+    ["glob", "search"],
+    ["search_files", "search"],
+    ["write_file", "edit"],
+    ["edit_file", "edit"],
+    ["multi_edit", "edit"],
+    ["remove_file", "remove"],
+    ["shell", "shell"],
+    ["run_agent", "agent"],
+    ["http_get", "web"],
+    ["knowledge_search", "knowledge"],
+    ["mcp__server__tool", "other"],
+  ])("shows the %s call with the %s icon", (name, kind) => {
+    const wrapper = mountCard(makeCall({ name }));
+    expect(wrapper.get('[data-testid="tool-icon"]').attributes("data-kind")).toBe(kind);
+  });
+
   it("shows the brief argument for a shell call", () => {
     const wrapper = mountCard(makeCall({ name: "shell", arguments: { command: "npm test" } }));
     expect(wrapper.get('[data-testid="tool-brief"]').text()).toContain("npm test");
@@ -120,6 +139,7 @@ describe("ToolCallCard", () => {
     expect(wrapper.get('[data-testid="shell-stdout"]').text()).toContain("built");
     expect(wrapper.get('[data-testid="shell-stderr"]').text()).toContain("warn");
     expect(wrapper.get('[data-testid="shell-exit"]').text()).toContain("2");
+    expect(wrapper.get('[data-testid="shell-command"]').text()).toBe("$ make");
   });
 
   it("shows the old -> new line diff for edit_file", async () => {
@@ -214,5 +234,55 @@ describe("ToolCallCard", () => {
     expect(wrapper.find('[data-testid="tool-detail"]').exists()).toBe(true);
     await wrapper.get('[data-testid="tool-call"] .tool-head').trigger("click");
     expect(wrapper.find('[data-testid="tool-detail"]').exists()).toBe(false);
+  });
+});
+
+it("renders a neutral patch with its actual application status", async () => {
+  const wrapper = mountCard(makeCall({
+    name: "engine.diff", status: "completed",
+    result: { success: true, patch: "+new\n-old", paths: ["a.txt"], status: "proposed" },
+  }));
+  await wrapper.get('.tool-head').trigger("click");
+  expect(wrapper.get('[data-testid="engine-patch"]').text()).toContain("+new");
+  expect(wrapper.text()).toContain("Предложено");
+  expect(wrapper.text()).toContain("a.txt");
+});
+
+it("labels a turn-scoped approval and forwards only that request", async () => {
+  const wrapper = mountCard(makeCall({ status: "awaiting_approval", approval: {
+    id: "native", tool_call_id: "call", tool_name: "write", arguments: {}, risk_level: "observed",
+    status: "pending", comment: null, executor: "engine", generation: 3, scope: "turn", request_id: "req",
+  } }));
+  expect(wrapper.text()).toContain("до конца хода");
+  await wrapper.get('[data-testid="approve-btn"]').trigger("click");
+  expect(wrapper.emitted("approve")).toEqual([["native"]]);
+  await wrapper.get('[data-testid="reject-btn"]').trigger("click");
+  await wrapper.get('[data-testid="reject-submit"]').trigger("click");
+  expect(wrapper.emitted("reject")).toEqual([[{ approvalId: "native", comment: "" }]]);
+});
+
+describe("ToolCallCard results", () => {
+  it("shows a read file in its language with line numbers", async () => {
+    const wrapper = mountCard(
+      makeCall({
+        name: "read_file",
+        arguments: { path: "src/a.py" },
+        status: "completed",
+        result: { success: true, output: { path: "src/a.py", start_line: 5, content: "x = 1\n" } },
+      }),
+    );
+    await wrapper.get(".tool-head").trigger("click");
+    const view = wrapper.get('[data-testid="result-blocks"] [data-testid="code-view"]');
+    expect(view.attributes("data-lang")).toBe("python");
+    expect(view.text()).toContain("x = 1");
+    expect(view.get('[data-testid="code-number"]').text()).toBe("5");
+  });
+
+  it("shows any other tool output as a code block, not only the brief line", async () => {
+    const wrapper = mountCard(
+      makeCall({ name: "mcp__srv__tool", status: "completed", result: { success: true, output: { rows: [1] } } }),
+    );
+    await wrapper.get(".tool-head").trigger("click");
+    expect(wrapper.get('[data-testid="result-blocks"] [data-testid="code-view"]').attributes("data-lang")).toBe("json");
   });
 });

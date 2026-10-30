@@ -59,7 +59,18 @@ describe("MarkdownView", () => {
     const toolbar = body.element.querySelector(".code-block__toolbar");
     const copyBtn = toolbar?.querySelector(".copy-btn");
     expect(copyBtn).not.toBeNull();
-    expect(copyBtn?.textContent).toBe("Копировать");
+    expect(copyBtn?.getAttribute("aria-label")).toBe("Копировать");
+  });
+
+  it("wraps long lines by default and lets the user turn wrap off per block", async () => {
+    const wrapper = await mountView("```js\n1\n```\n\n```js\n2\n```");
+    const blocks = wrapper.findAll(".code-block");
+    expect(blocks.map((block) => block.classes("code-block--nowrap"))).toEqual([false, false]);
+    const wrap = blocks[0].get('[data-testid="code-wrap"]');
+    expect(wrap.attributes("aria-pressed")).toBe("true");
+    await wrap.trigger("click");
+    expect(blocks.map((block) => block.classes("code-block--nowrap"))).toEqual([true, false]);
+    expect(wrap.attributes("aria-pressed")).toBe("false");
   });
 
   it("copy button copies the code text via navigator.clipboard", async () => {
@@ -90,25 +101,12 @@ describe("MarkdownView", () => {
     await expect(flushPromises()).resolves.not.toThrow();
   });
 
-  it("highlights with both light and dark shiki themes and tags the active one", async () => {
-    const light = await mountView("```ts\nconst x = 1;\n```");
-    const dark = await mount(MarkdownView, { props: { source: "```ts\nconst x = 1;\n```", dark: true } });
-    await flushPromises();
-    const lightBlock = light.get('[data-testid="markdown-body"] pre.shiki') as ReturnType<
-      typeof light.get
-    >;
-    const darkBlock = dark.get('[data-testid="markdown-body"] pre.shiki') as ReturnType<typeof dark.get>;
-    // Shiki dual-theme output always carries both theme classes…
-    for (const block of [lightBlock, darkBlock]) {
-      expect(block.classes()).toContain("github-light");
-      expect(block.classes()).toContain("github-dark");
-    }
-    // …and the active theme is recorded so CSS can pick the palette.
-    expect(lightBlock.attributes("data-active-theme")).toBe("light");
-    expect(darkBlock.attributes("data-active-theme")).toBe("dark");
+  it("highlights code blocks with the soft dark theme", async () => {
+    const wrapper = await mountView("```ts\nconst x = 1;\n```");
+    expect(wrapper.get('[data-testid="markdown-body"] pre.shiki').classes()).toContain("github-dark-dimmed");
   });
 
-  it("does not duplicate copy buttons after source and theme updates", async () => {
+  it("does not duplicate copy buttons after source updates", async () => {
     const wrapper = mount(MarkdownView, { props: { source: "```js\nconst a = 1;\n```" } });
     await flushPromises();
     const countBefore = wrapper.get('[data-testid="markdown-body"]').element.querySelectorAll(".copy-btn").length;
@@ -125,11 +123,6 @@ describe("MarkdownView", () => {
       .get('[data-testid="markdown-body"]')
       .element.querySelectorAll(".code-block");
     expect(wrappers.length).toBe(1);
-    await wrapper.setProps({ dark: true });
-    await flushPromises();
-    expect(wrapper.findAll(".copy-btn")).toHaveLength(1);
-    expect(wrapper.findAll(".code-block__toolbar")).toHaveLength(1);
-    expect(wrapper.findAll(".code-block")).toHaveLength(1);
   });
 
   it("toolbar is a separate sibling of pre and handles long first lines", async () => {

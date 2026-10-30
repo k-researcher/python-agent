@@ -18,16 +18,26 @@ def frontend_dist(tmp_path: Path) -> Path:
     return directory
 
 
-@pytest.mark.parametrize("path", ["", "login", "s/s1", "s/6c7125ba-a565-439c-895d-590c31514f99"])
+APP_PATHS = ["", "login", "settings/models", "s/s1", "s/6c7125ba-a565-439c-895d-590c31514f99"]
+UNKNOWN_PATHS = [
+    "api/unknown",
+    "assets/missing.js",
+    "missing.css",
+    "s/",
+    "s/a/b",
+    "settings",
+    "settings/x",
+]
+
+
+@pytest.mark.parametrize("path", APP_PATHS)
 def test_frontend_routes_serve_index(frontend_dist: Path, path: str) -> None:
     response = frontend_response(frontend_dist, path)
     assert isinstance(response, FileResponse)
     assert response.path == frontend_dist / "index.html"
 
 
-@pytest.mark.parametrize(
-    "path", ["api/unknown", "assets/missing.js", "missing.css", "s/", "s/a/b", "../secret"]
-)
+@pytest.mark.parametrize("path", [*UNKNOWN_PATHS, "../secret"])
 def test_unknown_or_unsafe_routes_do_not_serve_index(frontend_dist: Path, path: str) -> None:
     response = frontend_response(frontend_dist, path)
     assert isinstance(response, JSONResponse)

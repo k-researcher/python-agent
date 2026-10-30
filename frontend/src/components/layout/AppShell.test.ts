@@ -15,6 +15,14 @@ function mountShell(props: Record<string, unknown> = {}) {
 }
 
 describe("AppShell", () => {
+  it("keeps the panel toggles in the top bar, not over the content", () => {
+    const wrapper = mountShell();
+    const header = wrapper.get(".app-shell__topbar");
+    expect(header.find('[data-toggle="left"]').exists()).toBe(true);
+    expect(header.find('[data-toggle="right"]').exists()).toBe(true);
+    expect(wrapper.find(".app-shell__body [data-toggle]").exists()).toBe(false);
+  });
+
   it("renders all four slots", () => {
     const wrapper = mountShell();
     expect(wrapper.find(".slot-topbar").exists()).toBe(true);

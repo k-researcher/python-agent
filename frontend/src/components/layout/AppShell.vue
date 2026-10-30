@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Presentational shell: Topbar on top, three columns below (320 / flexible / 320).
 // Panels are shown/hidden through props; on narrow screens the toggle buttons
-// appear at the edges and emit update:* so the parent controls the state.
+// appear in the top bar and emit update:* so the parent controls the state.
 
 import {
   PanelLeftClose,
@@ -48,7 +48,32 @@ function toggleRight(): void {
 <template>
   <div class="app-shell">
     <header class="app-shell__topbar">
-      <slot name="topbar" />
+      <!-- Panel toggles live in the top bar, visible only on narrow screens, so they never cover content. -->
+      <button
+        type="button"
+        class="app-shell__toggle app-shell__toggle--left"
+        :aria-expanded="leftOpen"
+        :aria-label="leftOpen ? 'Скрыть левую панель' : 'Показать левую панель'"
+        :title="leftOpen ? 'Скрыть левую панель' : 'Показать левую панель'"
+        data-toggle="left"
+        @click="toggleLeft"
+      >
+        <component :is="leftOpen ? PanelLeftClose : PanelLeftOpen" :size="16" />
+      </button>
+      <div class="app-shell__topbar-content">
+        <slot name="topbar" />
+      </div>
+      <button
+        type="button"
+        class="app-shell__toggle app-shell__toggle--right"
+        :aria-expanded="rightOpen"
+        :aria-label="rightOpen ? 'Скрыть правую панель' : 'Показать правую панель'"
+        :title="rightOpen ? 'Скрыть правую панель' : 'Показать правую панель'"
+        data-toggle="right"
+        @click="toggleRight"
+      >
+        <component :is="rightOpen ? PanelRightClose : PanelRightOpen" :size="16" />
+      </button>
     </header>
 
     <div
@@ -69,29 +94,6 @@ function toggleRight(): void {
       </aside>
     </div>
 
-    <!-- Edge toggles, visible only below the responsive breakpoints (spec §6). -->
-    <button
-      type="button"
-      class="app-shell__toggle app-shell__toggle--left"
-      :aria-expanded="leftOpen"
-      :aria-label="leftOpen ? 'Скрыть левую панель' : 'Показать левую панель'"
-      :title="leftOpen ? 'Скрыть левую панель' : 'Показать левую панель'"
-      data-toggle="left"
-      @click="toggleLeft"
-    >
-      <component :is="leftOpen ? PanelLeftClose : PanelLeftOpen" :size="16" />
-    </button>
-    <button
-      type="button"
-      class="app-shell__toggle app-shell__toggle--right"
-      :aria-expanded="rightOpen"
-      :aria-label="rightOpen ? 'Скрыть правую панель' : 'Показать правую панель'"
-      :title="rightOpen ? 'Скрыть правую панель' : 'Показать правую панель'"
-      data-toggle="right"
-      @click="toggleRight"
-    >
-      <component :is="rightOpen ? PanelRightClose : PanelRightOpen" :size="16" />
-    </button>
   </div>
 </template>
 
@@ -108,12 +110,19 @@ function toggleRight(): void {
 
 .app-shell__topbar {
   grid-row: 1;
+  display: flex;
+  align-items: center;
   min-width: 0;
   z-index: 20;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
 
+.app-shell__topbar-content {
+  flex: 1;
+  min-width: 0;
+  align-self: stretch;
+}
 .app-shell__body {
   grid-row: 2;
   display: grid;
@@ -146,23 +155,19 @@ function toggleRight(): void {
 }
 
 .app-shell__toggle {
-  position: fixed;
-  top: 50%;
-  transform: translateY(-50%);
   display: none; /* hidden on wide screens */
+  flex-shrink: 0;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 44px;
+  width: 32px;
+  height: 32px;
+  margin: 0 6px;
   padding: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--text-muted);
-  box-shadow: var(--shadow);
-  z-index: 30;
 }
-
 .app-shell__toggle:hover {
   color: var(--text);
 }

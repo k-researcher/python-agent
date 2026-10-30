@@ -137,7 +137,7 @@ async def test_substituted_client_rejected_before_normal_message_or_any_tool(tmp
         from agent.database import session_factory
         from agent.llm import LLMResponse
         from agent.models import Message, ToolCall
-        from agent.runtime import AgentSupervisor
+        from agent.runtime import MAX_INVALID_CALL_REPLIES, AgentSupervisor
 
         session_id = await _create_session(tmp_path, "invalid-batch")
         await _add_messages(session_id, _simple_history())
@@ -147,8 +147,6 @@ async def test_substituted_client_rejected_before_normal_message_or_any_tool(tmp
 
             async def chat(self, *args, **kwargs):
                 self.calls += 1
-                if self.calls > 1:
-                    pytest.fail("invalid batch was accepted and retried")
                 return LLMResponse(
                     None,
                     [
@@ -169,6 +167,8 @@ async def test_substituted_client_rejected_before_normal_message_or_any_tool(tmp
         supervisor = AgentSupervisor(Settings())
         supervisor.llm = Client()
         await supervisor._run_session(session_id)
+        # The model may correct an invalid batch a bounded number of times; nothing runs.
+        assert supervisor.llm.calls == 1 + MAX_INVALID_CALL_REPLIES
         async with session_factory() as db:
             from agent.models import Session, SessionRunOutcome
 

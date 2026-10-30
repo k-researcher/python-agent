@@ -248,6 +248,7 @@ describe("RightPanel — context", () => {
   it("shows the omitted-messages count", () => {
     const wrapper = mountPanel();
     expect(wrapper.find('[data-omitted]').text()).toContain("3");
+    expect(wrapper.find('[data-omitted]').classes()).toContain("context-block__omitted--warning");
   });
 
   it("handles a missing context (null) gracefully", () => {
@@ -370,6 +371,7 @@ describe("RightPanel — context", () => {
       context: { approximate_tokens: 30, context_window: 100, omitted_messages: -1 },
     });
     expect(wrapper.find('[data-omitted]').text()).toBe("Пропущенных сообщений нет");
+    expect(wrapper.find('[data-omitted]').classes()).not.toContain("context-block__omitted--warning");
   });
 
   it("limits the wrapping layout to the compression metadata row", () => {
@@ -456,7 +458,7 @@ describe("RightPanel — tools, agents, audit", () => {
     const agents = wrapper.findAll(".agent-row");
     expect(agents).toHaveLength(2);
     expect(agents[0].text()).toContain("Дочерний");
-    expect(agents[0].text()).toContain("running");
+    expect(agents[0].get("[data-agent-status]").text()).toBe("Выполняется");
 
     await agents[1].find('[data-agent-id="c2"]').trigger("click");
     expect(wrapper.emitted("openSession")).toEqual([["c2"]]);
@@ -478,6 +480,17 @@ describe("RightPanel — tools, agents, audit", () => {
     expect(entries[0].text()).toContain("http_get");
     expect(entries[0].text()).toContain("https://api.example.com");
     expect(entries[0].find('[data-audit-status]').text()).toBe("ok");
+  });
+
+  it("shows the audit time in the local time zone, not the raw server value", async () => {
+    const wrapper = mountPanel();
+    await wrapper.findAll('[role="tab"]')[3].trigger("click");
+    const time = wrapper.get(".audit-row__time");
+    expect(time.text()).not.toContain("T10:00:00Z");
+    expect(time.text()).toContain(
+      new Date("2026-10-06T10:00:00Z").toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+    );
+    expect(time.attributes("datetime")).toBe("2026-10-06T10:00:00Z");
   });
 
   it("shows an empty audit state", async () => {

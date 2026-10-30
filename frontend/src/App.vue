@@ -244,10 +244,9 @@ function onNewSession(): void {
 }
 
 function onOpenSettings(): void {
-  // Settings / model-management (3.3) is not implemented yet. Be honest about it
-  // rather than navigating somewhere that silently does nothing.
-  shellNotice.value =
-    "Настройки и управление моделями будут доступны в следующем этапе (3.3).";
+  sessionStore.close();
+  if (window.innerWidth <= 760) leftOpen.value = false;
+  void router.push({ name: "settings-models" });
 }
 
 function endAuthSession(): void {

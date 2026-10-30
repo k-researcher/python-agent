@@ -61,7 +61,20 @@ class GuardedProcess:
         self._stderr_task = asyncio.create_task(self._stderr())
 
     @classmethod
-    async def start(cls, command: list[str], *, cwd: Path, lock_path: Path) -> GuardedProcess:
+    async def start(
+        cls,
+        command: list[str],
+        *,
+        cwd: Path,
+        lock_path: Path,
+        temporary_dir: Path | None = None,
+    ) -> GuardedProcess:
+        env = clean_env()
+        if temporary_dir is not None:
+            temporary_dir = temporary_dir.resolve(strict=True)
+            if not temporary_dir.is_dir() or temporary_dir.stat().st_mode & 0o777 != 0o700:
+                raise ValueError("Engine temporary directory must be private (0700)")
+            env["TMPDIR"] = str(temporary_dir)
         control_r, control_w = os.pipe()
         status_r, status_w = os.pipe()
         result = None
@@ -74,7 +87,7 @@ class GuardedProcess:
                 str(lock_path),
                 *command,
                 cwd=cwd,
-                env=clean_env(),
+                env=env,
                 pass_fds=(control_r, status_w),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,

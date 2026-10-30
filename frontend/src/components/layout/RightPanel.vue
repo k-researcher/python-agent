@@ -5,6 +5,8 @@
 import { computed, nextTick, ref } from "vue";
 import { Bot, ClipboardList, Puzzle, Activity, ChevronRight } from "lucide-vue-next";
 import type { ContextStats } from "./types";
+import { formatLocalTime } from "../../time";
+import { auditStatusLabel, sessionStatusLabel, statusTone } from "./status";
 
 const props = withDefaults(
   defineProps<{
@@ -220,7 +222,11 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
             </template>
           </dl>
         </div>
-        <p v-if="omittedCount > 0" class="context-block__omitted" data-omitted>
+        <p
+          v-if="omittedCount > 0"
+          class="context-block__omitted context-block__omitted--warning"
+          data-omitted
+        >
           Пропущено сообщений: {{ omittedCount }}
         </p>
         <p v-else class="muted context-block__omitted" data-omitted>Пропущенных сообщений нет</p>
@@ -242,7 +248,7 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
           <Puzzle :size="14" aria-hidden="true" class="tool-row__icon" />
           <span class="tool-row__name mono">{{ tool.name }}</span>
           <span
-            class="tool-row__state"
+            class="tool-row__state status-pill"
             :class="tool.enabled ? 'tool-row__state--on' : 'tool-row__state--off'"
             :data-enabled="tool.enabled ? 'on' : 'off'"
           >
@@ -272,7 +278,9 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
           >
             <Bot :size="15" aria-hidden="true" class="agent-row__icon" />
             <span class="agent-row__title">{{ child.title }}</span>
-            <span class="muted agent-row__status" data-agent-status>{{ child.status }}</span>
+            <span class="agent-row__status status-pill" :style="statusTone(child.status)" data-agent-status>{{
+              sessionStatusLabel(child.status)
+            }}</span>
             <ChevronRight :size="14" aria-hidden="true" class="agent-row__arrow" />
           </button>
         </li>
@@ -295,10 +303,14 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
           <div class="audit-row__body">
             <div class="audit-row__top">
               <span class="audit-row__operation mono">{{ entry.operation }}</span>
-              <span class="audit-row__status" data-audit-status>{{ entry.status }}</span>
+              <span class="audit-row__status status-pill" :style="statusTone(entry.status)" data-audit-status>{{
+                auditStatusLabel(entry.status)
+              }}</span>
             </div>
             <div class="audit-row__dest muted mono">{{ entry.destination }}</div>
-            <div class="audit-row__time muted">{{ entry.created_at }}</div>
+            <time class="audit-row__time muted" :datetime="entry.created_at">{{
+              formatLocalTime(entry.created_at, { seconds: true })
+            }}</time>
           </div>
         </li>
       </ul>
@@ -445,6 +457,8 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
 .context-block__omitted {
   margin-top: 10px;
   font-size: 13px;
+}
+.context-block__omitted--warning {
   color: var(--warning);
 }
 
@@ -485,20 +499,8 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
   font-size: 13px;
 }
 
-.tool-row__state {
-  font-size: 12px;
-  padding: 1px 7px;
-  border-radius: 999px;
-}
-
 .tool-row__state--on {
-  color: var(--success);
-  background: color-mix(in srgb, var(--success) 14%, transparent);
-}
-
-.tool-row__state--off {
-  color: var(--text-muted);
-  background: var(--bg-subtle);
+  --status-color: var(--success);
 }
 
 .agent-row__button {
@@ -529,11 +531,6 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.agent-row__status {
-  flex: none;
-  font-size: 12px;
 }
 
 .agent-row__arrow {
@@ -573,15 +570,9 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.audit-row__status {
-  flex: none;
-  font-size: 12px;
-  color: var(--text-muted);
-  text-transform: lowercase;
-}
-
 .audit-row__dest,
 .audit-row__time {
+  display: block;
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;

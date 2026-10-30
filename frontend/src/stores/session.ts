@@ -103,6 +103,7 @@ export const useSessionStore = defineStore("session", () => {
   const context = ref<ContextStats | null>(null);
   const audit = ref<OutboundAudit[]>([]);
   const children = ref<Session[]>([]);
+  const knownChildIds = new Set<string>();
 
   let activeStreamId: string | null = null;
   let finishedStreamIds = new Set<string>();
@@ -119,6 +120,7 @@ export const useSessionStore = defineStore("session", () => {
   type Reload = { token: number; dirty: boolean; promise: Promise<void> };
   let reload: Reload | null = null;
   const terminal = new Set(["completed", "stopped", "error", "interrupted"]);
+  const openRun = new Set(["pending", "running", "awaiting_confirmation"]);
 
   function resetStream(): void {
     if (activeStreamId != null) finishedStreamIds.add(activeStreamId);
@@ -130,7 +132,8 @@ export const useSessionStore = defineStore("session", () => {
   function confirmRun(next: number, status: string): boolean {
     if (next < runGeneration) return false;
     if (next > runGeneration) {
-      if (status !== "running" && status !== "pending" && !terminal.has(status)) return false;
+      // A run that waits for an approval is open too: a session can be opened in this state.
+      if (!openRun.has(status) && !terminal.has(status)) return false;
       epoch += 1;
       resetStream();
       finishedStreamIds = new Set();
@@ -153,6 +156,7 @@ export const useSessionStore = defineStore("session", () => {
     context.value = null;
     audit.value = [];
     children.value = [];
+    knownChildIds.clear();
     session.value = null;
     resetStream();
     finishedStreamIds.clear();
@@ -211,6 +215,7 @@ export const useSessionStore = defineStore("session", () => {
           messages.value = msgs;
           approvals.value = appr;
           children.value = kids;
+          for (const child of kids) knownChildIds.add(child.id);
           audit.value = aud;
           context.value = ctx;
           if (acceptStatus) session.value = sess;
@@ -255,7 +260,14 @@ export const useSessionStore = defineStore("session", () => {
   ): Promise<void> {
     const id = sessionId.value;
     const gen = generation;
-    await api.resolveApproval(approvalId, decision, comment);
+    const approval = approvals.value.find(item => item.id === approvalId);
+    if (approval?.executor === "engine") {
+      await api.resolveApproval(approvalId, decision, comment, {
+        generation: approval.generation ?? null, executor: "engine",
+      });
+    } else {
+      await api.resolveApproval(approvalId, decision, comment);
+    }
     if (!isCurrent(id, gen)) return;
     await reloadAll();
   }
@@ -320,13 +332,22 @@ export const useSessionStore = defineStore("session", () => {
 
   /** Fold one server event into the open session state. */
   function applyEvent(event: ServerEvent): void {
-    if (event.session_id !== sessionId.value) return;
+    if (event.session_id !== sessionId.value) {
+      // Child revisions belong to the child. Never advance the parent's watermark.
+      if (event.session_id && knownChildIds.has(event.session_id) && [
+        "session.status", "session.error", "approval.required", "approval.resolved", "approval.cancelled",
+      ].includes(event.type)) void reloadAll().catch(() => {});
+      return;
+    }
     if (isStreamDeltaEvent(event)) {
       applyStream(event);
       return;
     }
     const payload = event.payload;
     if (typeof payload !== "object" || payload === null) return;
+    if (event.type === "session.child_created" && typeof payload.child_id === "string") {
+      knownChildIds.add(payload.child_id);
+    }
     latestRevision = Math.max(latestRevision, event.id);
     if (reload?.token === generation) reload.dirty = true;
     const nextRun = typeof payload.generation === "number" ? payload.generation : 0;
@@ -348,6 +369,9 @@ export const useSessionStore = defineStore("session", () => {
         }
         void reloadAll().catch(() => {});
         break;
+      case "engine.usage":
+      case "engine.diff":
+      case "engine.health":
       case "approval.required":
       case "approval.resolved":
       case "approval.cancelled":

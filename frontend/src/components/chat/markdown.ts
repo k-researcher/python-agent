@@ -9,6 +9,7 @@
 
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
+import { CODE_THEME } from "../../highlight";
 
 let parser: MarkdownIt | null = null;
 
@@ -46,7 +47,7 @@ export function renderMarkdown(source: string): string {
 interface HighlightApi {
   codeToHtml: (
     code: string,
-    options: { lang: string; themes: { light: string; dark: string } },
+    options: { lang: string; theme: string },
   ) => Promise<string>;
 }
 
@@ -99,14 +100,10 @@ export function wrapCodeBlocksInPre(html: string): string {
 
 /**
  * Replace each code <pre> inside `html` with a shiki-highlighted version.
+ * Chat blocks use the same soft dark theme as the tool cards in both page themes.
  * Highlighting is best-effort: on any failure the plain block is kept as-is.
- *
- * `dark` chooses the active theme: light or dark. Shiki is told to emit both
- * themed styles (CSS variable fallbacks) but the result is tagged with the
- * active theme so callers/themes can apply the right colors; both themes are
- * always present in the markup so toggling works without re-highlighting.
  */
-export async function highlightCodeBlocks(html: string, dark: boolean): Promise<string> {
+export async function highlightCodeBlocks(html: string): Promise<string> {
   if (typeof DOMParser === "undefined" || typeof document === "undefined") return html;
   const doc = new DOMParser().parseFromString(html, "text/html");
   normalizeCodeBlocks(doc);
@@ -122,17 +119,14 @@ export async function highlightCodeBlocks(html: string, dark: boolean): Promise<
     const lang = extractLanguage(code);
     const raw = code.textContent ?? "";
     try {
-      const themed = await codeToHtml(raw, {
-        lang,
-        themes: { light: "github-light", dark: "github-dark" },
-      });
+      const themed = await codeToHtml(raw, { lang, theme: CODE_THEME });
       const holder = doc.createElement("div");
       holder.innerHTML = themed;
       const replacement = holder.firstElementChild;
       if (replacement) {
+        // The block takes its background and base colour from the app tokens, not from the theme.
+        replacement.removeAttribute("style");
         pre.replaceWith(replacement);
-        // Record the active theme so CSS can switch the visible palette.
-        replacement.setAttribute("data-active-theme", dark ? "dark" : "light");
       }
     } catch {
       // Keep the unhighlighted block on errors or unknown language.

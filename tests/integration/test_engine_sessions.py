@@ -268,6 +268,10 @@ async def test_message_finishes_unavailable_without_model_or_process(
         monkeypatch.setattr(runner, "_models", forbidden)
         monkeypatch.setattr("agent.runtime.source_registry", forbidden)
         monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden)
+        # Model a genuinely uninstalled adapter explicitly: both optional
+        # adapters may now be present in the source tree. Keep all no-call and
+        # durable-unavailable assertions independent of installed modules.
+        monkeypatch.setattr("agent.engine_adapters.importlib.util.find_spec", lambda _: None)
         monkeypatch.setattr(EngineRegistry, "get", forbidden)
         await runner.run_job(session_id)
         async with session_factory() as db:
