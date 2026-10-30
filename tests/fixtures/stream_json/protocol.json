@@ -1,0 +1,65 @@
+{
+  "adapter_module": "agent.engine_adapters.claude",
+  "version": "2.1.311",
+  "version_suffix": " (Claude Code)",
+  "auth": {
+    "loggedIn": true,
+    "authMethod": "claude.ai",
+    "apiProvider": "firstParty",
+    "subscriptionType": "max"
+  },
+  "initialize": {
+    "commands": [],
+    "output_style": "default",
+    "available_output_styles": [
+      "default"
+    ],
+    "models": []
+  },
+  "init": {
+    "type": "system",
+    "subtype": "init",
+    "session_id": "session-1",
+    "cwd": "/project",
+    "tools": [
+      "Bash",
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep"
+    ],
+    "mcp_servers": [],
+    "plugins": [],
+    "skills": [],
+    "slash_commands": [],
+    "permissionMode": "default",
+    "apiKeySource": "none",
+    "model": "configured-model"
+  },
+  "result": {
+    "type": "result",
+    "subtype": "success",
+    "session_id": "session-1",
+    "is_error": false,
+    "result": "Hello",
+    "total_cost_usd": 0.012,
+    "usage": {
+      "input_tokens": 12,
+      "output_tokens": 3,
+      "cache_read_input_tokens": 20,
+      "cache_creation_input_tokens": 4
+    },
+    "permission_denials": [],
+    "stop_reason": "end_turn"
+  },
+  "secret_environment": [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "HTTPS_PROXY",
+    "PYTHONPATH",
+    "LD_PRELOAD"
+  ]
+}

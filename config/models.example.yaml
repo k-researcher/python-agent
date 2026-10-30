@@ -103,3 +103,15 @@ engine_profiles: {}
 #     adapter_settings:
 #       supported_versions: ">=0.164.0,<0.164.1"
 #       # Расширять диапазон только после проверки fixtures и локальной приёмки.
+#   personal_stream:
+#     enabled: false
+#     adapter_module: agent.engine_adapters.claude
+#     binary: claude
+#     model: configured-model-id
+#     timeouts: {open: 30, request: 10, turn: 600, approval: 120}
+#     process_limit: 1
+#     operator_user_id: local-user-id
+#     adapter_settings:
+#       supported_versions: ">=2.1.311,<2.1.312"
+#       # 2.1.312 несовместима. Известный initialize не подтверждает изоляцию:
+#       # health остаётся unavailable, обхода этой проверки настройкой нет.
