@@ -13,8 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agent import runtime
 from agent.config import Settings
 from agent.database import init_database, session_factory
-from agent.models import Project, Session
+from agent.events import broker
+from agent.message_tree import append_message
+from agent.models import Approval, Project, Session, ToolCall
+from agent.run_finish import finish_run
 from agent.runtime import AgentSupervisor
+from agent.session_budget_store import BudgetExceeded
 from agent.session_fence import CURRENT_FENCE, claim, stop_generation
 from agent.session_service import create_session_record
 from agent.tools.base import Tool
@@ -172,3 +176,138 @@ async def test_waited_child_timeout_stops_the_child(
     async with session_factory() as db:
         child = await db.get(Session, run.session_id)
         assert child is not None and child.status == "stopped"
+
+
+@pytest.mark.parametrize("decision", ["approve", "reject"])
+async def test_waited_child_keeps_waiting_across_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str
+) -> None:
+    supervisor, parent, _ = await waited_case(
+        tmp_path, monkeypatch, max_parallel_sessions=1, max_child_wait_seconds=0.5
+    )
+    paused = asyncio.Event()
+    approval_id = "child-write-approval"
+    child_id = ""
+    budget_checks = 0
+    check_budget = supervisor._check_tool_budget
+
+    async def budget(db: Any, session_id: str) -> None:
+        nonlocal budget_checks
+        budget_checks += 1
+        await check_budget(db, session_id)
+
+    monkeypatch.setattr(supervisor, "_check_tool_budget", budget)
+
+    async def run(session_id: str) -> None:
+        nonlocal child_id
+        child_id = session_id
+        async with session_factory() as db:
+            child = await db.get(Session, session_id)
+            assert child is not None
+            if not paused.is_set():
+                db.add(
+                    ToolCall(
+                        id="child-write",
+                        session_id=session_id,
+                        name="write_file",
+                        arguments={"path": "post.md", "content": "Post"},
+                        risk_level="write",
+                        status="awaiting_confirmation",
+                    )
+                )
+                await db.flush()
+                db.add(Approval(id=approval_id, tool_call_id="child-write"))
+                await append_message(
+                    db,
+                    session_id,
+                    role="assistant",
+                    content="\n\n",
+                    tool_calls=[{"id": "child-write"}],
+                )
+                child.status = "awaiting_confirmation"
+                await db.commit()
+                paused.set()
+                return
+            await append_message(db, session_id, role="assistant", content=f"Post: {decision}")
+            await finish_run(db, session_id, 1, "completed")
+            await db.commit()
+
+    monkeypatch.setattr(supervisor, "_run", run)
+    async with asyncio.timeout(5), supervisor._semaphore:
+        spawn = asyncio.create_task(supervisor._spawn_child(parent, "dev", "Child", True, None))
+        try:
+            await paused.wait()
+            # Approval time must not spend the child's execution timeout.
+            await asyncio.sleep(0.65)
+            assert not spawn.done(), "A pending child approval is not a final response"
+            for _ in range(100):
+                await broker.broadcast(
+                    {"session_id": child_id, "type": "reasoning.delta", "payload": {"delta": "x"}}
+                )
+            await supervisor.resolve_approval(approval_id, decision, None)
+            result = await spawn
+        finally:
+            spawn.cancel()
+            await asyncio.gather(spawn, return_exceptions=True)
+    assert result["status"] == "completed"
+    assert result["response"] == f"Post: {decision}"
+    assert budget_checks < 10, "Stream deltas must not trigger repeated database reads"
+    assert child_id not in supervisor._waited_children
+    assert child_id not in supervisor._tasks or supervisor._tasks[child_id].done()
+
+
+@pytest.mark.parametrize("reason", ["cancel", "budget"])
+async def test_ended_waiter_withdraws_the_childs_pending_approval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    supervisor, parent, _ = await waited_case(tmp_path, monkeypatch)
+    paused = asyncio.Event()
+    child_id = ""
+
+    async def run(session_id: str) -> None:
+        nonlocal child_id
+        child_id = session_id
+        async with session_factory() as db:
+            child = await db.get(Session, session_id)
+            assert child is not None
+            child.status = "awaiting_confirmation"
+            db.add(
+                ToolCall(
+                    id="pending-write",
+                    session_id=session_id,
+                    name="write_file",
+                    arguments={"path": "post.md", "content": "Post"},
+                    risk_level="write",
+                    status="awaiting_confirmation",
+                )
+            )
+            await db.flush()
+            db.add(Approval(id="pending-approval", tool_call_id="pending-write"))
+            await db.commit()
+        paused.set()
+
+    monkeypatch.setattr(supervisor, "_run", run)
+    check_budget = supervisor._check_tool_budget
+
+    async def budget(db: Any, session_id: str) -> None:
+        if reason == "budget" and paused.is_set():
+            raise BudgetExceeded("deadline_exceeded")
+        await check_budget(db, session_id)
+
+    monkeypatch.setattr(supervisor, "_check_tool_budget", budget)
+    async with asyncio.timeout(5):
+        spawn = asyncio.create_task(supervisor._spawn_child(parent, "dev", "Child", True, None))
+        try:
+            await paused.wait()
+            if reason == "cancel":
+                spawn.cancel()
+            with pytest.raises(asyncio.CancelledError if reason == "cancel" else BudgetExceeded):
+                await spawn
+            async with session_factory() as db:
+                child = await db.get(Session, child_id)
+                approval = await db.get(Approval, "pending-approval")
+                assert child is not None and child.status == "stopped"
+                assert approval is not None and approval.status == "cancelled"
+        finally:
+            spawn.cancel()
+            await asyncio.gather(spawn, return_exceptions=True)

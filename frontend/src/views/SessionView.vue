@@ -66,6 +66,9 @@ watch(
 
 // Session header data
 const session = computed(() => sessionStore.session);
+const waitingChildren = computed(() => sessionStore.children.filter(
+  child => child.status === "awaiting_confirmation",
+));
 const timelineItems = computed(() => toChatTimelineItems(sessionStore.timeline));
 const external = computed(() => !!session.value?.engine_profile);
 const modelLabel = computed(() => {
@@ -221,6 +224,18 @@ function onOpenChild(id: string): void {
         </p>
       </header>
 
+      <div v-if="waitingChildren.length" class="child-waiting" role="status" data-testid="child-waiting">
+        <p>Дочерние агенты ждут вашего подтверждения. Откройте запрос и проверьте действие.</p>
+        <button v-for="child in waitingChildren" :key="child.id" type="button"
+          class="child-waiting__link" @click="onOpenChild(child.id)">
+          Открыть запрос: {{ child.title }}
+        </button>
+      </div>
+      <button v-if="session.parent_id" type="button" class="parent-link"
+        data-testid="parent-session" @click="onOpenChild(session.parent_id)">
+        К родительской сессии
+      </button>
+
       <ChatTimeline
         v-if="timelineItems.length > 0 || sessionStore.streaming"
         :items="timelineItems"
@@ -287,6 +302,27 @@ function onOpenChild(id: string): void {
   padding: 12px 16px 4px;
   border-bottom: 1px solid var(--border);
 }
+
+.child-waiting {
+  flex-shrink: 0;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-subtle);
+}
+.child-waiting p { margin: 0 0 6px; }
+.child-waiting__link, .parent-link {
+  display: block;
+  max-width: 100%;
+  padding: 6px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  text-decoration: underline;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.parent-link { margin: 0 16px; flex-shrink: 0; }
 
 .session-heading {
   display: flex;

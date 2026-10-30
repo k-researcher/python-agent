@@ -32,6 +32,39 @@ beforeEach(() => {
   vi.spyOn(api, "audit").mockResolvedValue(stamp([]));
   vi.spyOn(api, "context").mockResolvedValue(stamp({ approximate_tokens: 0, omitted_messages: 0, truncated_tool_results: 0, context_window: 8192, reserved_tokens: 1024 }));
 });
+it("refreshes a waiting child without applying its revision or generation to the parent", async () => {
+  const child = { ...session(), id: "child", parent_id: "s", status: "running" };
+  vi.mocked(api.children).mockResolvedValue(stamp([child]));
+  const store = useSessionStore();
+  await store.open("s");
+  vi.mocked(api.children).mockResolvedValue(stamp([{ ...child, status: "awaiting_confirmation" }]));
+  store.applyEvent({ ...event("approval.required", { generation: 99 }, 999), session_id: "child" });
+  await flushPromises();
+  expect(store.children[0]?.status).toBe("awaiting_confirmation");
+  expect(store.session?.id).toBe("s");
+  expect(store.session?.run_generation).toBe(2);
+  store.applyEvent(frame("message.delta"));
+  expect(store.streaming?.content).toBe("new");
+});
+
+it("recognizes a child event before the child list has finished loading", async () => {
+  const store = useSessionStore();
+  await store.open("s");
+  store.applyEvent(event("session.child_created", { generation: 2, child_id: "new-child" }, 1));
+  const calls = vi.mocked(api.children).mock.calls.length;
+  store.applyEvent({ ...event("approval.required", { generation: 1 }, 99), session_id: "new-child" });
+  await flushPromises();
+  expect(vi.mocked(api.children).mock.calls.length).toBeGreaterThan(calls);
+});
+
+it("ignores events of unrelated sessions", async () => {
+  const store = useSessionStore();
+  await store.open("s");
+  vi.mocked(api.children).mockClear();
+  store.applyEvent({ ...event("approval.required", {}, 999), session_id: "unrelated" });
+  await flushPromises();
+  expect(api.children).not.toHaveBeenCalled();
+});
 it("rejects an unknown older stream when its reset was lost", async () => {
   const store = useSessionStore();
   await store.open("s");

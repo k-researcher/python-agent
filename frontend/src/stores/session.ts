@@ -103,6 +103,7 @@ export const useSessionStore = defineStore("session", () => {
   const context = ref<ContextStats | null>(null);
   const audit = ref<OutboundAudit[]>([]);
   const children = ref<Session[]>([]);
+  const knownChildIds = new Set<string>();
 
   let activeStreamId: string | null = null;
   let finishedStreamIds = new Set<string>();
@@ -153,6 +154,7 @@ export const useSessionStore = defineStore("session", () => {
     context.value = null;
     audit.value = [];
     children.value = [];
+    knownChildIds.clear();
     session.value = null;
     resetStream();
     finishedStreamIds.clear();
@@ -211,6 +213,7 @@ export const useSessionStore = defineStore("session", () => {
           messages.value = msgs;
           approvals.value = appr;
           children.value = kids;
+          for (const child of kids) knownChildIds.add(child.id);
           audit.value = aud;
           context.value = ctx;
           if (acceptStatus) session.value = sess;
@@ -327,13 +330,22 @@ export const useSessionStore = defineStore("session", () => {
 
   /** Fold one server event into the open session state. */
   function applyEvent(event: ServerEvent): void {
-    if (event.session_id !== sessionId.value) return;
+    if (event.session_id !== sessionId.value) {
+      // Child revisions belong to the child. Never advance the parent's watermark.
+      if (event.session_id && knownChildIds.has(event.session_id) && [
+        "session.status", "session.error", "approval.required", "approval.resolved", "approval.cancelled",
+      ].includes(event.type)) void reloadAll().catch(() => {});
+      return;
+    }
     if (isStreamDeltaEvent(event)) {
       applyStream(event);
       return;
     }
     const payload = event.payload;
     if (typeof payload !== "object" || payload === null) return;
+    if (event.type === "session.child_created" && typeof payload.child_id === "string") {
+      knownChildIds.add(payload.child_id);
+    }
     latestRevision = Math.max(latestRevision, event.id);
     if (reload?.token === generation) reload.dirty = true;
     const nextRun = typeof payload.generation === "number" ? payload.generation : 0;

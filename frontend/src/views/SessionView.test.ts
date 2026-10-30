@@ -82,6 +82,33 @@ afterEach(() => {
 });
 
 describe("SessionView", () => {
+  it("shows child approvals in the parent conversation and opens the child", async () => {
+    const store = prepareSession();
+    store.children = [{ ...store.session!, id: "child", parent_id: "s1",
+      title: "Первый пост", status: "awaiting_confirmation" }];
+    const push = vi.spyOn(router, "push").mockResolvedValue(undefined);
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    const banner = wrapper.get('[data-testid="child-waiting"]');
+    expect(banner.text()).toContain("ждут вашего подтверждения");
+    await banner.get("button").trigger("click");
+    expect(push).toHaveBeenCalledWith("/s/child");
+    store.children = [];
+    await flushPromises();
+    expect(wrapper.find('[data-testid="child-waiting"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("lets a child return to its parent session", async () => {
+    const store = prepareSession();
+    store.session!.parent_id = "parent";
+    const push = vi.spyOn(router, "push").mockResolvedValue(undefined);
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    await wrapper.get('[data-testid="parent-session"]').trigger("click");
+    expect(push).toHaveBeenCalledWith("/s/parent");
+    wrapper.unmount();
+  });
   it("retains a long session title in its tooltip", async () => {
     const store = prepareSession();
     const title = "Очень длинный заголовок сессии ".repeat(30);

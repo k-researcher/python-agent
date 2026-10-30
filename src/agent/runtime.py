@@ -34,6 +34,7 @@ from agent.events import (
     PendingEvent,
     StreamPublisher,
     add_event,
+    broker,
     emit_event,
     publish,
     resume_stream_run,
@@ -60,6 +61,7 @@ from agent.models import (
     Project,
     Session,
     SessionInbox,
+    SessionRunOutcome,
     SessionStatus,
     ToolCall,
     ToolCallStatus,
@@ -205,6 +207,8 @@ class AgentSupervisor:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         # The generation that each task in _tasks was scheduled for (None: not known).
         self._task_generation: dict[str, int | None] = {}
+        # A waited child's continuation uses its parent's slot, including after approval.
+        self._waited_children: set[str] = set()
         # Tasks of older generations that still finish, with their session; kept referenced
         # until they end, and cancelled by Stop of the session and by shutdown.
         self._finishing: dict[asyncio.Task[None], str] = {}
@@ -741,7 +745,11 @@ class AgentSupervisor:
     ) -> None:
         token = CURRENT_FENCE.set(None)
         try:
-            async with self._semaphore if use_slot else nullcontext():
+            async with (
+                self._semaphore
+                if use_slot and session_id not in self._waited_children
+                else nullcontext()
+            ):
                 await self._execute_run(session_id, generation, owned_fence)
         finally:
             CURRENT_FENCE.reset(token)
@@ -2035,6 +2043,12 @@ class AgentSupervisor:
             assert fresh_parent is not None
             child.inbox_hop = fresh_parent.inbox_hop
             child.notify_generation = None if wait else 1
+            events: list[PendingEvent] = []
+            if wait and fresh_parent.status != SessionStatus.running.value:
+                fresh_parent.status = SessionStatus.running.value
+                events.append(
+                    await add_event(db, "session.status", {"status": "running"}, parent.id)
+                )
             created_event = await add_event(
                 db,
                 "session.child_created",
@@ -2050,10 +2064,10 @@ class AgentSupervisor:
                     raise FenceLostError("The new child run could not be claimed")
             else:
                 await db.commit()
-            await publish([created_event])
+            await publish([*events, created_event])
 
-        stopped = False
         if wait:
+            self._waited_children.add(child_id)
             # Register the waited run, so that a Stop of the child cancels it.
             task = asyncio.create_task(
                 self._run_guarded(child_id, 1, use_slot=False, owned_fence=child_fence),
@@ -2062,43 +2076,100 @@ class AgentSupervisor:
             self._tasks[child_id] = task
             self._task_generation[child_id] = 1
             try:
-                done, _pending = await asyncio.wait(
-                    {task}, timeout=self.settings.max_child_wait_seconds
-                )
-                if not done:
-                    await self.stop(child_id)
-                    raise RuntimeError("Child agent exceeded its wait timeout")
+                await self._wait_child_terminal(parent.id, child_id, task)
+            except BudgetExceeded:
+                await self.stop_scoped(child_id, 1)
+                raise
             except asyncio.CancelledError:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                await self.stop_scoped(child_id, 1)
                 raise
             finally:
-                if self._tasks.get(child_id) is task:
+                self._waited_children.discard(child_id)
+                if self._tasks.get(child_id) is task and task.done():
                     del self._tasks[child_id]
-            # Stop commits the terminal state before it cancels the run.
-            stopped = task.cancelled()
-            failure = None if stopped else task.exception()
-            if failure is not None:
-                raise failure
         else:
             await self.start(child_id, new_run=False, expected_generation=1)
 
         async with session_factory() as db:
             child_record = await db.get(Session, child_id)
-            final_message = (
-                await db.execute(
+            answers = (
+                await db.scalars(
                     select(Message)
-                    .where(Message.session_id == child_id, Message.role == "assistant")
+                    .where(
+                        Message.session_id == child_id,
+                        Message.role == "assistant",
+                        Message.run_generation == 1,
+                        Message.kind == "normal",
+                        Message.skipped.is_(False),
+                    )
                     .order_by(Message.id.desc())
-                    .limit(1)
                 )
-            ).scalar_one_or_none()
+            ).all()
+            final_message = next(
+                (row for row in answers if not row.tool_calls and (row.content or "").strip()),
+                None,
+            )
             status = child_record.status if child_record else "missing"
-            if stopped and status not in TERMINAL_STATUSES:
-                status = SessionStatus.stopped.value
+            outcome = await db.get(SessionRunOutcome, (child_id, 1))
+            if outcome is not None:
+                status = outcome.status
             return {
                 "session_id": child_id,
                 "status": status,
                 "llm_profile": child_record.llm_profile if child_record else selected_profile,
                 "response": final_message.content if final_message else None,
             }
+
+    async def _wait_child_terminal(
+        self, parent_id: str, child_id: str, initial: asyncio.Task[None]
+    ) -> None:
+        """Wait across approvals without returning an unfinished tool call as an answer."""
+        loop = asyncio.get_running_loop()
+        remaining = float(self.settings.max_child_wait_seconds)
+        checked_at = loop.time()
+        paused = False
+        async with broker.subscribe() as updates:
+            while True:
+                async with session_factory() as db:
+                    child = await db.get(Session, child_id)
+                    outcome = await db.get(SessionRunOutcome, (child_id, 1))
+                    await self._check_tool_budget(db, parent_id)
+                if outcome is not None:
+                    return
+                if child is None or child.run_generation != 1:
+                    raise RuntimeError("The waited child run is no longer available")
+                if child.status in TERMINAL_STATUSES:
+                    return
+                current = self._tasks.get(child_id, initial)
+                if current.done() and not current.cancelled():
+                    failure = current.exception()
+                    if failure is not None:
+                        raise failure
+                now = loop.time()
+                awaiting_approval = child.status == SessionStatus.awaiting_confirmation.value
+                if not paused and not awaiting_approval:
+                    remaining -= now - checked_at
+                checked_at = now
+                paused = awaiting_approval
+                if not paused and remaining <= 0:
+                    await self.stop_scoped(child_id, 1)
+                    raise RuntimeError("Child agent exceeded its wait timeout")
+                # Events wake the waiter promptly. A slow fallback also covers a lost
+                # publish and another worker, without polling human approvals in a loop.
+                delay = 1.0 if paused else min(0.5, max(0, remaining))
+                try:
+                    async with asyncio.timeout(delay):
+                        while True:
+                            event = await updates.get()
+                            if event.get("session_id") in {child_id, parent_id} and event.get(
+                                "type"
+                            ) in {
+                                "session.status",
+                                "session.error",
+                                "approval.required",
+                                "approval.resolved",
+                                "approval.cancelled",
+                            }:
+                                break
+                except TimeoutError:
+                    pass
