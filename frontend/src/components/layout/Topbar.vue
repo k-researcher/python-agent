@@ -212,5 +212,10 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onGlobalKeydown));
   .topbar__connection span:last-child {
     display: none;
   }
+
+  /* No keyboard shortcut hint on a phone; it would cover the placeholder. */
+  .topbar__kbd {
+    display: none;
+  }
 }
 </style>

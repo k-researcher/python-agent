@@ -207,7 +207,7 @@ function onOpenChild(id: string): void {
         />
         </div>
         <div class="session-meta">
-          <span class="session-status" :data-status="session.status" data-testid="session-status">{{ sessionStatusLabel(session.status) }}</span>
+          <span class="session-status status-pill" :data-status="session.status" data-testid="session-status">{{ sessionStatusLabel(session.status) }}</span>
         </div>
         <p v-if="external" data-testid="engine-health">{{ engineHealthLabel }}</p>
         <p v-if="external && engineUsage" data-testid="engine-usage">
@@ -316,39 +316,20 @@ function onOpenChild(id: string): void {
   color: var(--text-muted);
 }
 
-.session-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 1px 8px;
-  border-radius: 999px;
-  background: var(--bg-subtle);
-  color: var(--text);
-}
-
-.session-status::before {
-  content: "";
-  flex: none;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--session-status-color, var(--text-muted));
-}
-
 .session-status[data-status="running"] {
-  --session-status-color: var(--info);
+  --status-color: var(--info);
 }
 
 .session-status[data-status="awaiting_confirmation"] {
-  --session-status-color: var(--warning);
+  --status-color: var(--warning);
 }
 
 .session-status[data-status="completed"] {
-  --session-status-color: var(--success);
+  --status-color: var(--success);
 }
 
 .session-status[data-status="error"] {
-  --session-status-color: var(--danger);
+  --status-color: var(--danger);
 }
 
 .session-error {

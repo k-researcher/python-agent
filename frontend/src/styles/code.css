@@ -1,0 +1,89 @@
+/* Code blocks: chat answers (.code-block) and tool cards (.code-frame) share the
+   toolbar in the top right corner. The toolbar shows on hover and focus, and
+   always on touch screens. */
+
+.code-block {
+  position: relative;
+  margin: 0.6rem 0;
+}
+
+.code-block pre {
+  margin: 0;
+  padding: 0.75rem 0.9rem;
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+  background: var(--code-bg);
+  color: var(--code-text);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.code-block pre code {
+  white-space: inherit;
+}
+
+.code-block--nowrap pre {
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.code-toolbar {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 1;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.code-block:hover .code-toolbar,
+.code-frame:hover .code-toolbar,
+.code-toolbar:focus-within,
+.code-toolbar:has(.code-toolbar__note) {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .code-toolbar {
+    opacity: 1;
+  }
+}
+
+.code-toolbar__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 26px;
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid rgba(205, 217, 229, 0.12);
+  border-radius: var(--radius-sm);
+  background: var(--code-raised);
+  color: var(--code-muted);
+  font-family: var(--font-sans);
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
+.code-toolbar__btn:hover,
+.code-toolbar__btn:focus-visible {
+  color: var(--code-text);
+}
+
+.code-toolbar__btn[aria-pressed="true"] {
+  color: var(--code-text);
+}
+
+.copy-btn[data-state="done"] {
+  color: #57ab5a;
+}
+
+.copy-btn[data-state="failed"] {
+  color: #e5534b;
+}

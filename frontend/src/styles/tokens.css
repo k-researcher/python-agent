@@ -1,26 +1,33 @@
-/* Design tokens (UI spec §6). Light theme by default; dark via
-   prefers-color-scheme (unless data-theme="light") and via data-theme="dark". */
+/* Design tokens. A warm palette: cream light theme by default; warm dark via
+   prefers-color-scheme (unless data-theme="light") and via data-theme="dark".
+   Every text colour has a contrast of at least 4.5:1 on --bg, --surface and --bg-subtle. */
 
 :root {
   color-scheme: light;
 
-  --bg: #f7f7f8;
-  --bg-subtle: #ececee;
-  --surface: #ffffff;
-  --border: #e6e6e9;
-  --text: #111114;
-  --text-muted: #6b6b76;
-  --accent: #111114;
+  --bg: #faf6ef;
+  --bg-subtle: #f3ece2;
+  --surface: #fffcf7;
+  --border: #e4d8c8;
+  --text: #2b2118;
+  --text-muted: #6b5a4a;
+  --accent: #8a5a35;
   --accent-contrast: #ffffff;
-  --link: #2563eb;
-  --info: #2563eb;
-  --success: #16a34a;
-  --warning: #d97706;
-  --danger: #dc2626;
+  --link: #7b4b27;
+  --info: #2f6690;
+  --success: #276b54;
+  --warning: #835a0e;
+  --danger: #b3412e;
+
+  /* Code blocks keep one soft warm dark palette in both themes. */
+  --code-bg: #2a2420;
+  --code-raised: #352e29;
+  --code-text: #e3d9cc;
+  --code-muted: #9a8b7d;
 
   --radius: 10px;
   --radius-sm: 6px;
-  --shadow: 0 1px 2px rgba(17, 17, 20, 0.06), 0 8px 24px rgba(17, 17, 20, 0.08);
+  --shadow: 0 1px 2px rgba(43, 33, 24, 0.06), 0 8px 24px rgba(43, 33, 24, 0.08);
 
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji",
@@ -34,19 +41,19 @@
   :root:not([data-theme="light"]) {
     color-scheme: dark;
 
-    --bg: #0c0f14;
-    --bg-subtle: #161b24;
-    --surface: #121720;
-    --border: #293140;
-    --text: #e7eaf0;
-    --text-muted: #9ba7b8;
-    --accent: #e7eaf0;
-    --accent-contrast: #111114;
-    --link: #6ea8fe;
-    --info: #60a5fa;
-    --success: #2fbf71;
-    --warning: #e5a53d;
-    --danger: #ef6a6a;
+    --bg: #1b1714;
+    --bg-subtle: #2c261f;
+    --surface: #221d19;
+    --border: #3a3129;
+    --text: #ede4d8;
+    --text-muted: #a8988a;
+    --accent: #d9a577;
+    --accent-contrast: #1b1714;
+    --link: #e3b68c;
+    --info: #86b6de;
+    --success: #74c9a5;
+    --warning: #e2b45e;
+    --danger: #ee8c78;
 
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.4);
   }
@@ -56,19 +63,19 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  --bg: #0c0f14;
-  --bg-subtle: #161b24;
-  --surface: #121720;
-  --border: #293140;
-  --text: #e7eaf0;
-  --text-muted: #9ba7b8;
-  --accent: #e7eaf0;
-  --accent-contrast: #111114;
-  --link: #6ea8fe;
-  --info: #60a5fa;
-  --success: #2fbf71;
-  --warning: #e5a53d;
-  --danger: #ef6a6a;
+  --bg: #1b1714;
+  --bg-subtle: #2c261f;
+  --surface: #221d19;
+  --border: #3a3129;
+  --text: #ede4d8;
+  --text-muted: #a8988a;
+  --accent: #d9a577;
+  --accent-contrast: #1b1714;
+  --link: #e3b68c;
+  --info: #86b6de;
+  --success: #74c9a5;
+  --warning: #e2b45e;
+  --danger: #ee8c78;
 
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.4);
 }

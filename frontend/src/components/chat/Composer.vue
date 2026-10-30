@@ -225,7 +225,7 @@ button.send:disabled {
 
 button.stop {
   background: var(--danger, #dc2626);
-  color: #fff;
+  color: var(--accent-contrast, #fff);
   border-color: var(--danger, #dc2626);
 }
 

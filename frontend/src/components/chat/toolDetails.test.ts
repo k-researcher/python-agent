@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ToolCallView } from "./types";
 import {
+  resultBlocks,
   briefArgument,
   editDiff,
   fileEdits,
@@ -199,5 +200,68 @@ describe("editDiff", () => {
       ["remove", "b"],
       ["add", "c"],
     ]);
+  });
+});
+
+describe("resultBlocks", () => {
+  const done = (name: string, output: unknown, args: Record<string, unknown> = {}) =>
+    makeCall({ name, arguments: args, status: "completed", result: { success: true, output } });
+  const texts = (block: { lines: { text: string }[] }) => block.lines.map((line) => line.text);
+
+  it("shows read_file content in the file language with its first line number", () => {
+    const [block] = resultBlocks(
+      done("read_file", { path: "src/a.py", start_line: 10, content: "x = 1\ny = 2\n" }),
+    );
+    expect(block).toMatchObject({ lang: "python", start: 10 });
+    expect(texts(block)).toEqual(["x = 1", "y = 2"]);
+  });
+
+  it("lists directories with a trailing slash and finds of glob one per line", () => {
+    const [dir] = resultBlocks(
+      done("list_dir", { entries: [{ name: "src", type: "directory" }, { name: "a.py", type: "file" }] }),
+    );
+    expect(texts(dir)).toEqual(["src/", "a.py"]);
+    const [glob] = resultBlocks(done("glob", { paths: ["a.ts", "b.ts"] }));
+    expect(texts(glob)).toEqual(["a.ts", "b.ts"]);
+    const [none] = resultBlocks(done("glob", { paths: [] }));
+    expect(texts(none)).toEqual(["Ничего не найдено"]);
+  });
+
+  it("shows search matches as path:line text", () => {
+    const [block] = resultBlocks(
+      done("search_files", { matches: [{ path: "README.md", line: 82, text: "limit" }] }),
+    );
+    expect(texts(block)).toEqual(["README.md:82  limit"]);
+  });
+
+  it("colours git diffs and patches as diff, fetched pages as markdown", () => {
+    expect(resultBlocks(done("git_diff", { diff: "+a" }))[0].lang).toBe("diff");
+    expect(resultBlocks(done("git_show", { output: "+a" }))[0].lang).toBe("diff");
+    expect(resultBlocks(done("apply_patch", { files: [] }, { patch: "+a" }))[0].lang).toBe("diff");
+    expect(resultBlocks(done("web_fetch", { markdown: "# T" }))[0].lang).toBe("markdown");
+  });
+
+  it("chooses the HTTP body language from the content type", () => {
+    const json = resultBlocks(done("http_request", { status: 200, content_type: "application/json", body: '{"a":1}' }));
+    expect(json.at(-1)).toMatchObject({ lang: "json" });
+    expect(texts(json.at(-1)!)).toEqual(["{", '  "a": 1', "}"]);
+    const html = resultBlocks(done("http_request", { status: 200, content_type: "text/html", body: "<p>x</p>" }));
+    expect(html.at(-1)).toMatchObject({ lang: "html" });
+  });
+
+  it("shows any other output as formatted JSON or plain text", () => {
+    const [object] = resultBlocks(done("mcp__srv__tool", { rows: [1] }));
+    expect(object.lang).toBe("json");
+    expect(texts(object).join("\n")).toContain('"rows"');
+    const [text] = resultBlocks(done("custom", "plain answer"));
+    expect(text).toMatchObject({ lang: null });
+    expect(texts(text)).toEqual(["plain answer"]);
+  });
+
+  it("returns nothing without a successful result", () => {
+    expect(resultBlocks(makeCall({ name: "read_file" }))).toEqual([]);
+    expect(
+      resultBlocks(makeCall({ name: "read_file", result: { success: false, error: "no file" } })),
+    ).toEqual([]);
   });
 });

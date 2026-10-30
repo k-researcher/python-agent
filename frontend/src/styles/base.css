@@ -108,6 +108,20 @@ kbd {
   border-radius: var(--radius-sm);
 }
 
+/* Status pill: one look for every status label. Set --status-color for the tone. */
+.status-pill {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  color: var(--status-color, var(--text-muted));
+  background: color-mix(in srgb, var(--status-color, var(--text-muted)) 12%, transparent);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
 /* Utilities. */
 .muted {
   color: var(--text-muted);

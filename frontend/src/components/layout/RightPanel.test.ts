@@ -248,6 +248,7 @@ describe("RightPanel — context", () => {
   it("shows the omitted-messages count", () => {
     const wrapper = mountPanel();
     expect(wrapper.find('[data-omitted]').text()).toContain("3");
+    expect(wrapper.find('[data-omitted]').classes()).toContain("context-block__omitted--warning");
   });
 
   it("handles a missing context (null) gracefully", () => {
@@ -370,6 +371,7 @@ describe("RightPanel — context", () => {
       context: { approximate_tokens: 30, context_window: 100, omitted_messages: -1 },
     });
     expect(wrapper.find('[data-omitted]').text()).toBe("Пропущенных сообщений нет");
+    expect(wrapper.find('[data-omitted]').classes()).not.toContain("context-block__omitted--warning");
   });
 
   it("limits the wrapping layout to the compression metadata row", () => {
@@ -456,7 +458,7 @@ describe("RightPanel — tools, agents, audit", () => {
     const agents = wrapper.findAll(".agent-row");
     expect(agents).toHaveLength(2);
     expect(agents[0].text()).toContain("Дочерний");
-    expect(agents[0].text()).toContain("running");
+    expect(agents[0].get("[data-agent-status]").text()).toBe("Выполняется");
 
     await agents[1].find('[data-agent-id="c2"]').trigger("click");
     expect(wrapper.emitted("openSession")).toEqual([["c2"]]);

@@ -153,6 +153,18 @@ export async function installWsMock(page: Page): Promise<void> {
   );
 }
 
+/** The server wraps every session resource in one envelope with the run stamp. */
+export function snapshotEnvelope(data: unknown) {
+  return { data, run_generation: 0, revision: 1, consistent: true };
+}
+
+/** Replace one session resource (session, messages, approvals, context, ...) for this page. */
+export async function routeSnapshot(page: Page, sessionId: string, resource: string, data: () => unknown) {
+  await page.route(`**/api/sessions/${sessionId}/snapshot/${resource}`, (route) =>
+    route.fulfill({ json: snapshotEnvelope(data()) }),
+  );
+}
+
 async function json(route: import("@playwright/test").Route, status: number, body: unknown) {
   await route.fulfill({
     status,
@@ -201,6 +213,26 @@ export async function installRoutes(page: Page): Promise<void> {
     }
     if (path === "/ws") {
       await route.abort();
+      return;
+    }
+
+    const snapshot = /^\/api\/sessions\/([^/]+)\/snapshot\/([^/]+)$/.exec(path);
+    if (snapshot) {
+      const [, sid, resource] = snapshot;
+      if (sid !== "s1" && sid !== "s2") {
+        await json(route, 404, { detail: "not found" });
+        return;
+      }
+      const resources: Record<string, unknown> = {
+        session: sid === "s1" ? mockSessions[0] : mockSessions[1],
+        messages: mockMessages,
+        approvals: [],
+        children: [],
+        audit: [],
+        context: mockContext,
+      };
+      if (resource in resources) await json(route, 200, snapshotEnvelope(resources[resource]));
+      else await json(route, 404, { detail: "not found" });
       return;
     }
 
@@ -289,9 +321,11 @@ export async function assertThemeApplied(page: Page, theme: "light" | "dark"): P
   }));
   if (theme === "dark") {
     expect(applied.attr).toBe("dark");
-    expect(applied.bg).toMatch(/rgb\((12|17|18),/);
+    // --bg of the warm dark theme: #1b1714.
+    expect(applied.bg).toBe("rgb(27, 23, 20)");
   } else {
-    expect(applied.bg).toMatch(/rgb\(247,/);
+    // --bg of the warm light theme: #faf6ef.
+    expect(applied.bg).toBe("rgb(250, 246, 239)");
   }
 }
 

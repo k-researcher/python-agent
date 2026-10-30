@@ -149,7 +149,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 }
 button.approve {
   background: var(--accent, #111114);
-  color: #fff;
+  color: var(--accent-contrast, #fff);
   border-color: var(--accent, #111114);
 }
 button.reject {
@@ -185,7 +185,7 @@ button.reject {
 }
 .comment-actions .primary {
   background: var(--accent, #111114);
-  color: #fff;
+  color: var(--accent-contrast, #fff);
   border-color: var(--accent, #111114);
 }
 </style>

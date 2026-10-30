@@ -4,6 +4,7 @@
 
 import type { ToolCallView } from "./types";
 import { diffLines, type DiffLine } from "./diff";
+import { languageForPath } from "../../highlight";
 
 export const STATUS_LABEL: Record<string, string> = {
   pending: "Ожидание",
@@ -169,4 +170,98 @@ function objectFromUnknown(value: unknown): Record<string, unknown> {
     }
   }
   return {};
+}
+
+export interface ResultBlock {
+  label?: string;
+  lines: { text: string }[];
+  lang: string | null;
+  /** Number of the first line, when the block is a part of a file. */
+  start?: number;
+}
+
+function lines(text: string): { text: string }[] {
+  return text.replace(/\n$/, "").split("\n").map((line) => ({ text: line }));
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function text(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function bodyLanguage(contentType: string): string | null {
+  const type = contentType.toLowerCase();
+  if (type.includes("json")) return "json";
+  if (type.includes("html")) return "html";
+  if (type.includes("xml")) return "xml";
+  if (type.includes("markdown")) return "markdown";
+  if (type.includes("javascript")) return "javascript";
+  if (type.includes("css")) return "css";
+  return null;
+}
+
+function formatted(body: string, lang: string | null): string {
+  if (lang !== "json") return body;
+  try {
+    return JSON.stringify(JSON.parse(body), null, 2);
+  } catch {
+    return body;
+  }
+}
+
+/**
+ * The result of a finished tool call as code blocks, each in its own language.
+ * Shell, file edits and engine patches have their own views in ToolCallCard.
+ */
+export function resultBlocks(call: ToolCallView): ResultBlock[] {
+  const result = call.result;
+  if (!result || !result.success) return [];
+  const output = result.output;
+  const out = record(output);
+  const args = call.arguments ?? {};
+  switch (call.name) {
+    case "read_file":
+      return [
+        {
+          lines: lines(text(out.content)),
+          lang: languageForPath(text(out.path) || text(args.path)),
+          start: typeof out.start_line === "number" ? out.start_line : 1,
+        },
+      ];
+    case "list_dir": {
+      const entries = Array.isArray(out.entries) ? out.entries.map(record) : [];
+      const names = entries.map((entry) => text(entry.name) + (entry.type === "directory" ? "/" : ""));
+      return [{ lines: names.length ? names.map((name) => ({ text: name })) : [{ text: "Каталог пуст" }], lang: null }];
+    }
+    case "glob": {
+      const paths = Array.isArray(out.paths) ? out.paths.filter((p): p is string => typeof p === "string") : [];
+      return [{ lines: paths.length ? paths.map((path) => ({ text: path })) : [{ text: "Ничего не найдено" }], lang: null }];
+    }
+    case "search_files": {
+      const matches = Array.isArray(out.matches) ? out.matches.map(record) : [];
+      const found = matches.map((m) => ({ text: `${text(m.path)}:${String(m.line ?? "")}  ${text(m.text)}` }));
+      return [{ lines: found.length ? found : [{ text: "Ничего не найдено" }], lang: null }];
+    }
+    case "git_diff":
+      return [{ lines: lines(text(out.diff)), lang: "diff" }];
+    case "git_show":
+      return [{ lines: lines(text(out.output)), lang: "diff" }];
+    case "apply_patch":
+      return [{ lines: lines(text(args.patch)), lang: "diff" }];
+    case "web_fetch":
+      return [{ label: text(out.url) || undefined, lines: lines(text(out.markdown)), lang: "markdown" }];
+    case "http_request": {
+      const lang = bodyLanguage(text(out.content_type));
+      return [
+        { lines: [{ text: `HTTP ${String(out.status ?? "")} ${text(out.content_type)}`.trim() }], lang: null },
+        { lines: lines(formatted(text(out.body), lang)), lang },
+      ];
+    }
+  }
+  if (typeof output === "string") return [{ lines: lines(output), lang: null }];
+  if (output == null) return [];
+  return [{ lines: lines(JSON.stringify(output, null, 2)), lang: "json" }];
 }

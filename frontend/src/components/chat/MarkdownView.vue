@@ -1,101 +1,91 @@
 <script setup lang="ts">
-// Renders a chat message as sanitized markdown with lazy shiki highlighting
-// and a copy button on every code block.
+// Renders a chat message as sanitized markdown with lazy shiki highlighting.
+// Every code block gets the shared toolbar (copy, line wrap) inside its corner.
 
-import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { h, nextTick, onBeforeUnmount, ref, render, watch } from "vue";
 import { highlightCodeBlocks, renderMarkdown, wrapCodeBlocksInPre } from "./markdown";
+import CodeToolbar from "./CodeToolbar.vue";
 
-const props = withDefaults(defineProps<{ source?: string; dark?: boolean }>(), {
-  source: "",
-  dark: undefined,
-});
-
-const isDark = computed(() => {
-  if (props.dark !== undefined) return props.dark;
-  if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
-    return window.matchMedia("(prefers-color-scheme: dark)").matches;
-  }
-  return false;
-});
+const props = withDefaults(defineProps<{ source?: string }>(), { source: "" });
 
 const html = ref("");
 const rootEl = ref<HTMLElement | null>(null);
+// Toolbar hosts mounted into the v-html content; unmount them before it is replaced.
+let hosts: HTMLElement[] = [];
 let generation = 0;
 let disposed = false;
 
+function unmountToolbars(): void {
+  for (const host of hosts) render(null, host);
+  hosts = [];
+}
+
+async function show(content: string, gen: number): Promise<boolean> {
+  unmountToolbars();
+  html.value = content;
+  await nextTick();
+  if (disposed || gen !== generation) return false;
+  attachToolbars();
+  return true;
+}
+
 onBeforeUnmount(() => {
   disposed = true;
+  unmountToolbars();
 });
 
 watch(
-  [() => props.source, isDark],
+  () => props.source,
   async () => {
     const gen = ++generation;
     const base = wrapCodeBlocksInPre(renderMarkdown(props.source ?? ""));
-    if (disposed || gen !== generation) return;
-    // First paint plain code blocks and attach copy buttons before async
-    // shiki highlighting finishes, so copying never depends on it.
-    html.value = base;
-    await nextTick();
-    if (disposed || gen !== generation) return;
-    attachCopyButtons();
+    // First paint plain code blocks with their toolbars before async shiki
+    // highlighting finishes, so copying never depends on it.
+    if (!(await show(base, gen))) return;
     let highlighted = base;
     try {
-      highlighted = await highlightCodeBlocks(base, isDark.value);
+      highlighted = await highlightCodeBlocks(base);
     } catch {
       // Shiki unavailable -> keep the plain, wrapped blocks.
       highlighted = base;
     }
     if (disposed || gen !== generation) return;
-    html.value = highlighted;
-    await nextTick();
-    if (disposed || gen !== generation) return;
-    attachCopyButtons();
+    await show(highlighted, gen);
   },
   { immediate: true, flush: "post" },
 );
 
-async function copyCode(button: HTMLButtonElement, pre: HTMLElement): Promise<void> {
-  const code = pre.querySelector("code");
-  const text = code?.textContent ?? "";
-  const original = button.textContent ?? "";
-  try {
-    await navigator.clipboard.writeText(text);
-    button.textContent = "Скопировано";
-  } catch {
-    button.textContent = "Не удалось скопировать";
-  }
-  window.setTimeout(() => {
-    button.textContent = original;
-    button.disabled = false;
-  }, 1200);
-}
-
-function attachCopyButtons(): void {
+function attachToolbars(): void {
   const root = rootEl.value;
   if (!root) return;
-  // Idempotency marker: skip <pre> blocks that already carry a copy button so
-  // a re-run after source/highlight updates never creates a second one.
   for (const pre of Array.from(root.querySelectorAll<HTMLElement>("pre"))) {
-    if (pre.dataset.hasCopyBtn === "true") continue;
+    // Skip a <pre> that is already inside a block, so a re-run never adds a second toolbar.
     if (pre.parentElement?.classList.contains("code-block")) continue;
     const block = document.createElement("div");
     block.className = "code-block";
-    const toolbar = document.createElement("div");
-    toolbar.className = "code-block__toolbar";
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "copy-btn";
-    button.textContent = "Копировать";
-    button.addEventListener("click", () => {
-      button.disabled = true;
-      void copyCode(button, pre);
-    });
-    pre.dataset.hasCopyBtn = "true";
+    const host = document.createElement("div");
+    host.className = "code-block__toolbar";
     pre.parentNode?.insertBefore(block, pre);
+    block.appendChild(host);
     block.appendChild(pre);
-    toolbar.appendChild(button);
-    block.insertBefore(toolbar, pre);
+    hosts.push(host);
+    render(
+      h({
+        setup() {
+          const wrapped = ref(true);
+          return () =>
+            h(CodeToolbar, {
+              text: () => pre.querySelector("code")?.textContent ?? "",
+              wrapped: wrapped.value,
+              onToggleWrap: () => {
+                wrapped.value = !wrapped.value;
+                block.classList.toggle("code-block--nowrap", !wrapped.value);
+              },
+            });
+        },
+      }),
+      host,
+    );
   }
 }
 </script>
@@ -125,47 +115,5 @@ function attachCopyButtons(): void {
   color: var(--link, #2563eb);
   text-decoration: underline;
   text-underline-offset: 2px;
-}
-</style>
-
-<!-- Code blocks and their copy buttons are injected via v-html at runtime, so
-     they can't carry the scoped-data attribute; style them globally. -->
-<style>
-.code-block {
-  position: relative;
-  margin: 0.6rem 0;
-}
-
-.code-block__toolbar {
-  display: flex;
-  justify-content: flex-end;
-  gap: 0.5rem;
-  margin-bottom: 0.2rem;
-}
-
-.code-block pre {
-  margin: 0;
-  padding: 1rem 0.9rem 0.8rem;
-  border: 1px solid var(--border, #e6e6e9);
-  border-radius: var(--radius-sm, 6px);
-  overflow-x: auto;
-  background: var(--bg-subtle, #f4f4f6);
-  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-  font-size: 0.82rem;
-  line-height: 1.5;
-}
-
-.code-block .copy-btn {
-  padding: 0.15rem 0.5rem;
-  font-size: 0.7rem;
-  border: 1px solid var(--border, #e6e6e9);
-  border-radius: var(--radius-sm, 6px);
-  background: var(--surface, #fff);
-  color: var(--text-muted, #6b6b76);
-  cursor: pointer;
-}
-.code-block .copy-btn:hover {
-  color: var(--text, #111114);
-  border-color: var(--accent, #111114);
 }
 </style>

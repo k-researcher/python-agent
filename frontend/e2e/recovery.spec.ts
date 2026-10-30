@@ -9,6 +9,7 @@ import {
   viewportWidthOf,
   mockMessages,
   mockSessions,
+  routeSnapshot,
 } from "./helpers";
 
 /** A user message followed by a partial assistant reply for a running session. */
@@ -68,12 +69,8 @@ async function openSessionWithOwnWs(
 test.describe("session state recovery", () => {
   test("reload during a running session keeps messages, status and the busy indicator", async ({ page }, testInfo) => {
     await openSessionViaSidebar(page, testInfo, "s1");
-    await page.route("**/api/sessions/s1", (route) =>
-      route.fulfill({ json: { ...mockSessions[0], status: "running" } }),
-    );
-    await page.route("**/api/sessions/s1/messages", (route) =>
-      route.fulfill({ json: runningSessionMessages() }),
-    );
+    await routeSnapshot(page, "s1", "session", () => ({ ...mockSessions[0], status: "running" }));
+    await routeSnapshot(page, "s1", "messages", () => (runningSessionMessages()));
 
     await page.reload();
 
@@ -96,12 +93,8 @@ test.describe("session state recovery", () => {
         decisions.push(route.request().postDataJSON());
         return route.fulfill({ json: { session_id: "s1", decision: "approve" } });
       });
-      await page.route("**/api/sessions/s1", (route) =>
-        route.fulfill({ json: { ...mockSessions[0], status: "awaiting_confirmation" } }),
-      );
-      await page.route("**/api/sessions/s1/messages", (route) =>
-        route.fulfill({
-          json: [
+      await routeSnapshot(page, "s1", "session", () => ({ ...mockSessions[0], status: "awaiting_confirmation" }));
+      await routeSnapshot(page, "s1", "messages", () => ([
             {
               ...mockMessages[0],
               id: 21,
@@ -116,12 +109,8 @@ test.describe("session state recovery", () => {
                 },
               ],
             },
-          ],
-        }),
-      );
-      await page.route("**/api/sessions/s1/approvals**", (route) =>
-        route.fulfill({
-          json: [
+          ]));
+      await routeSnapshot(page, "s1", "approvals", () => ([
             {
               id: "ap1",
               tool_call_id: "call_1",
@@ -131,9 +120,7 @@ test.describe("session state recovery", () => {
               status: "pending",
               comment: null,
             },
-          ],
-        }),
-      );
+          ]));
 
       await page.reload();
 
@@ -153,23 +140,20 @@ test.describe("session state recovery", () => {
 
     await openSessionWithOwnWs(page, testInfo, "s1", sockets, () => {
       // Registered after installRoutes so it shadows the generic `**/*` mock.
-      page.route("**/api/sessions/s1/messages", (route) => {
+      void routeSnapshot(page, "s1", "messages", () => {
         messageCalls += 1;
-        route.fulfill({
-          json:
-            messageCalls === 1
-              ? [{ ...mockMessages[0], id: 11, content: "старое сообщение" }]
-              : [
-                  { ...mockMessages[0], id: 11, content: "старое сообщение" },
-                  {
-                    ...mockMessages[0],
-                    id: 12,
-                    role: "assistant",
-                    kind: "assistant",
-                    content: "пропущенный ответ",
-                  },
-                ],
-        });
+        return messageCalls === 1
+          ? [{ ...mockMessages[0], id: 11, content: "старое сообщение" }]
+          : [
+              { ...mockMessages[0], id: 11, content: "старое сообщение" },
+              {
+                ...mockMessages[0],
+                id: 12,
+                role: "assistant",
+                kind: "assistant",
+                content: "пропущенный ответ",
+              },
+            ];
       });
     });
 
@@ -204,14 +188,8 @@ test.describe("session state recovery", () => {
 
   test("shows the final status and answer when a session completed while the tab was closed", async ({ page }, testInfo) => {
     await openSessionViaSidebar(page, testInfo, "s1");
-    await page.route("**/api/sessions/s1", (route) =>
-      route.fulfill({ json: { ...mockSessions[0], status: "completed" } }),
-    );
-    await page.route("**/api/sessions/s1/messages", (route) =>
-      route.fulfill({
-        json: [{ ...mockMessages[0], id: 31, content: "Итоговый ответ агента" }],
-      }),
-    );
+    await routeSnapshot(page, "s1", "session", () => ({ ...mockSessions[0], status: "completed" }));
+    await routeSnapshot(page, "s1", "messages", () => ([{ ...mockMessages[0], id: 31, content: "Итоговый ответ агента" }]));
 
     await page.reload();
 
