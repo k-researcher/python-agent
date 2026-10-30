@@ -9,22 +9,31 @@ import { ApiError } from "../api/client";
 import {
   modelSettings,
   type DiscoveredModel,
+  type LocalServer,
   type ModelView,
   type ModelsView,
+  type ProbeResult,
   type ProviderView,
 } from "../api/modelSettings";
 import {
   MIN_CONTEXT,
   PROVIDER_PRESETS,
+  SERVER_NAMES,
   addedAs,
   canChat,
-  formatTokens,
+  describeFound,
+  isLocalUrl,
   isValidId,
   keyStatus,
   originLabel,
+  probeText,
+  providerIdFor,
+  rolesOf,
   suggestModel,
 } from "../components/settings/modelForms";
 import { useAppStore } from "../stores/app";
+
+const IN_ROLE_HINT = "Модель назначена на роль: сначала выберите для роли другую модель";
 
 const router = useRouter();
 const appStore = useAppStore();
@@ -41,10 +50,119 @@ interface Discovery {
 }
 const discoveries = reactive<Record<string, Discovery>>({});
 
+// One-token checks: of found models by "provider model", and of agent models by model ID.
+type Check = ProbeResult | "checking";
+const foundChecks = reactive<Record<string, Check>>({});
+const modelChecks = reactive<Record<string, Check>>({});
+const foundKey = (provider: string, model: string) => `${provider} ${model}`;
+
+const localServers = ref<LocalServer[] | null>(null);
+const scanning = ref(false);
+
+// The list of a cloud gateway can keep models that no longer answer, so its models are
+// checked before they can be added. A local server lists the models it really has.
+function needsCheck(provider: ProviderView): boolean {
+  return !isLocalUrl(provider.base_url);
+}
+
+function foundCheck(provider: ProviderView, found: DiscoveredModel): Check | undefined {
+  return foundChecks[foundKey(provider.id, found.id)];
+}
+
+function answered(check: Check | undefined): check is ProbeResult {
+  return !!check && check !== "checking" && check.ok;
+}
+
+function failed(check: Check | undefined): check is ProbeResult {
+  return !!check && check !== "checking" && !check.ok;
+}
+
+/** Found models offered for adding: a gateway's model only after it answered. */
+function offered(provider: ProviderView): DiscoveredModel[] {
+  return (discoveries[provider.id]?.found ?? []).filter(
+    (found) => !(needsCheck(provider) && canChat(found) && failed(foundCheck(provider, found))),
+  );
+}
+
+function dead(provider: ProviderView): string[] {
+  return (discoveries[provider.id]?.found ?? [])
+    .filter((found) => needsCheck(provider) && canChat(found) && failed(foundCheck(provider, found)))
+    .map((found) => `${found.id} (${probeText(foundCheck(provider, found) as ProbeResult).replace("Не отвечает: ", "")})`);
+}
+
+async function checkFound(provider: ProviderView, found: DiscoveredModel): Promise<void> {
+  const key = foundKey(provider.id, found.id);
+  foundChecks[key] = "checking";
+  try {
+    foundChecks[key] = await modelSettings.probeFound(provider.id, found.id);
+  } catch (error) {
+    foundChecks[key] = { ok: false, status: null, seconds: null, message: message(error) };
+  }
+}
+
+async function checkModel(item: ModelView): Promise<void> {
+  modelChecks[item.id] = "checking";
+  try {
+    modelChecks[item.id] = await modelSettings.probeModel(item.id);
+  } catch (error) {
+    modelChecks[item.id] = { ok: false, status: null, seconds: null, message: message(error) };
+  }
+  // The composer hides a model that did not answer.
+  await appStore.loadConfig().catch(() => undefined);
+}
+
+async function scan(): Promise<void> {
+  scanning.value = true;
+  try {
+    localServers.value = await modelSettings.scanLocal();
+  } catch {
+    localServers.value = [];
+  } finally {
+    scanning.value = false;
+  }
+}
+
+async function connectLocal(server: LocalServer): Promise<void> {
+  if (!view.value) return;
+  const id = providerIdFor(server.server, view.value.providers);
+  const saved = await apply(`provider:${id}`, () =>
+    modelSettings.putProvider(id, { kind: "openai", base_url: server.base_url }),
+  );
+  if (!saved) return;
+  server.provider = id;
+  const provider = view.value?.providers.find((item) => item.id === id);
+  if (provider) await discover(provider);
+}
+
+function providerOf(item: ModelView): ProviderView | undefined {
+  return view.value?.providers.find((provider) => provider.id === item.provider);
+}
+
 const presetKey = ref(PROVIDER_PRESETS[0].key);
 const preset = computed(() => PROVIDER_PRESETS.find((item) => item.key === presetKey.value) ?? PROVIDER_PRESETS[0]);
 const form = reactive({ id: PROVIDER_PRESETS[0].id, baseUrl: PROVIDER_PRESETS[0].baseUrl, apiKey: "" });
 const showForm = ref(false);
+
+// Provider address being edited, by provider ID.
+const addresses = reactive<Record<string, string>>({});
+
+function addressError(value: string): string {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? "" : "Адрес должен начинаться с http:// или https://";
+  } catch {
+    return "Укажите адрес, например http://127.0.0.1:1234/v1";
+  }
+}
+
+async function saveAddress(item: ProviderView): Promise<void> {
+  const value = addresses[item.id]?.trim() ?? "";
+  if (addressError(value)) return;
+  const saved = await apply(`provider:${item.id}`, () => modelSettings.putProvider(item.id, { base_url: value }));
+  if (!saved) return;
+  delete addresses[item.id];
+  delete discoveries[item.id];
+}
 
 // Edited context and answer limits, by model ID, until saved.
 const limits = reactive<Record<string, { context_window: number; max_tokens: number }>>({});
@@ -136,6 +254,9 @@ async function discover(provider: ProviderView): Promise<void> {
         ? found.length ? "" : "Сервер не вернул ни одной модели"
         : "Сервер не отвечает. Проверьте, что он запущен и адрес верный.",
     };
+    if (result.ok && needsCheck(provider)) {
+      await Promise.all(found.filter(canChat).map((item) => checkFound(provider, item)));
+    }
   } catch (error) {
     discoveries[provider.id] = { loading: false, found: [], message: message(error) };
   }
@@ -205,7 +326,15 @@ function back(): void {
   else void router.push({ name: "home" });
 }
 
-onMounted(load);
+onMounted(async () => {
+  await Promise.all([load(), scan()]);
+  // Check the cloud models at once; a local check would load the model into memory.
+  const remote = (view.value?.models ?? []).filter((item) => {
+    const provider = providerOf(item);
+    return !item.disabled && provider && !provider.disabled && needsCheck(provider);
+  });
+  await Promise.all(remote.map(checkModel));
+});
 </script>
 
 <template>
@@ -238,6 +367,39 @@ onMounted(load);
         </div>
         <p class="hint">Сервер с OpenAI-совместимым API: облачный шлюз или локальный, например LM Studio.</p>
 
+        <div class="card local" data-testid="local-servers">
+          <div class="card__row">
+            <strong>На этом компьютере</strong>
+            <button type="button" class="ghost" :disabled="scanning" data-testid="local-scan" @click="scan">
+              <Search :size="15" aria-hidden="true" />
+              <span>{{ scanning ? "Ищу…" : "Искать снова" }}</span>
+            </button>
+          </div>
+          <p v-if="localServers && !localServers.length" class="muted small">
+            Запущенных серверов моделей не найдено. Запустите сервер в LM Studio (<code>lms server start</code>)
+            или Ollama и нажмите «Искать снова».
+          </p>
+          <ul v-else-if="localServers" class="local__list">
+            <li v-for="server in localServers" :key="server.base_url" class="found__row" :data-local="server.base_url">
+              <span>{{ SERVER_NAMES[server.server] }}</span>
+              <span class="mono muted small">{{ server.base_url }}</span>
+              <span class="muted small">моделей: {{ server.models }}</span>
+              <span v-if="server.provider" class="muted small found__state">Подключён как {{ server.provider }}</span>
+              <button
+                v-else
+                type="button"
+                class="ghost found__state"
+                :disabled="!!busy"
+                data-testid="local-connect"
+                @click="connectLocal(server)"
+              >
+                <Plus :size="14" aria-hidden="true" />
+                <span>Подключить</span>
+              </button>
+            </li>
+          </ul>
+        </div>
+
         <form v-if="showForm" class="card form" data-testid="provider-form" @submit.prevent="addProvider">
           <div class="presets" role="radiogroup" aria-label="Тип сервера">
             <button
@@ -264,8 +426,9 @@ onMounted(load);
             <input v-model="form.apiKey" type="password" data-testid="provider-key" autocomplete="off" />
           </label>
           <p v-if="preset.key === 'lmstudio'" class="hint">
-            Запустите сервер в LM Studio (вкладка Developer или <code>lms server start</code>). Длина контекста
-            модели при загрузке должна быть не меньше той, что указана здесь.
+            Запустите сервер в LM Studio (вкладка Developer или <code>lms server start</code>). Порт сервера
+            виден там же, по умолчанию 1234. Длина контекста модели при загрузке должна быть не меньше той,
+            что указана здесь.
           </p>
           <p v-if="formError" class="field-error" data-testid="provider-form-error">{{ formError }}</p>
           <div class="actions">
@@ -301,6 +464,13 @@ onMounted(load);
                 <Search :size="15" aria-hidden="true" />
                 <span>{{ discoveries[item.id]?.loading ? "Ищу…" : "Найти модели" }}</span>
               </button>
+              <button
+                type="button"
+                class="ghost"
+                :disabled="!!busy"
+                data-testid="provider-edit-url"
+                @click="addresses[item.id] = item.base_url"
+              >Изменить адрес</button>
               <button type="button" class="ghost" :disabled="!!busy" @click="toggleProvider(item)">
                 {{ item.disabled ? "Включить" : "Отключить" }}
               </button>
@@ -315,30 +485,66 @@ onMounted(load);
             </div>
           </div>
 
+          <form
+            v-if="addresses[item.id] !== undefined"
+            class="address"
+            data-testid="provider-url-form"
+            @submit.prevent="saveAddress(item)"
+          >
+            <input v-model.trim="addresses[item.id]" class="mono" aria-label="Адрес API" data-testid="provider-url-edit" />
+            <button type="submit" class="primary" :disabled="!!addressError(addresses[item.id]) || !!busy">Сохранить</button>
+            <button type="button" class="ghost" @click="delete addresses[item.id]">Отмена</button>
+            <span v-if="addressError(addresses[item.id])" class="field-error">{{ addressError(addresses[item.id]) }}</span>
+          </form>
+
           <div v-if="discoveries[item.id] && !discoveries[item.id].loading" class="found" data-testid="found-models">
             <p v-if="discoveries[item.id].message" class="muted small">{{ discoveries[item.id].message }}</p>
-            <ul v-else>
-              <li v-for="found in discoveries[item.id].found" :key="found.id" class="found__row" :data-found="found.id">
-                <span class="mono">{{ found.id }}</span>
-                <span class="muted small">
-                  {{ canChat(found) ? `контекст ${formatTokens(found.context_window)}` : "модель эмбеддингов" }}
-                </span>
-                <span v-if="addedAs(view.models, item.id, found.id)" class="muted small found__state">
-                  Добавлена как {{ addedAs(view.models, item.id, found.id) }}
-                </span>
-                <button
-                  v-else-if="canChat(found)"
-                  type="button"
-                  class="ghost found__state"
-                  :disabled="!!busy"
-                  data-testid="found-add"
-                  @click="addModel(item, found)"
-                >
-                  <Plus :size="14" aria-hidden="true" />
-                  <span>Добавить</span>
-                </button>
-              </li>
-            </ul>
+            <template v-else>
+              <ul>
+                <li v-for="found in offered(item)" :key="found.id" class="found__row" :data-found="found.id">
+                  <span class="mono">{{ found.id }}</span>
+                  <span class="muted small">{{ describeFound(found) }}</span>
+                  <span v-if="found.state" class="muted small">
+                    {{ found.state === "loaded" ? "загружена в память" : "не загружена" }}
+                  </span>
+                  <span v-if="foundCheck(item, found) === 'checking'" class="muted small">Проверяю…</span>
+                  <span v-else-if="answered(foundCheck(item, found))" class="small ok" data-testid="found-check">
+                    {{ probeText(foundCheck(item, found) as ProbeResult) }}
+                  </span>
+                  <span v-else-if="failed(foundCheck(item, found))" class="small bad" data-testid="found-check">
+                    {{ probeText(foundCheck(item, found) as ProbeResult) }}
+                  </span>
+                  <span v-if="addedAs(view.models, item.id, found.id)" class="muted small found__state">
+                    Добавлена как {{ addedAs(view.models, item.id, found.id) }}
+                  </span>
+                  <template v-else-if="canChat(found)">
+                    <button
+                      v-if="!needsCheck(item) && !foundCheck(item, found)"
+                      type="button"
+                      class="ghost found__state"
+                      title="Короткий запрос к модели; сервер загрузит её в память"
+                      data-testid="found-probe"
+                      @click="checkFound(item, found)"
+                    >Проверить</button>
+                    <button
+                      v-if="!needsCheck(item) || answered(foundCheck(item, found))"
+                      type="button"
+                      class="ghost"
+                      :class="{ found__state: needsCheck(item) || !!foundCheck(item, found) }"
+                      :disabled="!!busy"
+                      data-testid="found-add"
+                      @click="addModel(item, found)"
+                    >
+                      <Plus :size="14" aria-hidden="true" />
+                      <span>Добавить</span>
+                    </button>
+                  </template>
+                </li>
+              </ul>
+              <p v-if="dead(item).length" class="small bad" data-testid="found-dead">
+                Не отвечают, добавить нельзя: {{ dead(item).join(", ") }}
+              </p>
+            </template>
           </div>
         </article>
       </section>
@@ -360,16 +566,44 @@ onMounted(load);
               <span class="muted small">
                 <span class="mono">{{ item.model }}</span> · {{ item.provider }} · {{ originLabel(item.origin) }}
               </span>
+              <span v-if="rolesOf(view.routing, item.id).length" class="small" data-testid="model-roles">
+                Роль: {{ rolesOf(view.routing, item.id).join(", ") }}
+              </span>
+              <span v-if="modelChecks[item.id] === 'checking'" class="muted small">Проверяю…</span>
+              <span
+                v-else-if="modelChecks[item.id]"
+                class="small"
+                :class="answered(modelChecks[item.id]) ? 'ok' : 'bad'"
+                data-testid="model-check"
+              >{{ probeText(modelChecks[item.id] as ProbeResult) }}{{
+                failed(modelChecks[item.id]) ? " · не предлагается для новых сессий" : ""
+              }}</span>
             </div>
             <div class="card__actions">
-              <button type="button" class="ghost" :disabled="!!busy" @click="toggleModel(item)">
+              <button
+                type="button"
+                class="ghost"
+                :disabled="item.disabled || modelChecks[item.id] === 'checking'"
+                :title="providerOf(item) && !needsCheck(providerOf(item)!) ? 'Сервер загрузит модель в память' : undefined"
+                data-testid="model-probe"
+                @click="checkModel(item)"
+              >Проверить</button>
+              <button
+                type="button"
+                class="ghost"
+                :disabled="!!busy || (!item.disabled && !!rolesOf(view.routing, item.id).length)"
+                :title="!item.disabled && rolesOf(view.routing, item.id).length ? IN_ROLE_HINT : undefined"
+                data-testid="model-toggle"
+                @click="toggleModel(item)"
+              >
                 {{ item.disabled ? "Включить" : "Отключить" }}
               </button>
               <button
                 v-if="item.origin === 'ui'"
                 type="button"
                 class="ghost danger"
-                :disabled="!!busy"
+                :disabled="!!busy || !!rolesOf(view.routing, item.id).length"
+                :title="rolesOf(view.routing, item.id).length ? IN_ROLE_HINT : undefined"
                 data-testid="model-remove"
                 @click="removeModel(item)"
               >Удалить</button>
@@ -637,6 +871,24 @@ input.mono {
   color: var(--warning);
 }
 
+.ok {
+  color: var(--success);
+}
+
+.bad {
+  color: var(--danger);
+}
+
+.local {
+  margin-bottom: 4px;
+}
+
+.local__list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
 .found {
   margin-top: 10px;
   padding-top: 8px;
@@ -660,6 +912,19 @@ input.mono {
 
 .found__state {
   margin-left: auto;
+}
+
+.address {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.address input {
+  flex: 1 1 18rem;
+  min-width: 0;
 }
 
 .limits {

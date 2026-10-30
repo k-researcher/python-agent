@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import attributes, selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
+from agent import model_health
 from agent.auth import check_request
 from agent.checkpoints import load_context_rows
 from agent.config import Settings, get_settings
@@ -230,6 +231,8 @@ async def public_config(request: Request, db: AsyncSession = Depends(get_db)) ->
                 "max_tokens": model.max_tokens,
                 "reasoning_efforts": model.reasoning.allowed_efforts,
                 "default_reasoning_effort": model.reasoning.default_effort,
+                # The last check: "ok", "failed" or None when the model is not checked.
+                "available": model_health.health(model.id, model.base_url, model.model),
             }
             for model in models.models.values()
         ],

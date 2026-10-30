@@ -45,7 +45,24 @@ export interface ModelsView {
 export interface DiscoveredModel {
   id: string;
   context_window: number | null;
+  max_output_tokens?: number | null;
   kind: string | null;
+  /** A local server says whether the model is loaded into memory. */
+  state?: string | null;
+}
+
+export interface ProbeResult {
+  ok: boolean;
+  status: number | null;
+  seconds: number | null;
+  message?: string;
+}
+
+export interface LocalServer {
+  base_url: string;
+  server: "lmstudio" | "ollama" | "openai";
+  models: number;
+  provider: string | null;
 }
 
 export interface ConnectionResult {
@@ -90,4 +107,11 @@ export const modelSettings = {
   removeModel: (id: string) => request<ModelsView>(`${PREFIX}/models/${modelPath(id)}`, { method: "DELETE" }),
   testProvider: (id: string) =>
     request<ConnectionResult>(`${PREFIX}/providers/${encodeURIComponent(id)}/test`, { method: "POST" }),
+  probeFound: (providerId: string, model: string) =>
+    request<ProbeResult>(`${PREFIX}/providers/${encodeURIComponent(providerId)}/probe`, {
+      method: "POST",
+      body: JSON.stringify({ model }),
+    }),
+  probeModel: (id: string) => request<ProbeResult>(`${PREFIX}/models/${modelPath(id)}/probe`, { method: "POST" }),
+  scanLocal: () => request<LocalServer[]>(`${PREFIX}/local-servers`, { method: "POST" }),
 };

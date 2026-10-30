@@ -150,6 +150,15 @@ describe("layout adapters", () => {
       ],
     };
     expect(toModelOptions(config)).toEqual([{ id: "p1", label: "p1 · model-a" }]);
+    const checked = {
+      ...config,
+      llm_profiles: [
+        { name: "ok", model: "a", destination: "dst", configured: true, available: "ok" as const },
+        { name: "dead", model: "b", destination: "dst", configured: true, available: "failed" as const },
+        { name: "unchecked", model: "c", destination: "dst", configured: true, available: null },
+      ],
+    };
+    expect(toModelOptions(checked).map((option) => option.id)).toEqual(["ok", "unchecked"]);
     expect(toModelOptions(null)).toEqual([]);
   });
 

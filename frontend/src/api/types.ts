@@ -100,6 +100,8 @@ export interface PublicConfig {
     configured: boolean;
     reasoning_efforts?: string[];
     default_reasoning_effort?: string | null;
+    /** The last check of the model: "failed" means it did not answer. */
+    available?: "ok" | "failed" | null;
   }>;
 }
 

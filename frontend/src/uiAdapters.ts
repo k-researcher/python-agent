@@ -38,7 +38,8 @@ import type {
 export function toModelOptions(config: PublicConfig | null): ModelOption[] {
   if (!config) return [];
   return config.llm_profiles
-    .filter((profile) => profile.configured)
+    // A model that did not answer its last check is not offered.
+    .filter((profile) => profile.configured && profile.available !== "failed")
     .map((profile) => ({
       id: profile.name,
       label: `${profile.name} · ${profile.model}`,
