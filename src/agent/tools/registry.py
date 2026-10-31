@@ -8,6 +8,7 @@ from jsonschema import Draft202012Validator
 from agent.config import Settings
 from agent.modes import tool_profile
 from agent.tools.advanced import advanced_tools
+from agent.tools.agent_status import AgentStatusTool
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 from agent.tools.builtin import BUILTIN_TOOLS
 from agent.tools.check_tools import RunChecksTool
@@ -50,6 +51,7 @@ class ToolRegistry:
                 TodoWriteTool(),
                 TodoReadTool(),
                 ReadSessionTool(),
+                AgentStatusTool(self.settings),
                 GetProjectsTool(),
                 MessageToSessionTool(),
                 *advanced_tools(self.settings),

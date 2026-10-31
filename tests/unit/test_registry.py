@@ -140,6 +140,7 @@ def test_ask_definitions_are_read_only() -> None:
         "todo_read",
         "excel_read",
         "excel_sheets",
+        "agent_status",
     } == names
     assert all(registry.risk(name, "ask") is RiskLevel.read_only for name in names)
 
