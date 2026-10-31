@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import attributes, selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
-from agent import model_health
+from agent import model_health, monitor
 from agent.auth import check_request
 from agent.checkpoints import load_context_rows
 from agent.config import Settings, get_settings
@@ -55,6 +55,7 @@ from agent.schemas import (
     KnowledgeDocumentRead,
     MessageCreate,
     MessageRead,
+    MonitorRowRead,
     OutboundAuditRead,
     ProjectCreate,
     ProjectRead,
@@ -69,6 +70,7 @@ from agent.session_budget_store import (
     resolve_budget_limits,
 )
 from agent.session_service import create_session_record
+from agent.usage_ledger import summarize_session_usage
 
 
 async def _personal_session_route(request: Request, db: AsyncSession = Depends(get_db)) -> None:
@@ -279,6 +281,37 @@ async def list_sessions(
     )
     sessions = list((await db.execute(query)).scalars())
     return [await _session_read(db, session) for session in sessions]
+
+
+@router.get("/monitor", response_model=list[MonitorRowRead])
+async def monitor_rows(
+    request: Request, db: AsyncSession = Depends(get_db)
+) -> list[MonitorRowRead]:
+    """Agents that work or wait now, then the ones finished in the last half hour."""
+    hidden = set(await _hidden_engines(db, getattr(request.state, "actor_user_id", None)))
+    rows = [row for row in await monitor.collect(db, limit=None) if row.session_id not in hidden]
+    result = []
+    for row in rows:
+        usage = await summarize_session_usage(db, row.session_id)
+        result.append(
+            MonitorRowRead(
+                session_id=row.session_id,
+                parent_id=row.parent_id,
+                project_id=row.project_id,
+                project=row.project,
+                title=row.title,
+                status=row.status,
+                model=row.model,
+                mode=row.mode,
+                action_kind=row.action_kind,
+                action_text=row.action_text,
+                duration_seconds=row.duration_seconds,
+                idle_seconds=row.idle_seconds,
+                cost=str(usage.known_cost),
+                has_unknown_cost=usage.has_unknown_cost,
+            )
+        )
+    return result
 
 
 @router.post("/sessions", response_model=SessionRead, status_code=201)

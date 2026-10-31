@@ -31,6 +31,15 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+it("loads the global monitor through the authenticated API client", async () => {
+  stubFetch(async (input, init) => {
+    expect(String(input)).toBe("/api/monitor");
+    expect(init?.credentials).toBe("same-origin");
+    return jsonResponse(200, []);
+  });
+  expect(await api.monitor()).toEqual([]);
+});
+
 describe("api client request", () => {
   it("sends same-origin credentials and parses JSON on GET", async () => {
     stubFetch(async (input) => {

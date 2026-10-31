@@ -2,6 +2,7 @@ import type {
   Approval,
   ContextStats,
   Message,
+  MonitorRow,
   OutboundAudit,
   Project,
   PublicConfig,
@@ -112,6 +113,7 @@ async function snapshot<T extends object>(sessionId: string, resource: string): 
 }
 
 export const api = {
+  monitor: (signal?: AbortSignal): Promise<MonitorRow[]> => request("/api/monitor", { signal }),
   config: (): Promise<PublicConfig> => request<PublicConfig>("/api/config/public"),
   projects: (): Promise<Project[]> => request<Project[]>("/api/projects"),
   createProject: (name: string, rootPath: string): Promise<Project> =>

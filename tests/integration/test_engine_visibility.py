@@ -47,6 +47,7 @@ def test_config_context_rest_and_ws_are_actor_filtered(tmp_path, monkeypatch):
         assert client.get("/api/config/public").json()["engine_profiles"] == []
         assert all(s["id"] != sid for s in client.get("/api/sessions").json())
         assert all(e["session_id"] != sid for e in client.get("/api/events").json())
+        assert all(r["session_id"] != sid for r in client.get("/api/monitor").json())
         for path in [
             "",
             "/messages",

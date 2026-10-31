@@ -88,6 +88,25 @@ class SessionCreate(BaseModel):
         return self
 
 
+class MonitorRowRead(BaseModel):
+    """One agent in the "now working" list: active and recently finished sessions."""
+
+    session_id: str
+    parent_id: str | None
+    project_id: str
+    project: str
+    title: str
+    status: str
+    model: str
+    mode: str
+    action_kind: str
+    action_text: str
+    duration_seconds: int
+    idle_seconds: int
+    cost: str
+    has_unknown_cost: bool
+
+
 class SessionRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

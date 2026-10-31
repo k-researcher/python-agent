@@ -217,6 +217,10 @@ export async function installRoutes(page: Page): Promise<void> {
     }
     const path = url.pathname;
 
+    if (path === "/api/monitor") {
+      await json(route, 200, []);
+      return;
+    }
     if (path === "/auth/session") {
       await json(route, 200, { authenticated: true, csrf_token: "test-csrf" });
       return;
@@ -480,7 +484,7 @@ export async function assertComposerGeometry(page: Page): Promise<void> {
 
 export async function assertRightTabTextsDoNotOverlap(page: Page): Promise<void> {
   const tabs = page.locator(".right-panel__tab");
-  await expect(tabs).toHaveCount(4);
+  await expect(tabs).toHaveCount(5);
   await expect(tabs.first()).toBeVisible();
 
   const result = await page.evaluate(() => {
@@ -494,13 +498,15 @@ export async function assertRightTabTextsDoNotOverlap(page: Page): Promise<void>
         left: br.left,
         right: br.right,
         width: br.width,
+        top: br.top,
+        bottom: br.bottom,
       };
     });
     for (let i = 0; i < ranges.length - 1; i++) {
       const a = ranges[i];
       const b = ranges[i + 1];
       if (a.width <= 0 || b.width <= 0) continue;
-      if (a.right > b.left + 0.5) {
+      if (a.top < b.bottom && a.bottom > b.top && a.right > b.left + 0.5) {
         return { ok: false, reason: `"${a.text}" right ${a.right} > "${b.text}" left ${b.left}` };
       }
     }

@@ -1,10 +1,11 @@
 <script setup lang="ts">
-// Right panel: tabs "Контекст", "Инструменты", "Агенты", "Аудит".
+// Right panel tabs. Data and actions belong to the parent.
 // Presentational — data via props, opening a child session goes up through emits.
 
 import { computed, nextTick, ref } from "vue";
 import { Bot, ClipboardList, Puzzle, Activity, ChevronRight } from "lucide-vue-next";
 import type { ContextStats } from "./types";
+import type { MonitorRow } from "../../api/types";
 import { formatLocalTime } from "../../time";
 import { auditStatusLabel, sessionStatusLabel, statusTone } from "./status";
 
@@ -14,34 +15,74 @@ const props = withDefaults(
     children: { id: string; title: string; status: string }[];
     audit: { id: number; operation: string; destination: string; status: string; created_at: string }[];
     tools: { name: string; enabled: boolean }[];
+    monitorRows?: MonitorRow[];
+    monitorLoading?: boolean;
+    monitorError?: string;
+    monitorStopping?: string[];
   }>(),
   {
     context: null,
     children: () => [],
     audit: () => [],
     tools: () => [],
+    monitorRows: () => [],
+    monitorLoading: false,
+    monitorError: "",
+    monitorStopping: () => [],
   },
 );
 
 const emit = defineEmits<{
   openSession: [id: string];
+  monitorActive: [active: boolean];
+  stopSession: [id: string];
+  refreshMonitor: [];
 }>();
 
 const TAB_CONTEXT = "context";
 const TAB_TOOLS = "tools";
 const TAB_AGENTS = "agents";
 const TAB_AUDIT = "audit";
+const TAB_MONITOR = "monitor";
 
 const tabs = [
   { id: TAB_CONTEXT, label: "Контекст" },
   { id: TAB_TOOLS, label: "Инструменты" },
   { id: TAB_AGENTS, label: "Агенты" },
   { id: TAB_AUDIT, label: "Аудит" },
+  { id: TAB_MONITOR, label: "Работает" },
 ] as const;
 
 type TabId = (typeof tabs)[number]["id"];
 
 const activeTab = ref<TabId>(TAB_CONTEXT);
+
+function selectTab(id: TabId): void {
+  activeTab.value = id;
+  emit("monitorActive", id === TAB_MONITOR);
+}
+
+function actionLabel(row: MonitorRow): string {
+  if (row.action_kind === "tool") return row.action_text || "инструмент";
+  if (row.action_kind === "assistant") return "отвечает";
+  if (row.action_kind === "user") return "ждёт модель";
+  return "—";
+}
+
+function duration(seconds: number): string {
+  const value = Number.isFinite(seconds) ? Math.max(0, Math.floor(seconds)) : 0;
+  if (value < 60) return `${value} с`;
+  if (value < 3600) return `${Math.floor(value / 60)} м ${value % 60} с`;
+  return `${Math.floor(value / 3600)} ч ${Math.floor(value % 3600 / 60)} м`;
+}
+
+function canStop(row: MonitorRow): boolean {
+  return ["running", "pending", "awaiting_confirmation", "starting"].includes(row.status);
+}
+
+function hasCost(row: MonitorRow): boolean {
+  return Number.isFinite(Number(row.cost)) && Number(row.cost) > 0;
+}
 
 /**
  * Context meter denominator: prefer a positive finite input_budget (newer
@@ -117,7 +158,7 @@ function onChildClick(id: string): void {
 }
 
 function focusTab(id: TabId): void {
-  activeTab.value = id;
+  selectTab(id);
   nextTick(() => document.getElementById(`tab-${id}`)?.focus());
 }
 
@@ -163,12 +204,40 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
         :aria-controls="`panel-${tab.id}`"
         :tabindex="activeTab === tab.id ? 0 : -1"
         :data-tab="tab.id"
-        @click="activeTab = tab.id"
+        @click="selectTab(tab.id)"
         @keydown="onTabKeydown($event, tab.id)"
       >
         {{ tab.label }}
       </button>
     </div>
+
+    <section v-if="activeTab === TAB_MONITOR" id="panel-monitor" role="tabpanel"
+      aria-labelledby="tab-monitor" class="right-panel__panel" data-panel="monitor"
+      :aria-busy="monitorLoading">
+      <p class="muted monitor-help">Все проекты · активные агенты и завершённые за 30 минут</p>
+      <p v-if="monitorError" class="monitor-error" role="alert">
+        {{ monitorError }}
+        <button type="button" @click="emit('refreshMonitor')">Повторить</button>
+      </p>
+      <p v-if="monitorLoading && !monitorRows.length" class="muted">Загрузка агентов…</p>
+      <p v-else-if="!monitorRows.length && !monitorError" class="muted">Нет активных или недавних агентов</p>
+      <ul class="monitor-list">
+        <li v-for="row in monitorRows" :key="row.session_id" class="monitor-row" :data-monitor-id="row.session_id">
+          <button type="button" class="monitor-open" @click="emit('openSession', row.session_id)">
+            <span class="monitor-title">{{ row.title || "Без названия" }}</span>
+            <span class="muted monitor-project">{{ row.project || "Без проекта" }}</span>
+            <span class="status-pill monitor-status" :style="statusTone(row.status)">{{ sessionStatusLabel(row.status) }}</span>
+            <span class="monitor-action">Шаг: {{ actionLabel(row) }}</span>
+            <span class="muted monitor-time">Время: {{ duration(row.duration_seconds) }}</span>
+            <span v-if="hasCost(row)" class="monitor-cost">Стоимость: ${{ row.cost }}{{ row.has_unknown_cost ? " + неизвестная часть" : "" }}</span>
+          </button>
+          <button v-if="canStop(row)" type="button" class="monitor-stop"
+            :disabled="monitorStopping.includes(row.session_id)"
+            :aria-label="`Остановить: ${row.title || 'агент'}`"
+            @click.stop="emit('stopSession', row.session_id)">{{ monitorStopping.includes(row.session_id) ? "Останавливается…" : "Стоп" }}</button>
+        </li>
+      </ul>
+    </section>
 
     <!-- Контекст -->
     <section
@@ -328,17 +397,17 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
 }
 
 .right-panel__tabs {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 0;
   padding: 8px 8px 0;
   border-bottom: 1px solid var(--border);
-  overflow-x: auto;
-  scrollbar-width: thin;
 }
 
 .right-panel__tab {
-  flex: 0 0 auto;
-  padding: 7px 8px;
+  grid-column: span 2;
+  min-width: 0;
+  padding: 7px 4px;
   border: 0;
   border-bottom: 2px solid transparent;
   background: transparent;
@@ -347,6 +416,22 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
   white-space: nowrap;
   cursor: pointer;
 }
+
+.right-panel__tab:nth-child(n + 4) {
+  grid-column: span 3;
+}
+
+.monitor-help { font-size: 12px; margin: 0 0 12px; }
+.monitor-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.monitor-row { min-width: 0; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+.monitor-open { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; width: 100%; padding: 10px; text-align: left; border: 0; background: var(--surface); color: var(--text); cursor: pointer; }
+.monitor-open > span { max-width: 100%; overflow-wrap: anywhere; }
+.monitor-title { font-weight: 600; }
+.monitor-project, .monitor-action, .monitor-time, .monitor-cost { font-size: 12px; }
+.monitor-status { white-space: normal; }
+.monitor-stop { margin: 0 10px 10px; padding: 5px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-subtle); color: var(--danger); cursor: pointer; }
+.monitor-stop:disabled { opacity: 0.6; cursor: wait; }
+.monitor-error { color: var(--danger); font-size: 13px; }
 
 .right-panel__tab:hover {
   color: var(--text);
