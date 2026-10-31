@@ -222,3 +222,19 @@ export type TimelineItem =
   | { kind: "tool"; call: ToolCallView }
   | { kind: "summary"; message: Message }
   | { kind: "streaming"; content: string; reasoning: string };
+export interface MonitorRow {
+  session_id: string;
+  parent_id: string | null;
+  project_id: string;
+  project: string;
+  title: string;
+  status: string;
+  model: string;
+  mode: string;
+  action_kind: "tool" | "assistant" | "user" | "none";
+  action_text: string;
+  duration_seconds: number;
+  idle_seconds: number;
+  cost: string;
+  has_unknown_cost: boolean;
+}

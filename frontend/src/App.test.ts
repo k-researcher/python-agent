@@ -4,6 +4,7 @@ import { createPinia, setActivePinia, type Pinia } from "pinia";
 import { nextTick } from "vue";
 import App from "./App.vue";
 import { api } from "./api/client";
+import { Realtime } from "./realtime";
 
 vi.mock("./api/client", () => ({
   api: {
@@ -22,6 +23,7 @@ vi.mock("./api/client", () => ({
     resolveApproval: vi.fn(),
     stop: vi.fn(),
     archive: vi.fn(),
+    monitor: vi.fn(),
   },
   ApiError: class ApiError extends Error {
     constructor(message: string, readonly status: number) {
@@ -87,12 +89,14 @@ function mountApp() {
       plugins: [pinia],
       stubs: {
         AppShell: {
+          name: "AppShell",
           template:
             '<div><slot name="topbar" /><slot name="left" /><slot name="main" /><slot name="right" /></div>',
         },
         Topbar: true,
         RightPanel: {
-          props: ["context", "children", "audit", "tools"],
+          name: "RightPanel",
+          props: ["context", "children", "audit", "tools", "monitorRows", "monitorLoading", "monitorError", "monitorStopping"],
           template: "<div />",
         },
         RouterView: true,
@@ -137,7 +141,35 @@ beforeEach(() => {
   (api.config as ReturnType<typeof vi.fn>).mockResolvedValue(mockConfig);
   (api.projects as ReturnType<typeof vi.fn>).mockResolvedValue([]);
   (api.sessions as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+  vi.mocked(api.monitor).mockResolvedValue([]);
   (api.createProject as ReturnType<typeof vi.fn>).mockReset();
+});
+
+it("loads the monitor tab and forwards global status and approval events", async () => {
+  vi.useFakeTimers();
+  const wrapper = await mountReadyApp();
+  try {
+    expect(api.monitor).not.toHaveBeenCalled();
+    wrapper.findComponent({ name: "AppShell" }).vm.$emit("update:rightOpen", true);
+    const panel = wrapper.findComponent({ name: "RightPanel" });
+    panel.vm.$emit("monitorActive", true);
+    await nextTick(); await flushPromises();
+    expect(api.monitor).toHaveBeenCalledTimes(1);
+    const options = vi.mocked(Realtime).mock.calls.at(-1)![0];
+    if (!options) throw new Error("Realtime was not connected");
+    for (const type of ["session.status", "session.error", "approval.required"]) {
+      options.onEvent?.({ id: 1, session_id: "elsewhere", type, created_at: "", payload: {} });
+      await vi.advanceTimersByTimeAsync(150);
+    }
+    expect(api.monitor).toHaveBeenCalledTimes(4);
+    panel.vm.$emit("monitorActive", false); await nextTick();
+    options.onEvent?.({ id: 2, session_id: "elsewhere", type: "session.status", created_at: "", payload: {} });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(api.monitor).toHaveBeenCalledTimes(4);
+  } finally {
+    wrapper.unmount();
+    vi.useRealTimers();
+  }
 });
 
 describe("App — project creation flow", () => {

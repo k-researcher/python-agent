@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { mount, flushPromises } from "@vue/test-utils";
 import RightPanel from "./RightPanel.vue";
+import type { MonitorRow } from "../../api/types";
 
 const context = {
   approximate_tokens: 20,
@@ -28,8 +29,58 @@ function mountPanel(props: Record<string, unknown> = {}) {
   });
 }
 
+const monitorRow: MonitorRow = { session_id: "global", parent_id: null, project_id: "other",
+  project: "Другой проект", title: "Другая задача", status: "running", model: "default", mode: "dev",
+  action_kind: "tool", action_text: "read_file", duration_seconds: 65, idle_seconds: 1,
+  cost: "0.03", has_unknown_cost: false };
+
+it("shows global activity and keeps Stop separate from opening a session", async () => {
+  const wrapper = mountPanel({ monitorRows: [monitorRow] });
+  await wrapper.get('[data-tab="monitor"]').trigger("click");
+  expect(wrapper.emitted("monitorActive")?.at(-1)).toEqual([true]);
+  const row = wrapper.get('[data-monitor-id="global"]');
+  expect(row.text()).toContain("Другой проект");
+  expect(row.text()).toContain("Выполняется");
+  expect(row.text()).toContain("Шаг: read_file");
+  expect(row.text()).toContain("1 м 5 с");
+  expect(row.text()).toContain("$0.03");
+  await row.get(".monitor-stop").trigger("click");
+  expect(wrapper.emitted("stopSession")).toEqual([["global"]]);
+  expect(wrapper.emitted("openSession")).toBeUndefined();
+  await row.get(".monitor-open").trigger("click");
+  expect(wrapper.emitted("openSession")).toEqual([["global"]]);
+  await wrapper.get('[data-tab="context"]').trigger("click");
+  expect(wrapper.emitted("monitorActive")?.at(-1)).toEqual([false]);
+});
+
+it.each([["assistant", "отвечает"], ["user", "ждёт модель"], ["none", "—"]] as const)(
+  "labels %s activity and hides zero cost", async (kind, label) => {
+    const wrapper = mountPanel({ monitorRows: [{ ...monitorRow, action_kind: kind, cost: "0.000", status: "completed" }] });
+    await wrapper.get('[data-tab="monitor"]').trigger("click");
+    expect(wrapper.get(".monitor-action").text()).toBe(`Шаг: ${label}`);
+    expect(wrapper.find(".monitor-cost").exists()).toBe(false);
+    expect(wrapper.find(".monitor-stop").exists()).toBe(false);
+  },
+);
+it("shows loading, empty and error states and emits retry", async () => {
+  const wrapper = mountPanel({ monitorLoading: true });
+  await wrapper.get('[data-tab="monitor"]').trigger("click");
+  expect(wrapper.text()).toContain("Загрузка агентов");
+  await wrapper.setProps({ monitorLoading: false });
+  expect(wrapper.text()).toContain("Нет активных или недавних");
+  await wrapper.setProps({ monitorError: "Ошибка сети" });
+  await wrapper.get('[role="alert"] button').trigger("click");
+  expect(wrapper.emitted("refreshMonitor")).toHaveLength(1);
+});
+it("disables Stop during its request and marks partial known cost", async () => {
+  const wrapper = mountPanel({ monitorRows: [{ ...monitorRow, has_unknown_cost: true }], monitorStopping: ["global"] });
+  await wrapper.get('[data-tab="monitor"]').trigger("click");
+  expect(wrapper.get(".monitor-stop").attributes("disabled")).toBeDefined();
+  expect(wrapper.get(".monitor-cost").text()).toContain("неизвестная часть");
+});
+
 describe("RightPanel — tabs", () => {
-  it("renders a tablist with the four spec tabs", () => {
+  it("renders a tablist with the five tabs", () => {
     const wrapper = mountPanel();
     const tablist = wrapper.find('[role="tablist"]');
     expect(tablist.exists()).toBe(true);
@@ -38,6 +89,7 @@ describe("RightPanel — tabs", () => {
       "Инструменты",
       "Агенты",
       "Аудит",
+      "Работает",
     ]);
   });
 
@@ -61,7 +113,7 @@ describe("RightPanel — tabs", () => {
 
   it("links each panel to its tab via aria-labelledby", async () => {
     const wrapper = mountPanel();
-    const tabIds = ["context", "tools", "agents", "audit"];
+    const tabIds = ["context", "tools", "agents", "audit", "monitor"];
     for (const id of tabIds) {
       const tab = wrapper.find(`[data-tab="${id}"]`);
       expect(tab.attributes("id")).toBe(`tab-${id}`);
@@ -103,7 +155,7 @@ describe("RightPanel — tabs", () => {
     expect(wrapper.findAll('[role="tab"]')[1].attributes("aria-selected")).toBe("true");
     expect(wrapper.find('[data-panel="tools"]').exists()).toBe(true);
 
-    const last = wrapper.findAll('[role="tab"]')[3];
+    const last = wrapper.findAll('[role="tab"]')[4];
     await last.trigger("keydown", { key: "ArrowRight" });
     expect(wrapper.findAll('[role="tab"]')[0].attributes("aria-selected")).toBe("true");
     expect(wrapper.find('[data-panel="context"]').exists()).toBe(true);
@@ -113,13 +165,13 @@ describe("RightPanel — tabs", () => {
     const wrapper = mountPanel();
     const tabs = wrapper.findAll('[role="tab"]');
     await tabs[0].trigger("keydown", { key: "ArrowLeft" });
+    expect(wrapper.findAll('[role="tab"]')[4].attributes("aria-selected")).toBe("true");
+    expect(wrapper.find('[data-panel="monitor"]').exists()).toBe(true);
+
+    const last = wrapper.findAll('[role="tab"]')[4];
+    await last.trigger("keydown", { key: "ArrowLeft" });
     expect(wrapper.findAll('[role="tab"]')[3].attributes("aria-selected")).toBe("true");
     expect(wrapper.find('[data-panel="audit"]').exists()).toBe(true);
-
-    const last = wrapper.findAll('[role="tab"]')[3];
-    await last.trigger("keydown", { key: "ArrowLeft" });
-    expect(wrapper.findAll('[role="tab"]')[2].attributes("aria-selected")).toBe("true");
-    expect(wrapper.find('[data-panel="agents"]').exists()).toBe(true);
   });
 
   it("jumps to the first tab on Home and the last on End", async () => {
@@ -129,8 +181,8 @@ describe("RightPanel — tabs", () => {
     expect(wrapper.find('[data-panel="context"]').exists()).toBe(true);
 
     await wrapper.findAll('[role="tab"]')[0].trigger("keydown", { key: "End" });
-    expect(wrapper.findAll('[role="tab"]')[3].attributes("aria-selected")).toBe("true");
-    expect(wrapper.find('[data-panel="audit"]').exists()).toBe(true);
+    expect(wrapper.findAll('[role="tab"]')[4].attributes("aria-selected")).toBe("true");
+    expect(wrapper.find('[data-panel="monitor"]').exists()).toBe(true);
   });
 
   it("calls preventDefault for recognised navigation keys", async () => {

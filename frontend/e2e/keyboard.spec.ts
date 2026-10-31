@@ -5,11 +5,11 @@ import {
   ensureLeftPanelOpen,
 } from "./helpers";
 
-const RIGHT_TABS = ["context", "tools", "agents", "audit"];
+const RIGHT_TABS = ["context", "tools", "agents", "audit", "monitor"];
 
 async function focusFirstRightTab(page: import("@playwright/test").Page): Promise<void> {
   const tabs = page.locator('[role="tab"][data-tab]');
-  await expect(tabs).toHaveCount(4);
+  await expect(tabs).toHaveCount(5);
   await tabs.first().focus();
   await expect(tabs.first()).toBeFocused();
 }
@@ -51,6 +51,8 @@ test.describe("keyboard navigation", () => {
     await assertRightTabActive(page, "context");
 
     await page.keyboard.press("ArrowLeft");
+    await assertRightTabActive(page, "monitor");
+    await page.keyboard.press("ArrowLeft");
     await assertRightTabActive(page, "audit");
     await page.keyboard.press("ArrowLeft");
     await assertRightTabActive(page, "agents");
@@ -66,7 +68,7 @@ test.describe("keyboard navigation", () => {
     await focusFirstRightTab(page);
 
     await page.keyboard.press("End");
-    await assertRightTabActive(page, "audit");
+    await assertRightTabActive(page, "monitor");
     await page.keyboard.press("Home");
     await assertRightTabActive(page, "context");
   });

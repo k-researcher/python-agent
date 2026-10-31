@@ -163,8 +163,9 @@ test.describe("layout geometry", () => {
     const panel = await page.locator(".app-shell__right").boundingBox();
     expect(panel).not.toBeNull();
     const tabs = page.locator("[data-tab]");
-    await expect(tabs).toHaveCount(4);
+    await expect(tabs).toHaveCount(5);
     for (const tab of await tabs.all()) {
+      await tab.scrollIntoViewIfNeeded();
       const bounds = await tab.boundingBox();
       expect(bounds).not.toBeNull();
       expect(bounds!.x).toBeGreaterThanOrEqual(panel!.x - 1);
@@ -176,9 +177,9 @@ test.describe("layout geometry", () => {
     await openApp(page, testInfo);
     await ensureRightPanelOpen(page);
     const tabs = page.locator("[data-tab]");
-    await expect(tabs).toHaveCount(4);
+    await expect(tabs).toHaveCount(5);
 
-    const ids = ["tools", "agents", "audit", "context"];
+    const ids = ["tools", "agents", "audit", "monitor", "context"];
     for (const id of ids) {
       await page.locator(`[data-tab="${id}"]`).click();
       await expect(page.locator(`[data-panel="${id}"]`)).toBeVisible();

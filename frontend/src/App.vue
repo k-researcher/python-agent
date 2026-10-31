@@ -13,6 +13,7 @@ import AppShell from "./components/layout/AppShell.vue";
 import Topbar from "./components/layout/Topbar.vue";
 import LeftSidebar from "./components/layout/LeftSidebar.vue";
 import RightPanel from "./components/layout/RightPanel.vue";
+import { useMonitor } from "./composables/useMonitor";
 import {
   toChildSessions,
   toAuditEntries,
@@ -86,6 +87,8 @@ function toggleTheme(): void {
 const SIDEBAR_KEY = "agent:sidebar";
 const leftOpen = ref(window.innerWidth > 760);
 const rightOpen = ref(window.innerWidth > 1100);
+const monitorTabActive = ref(false);
+const monitor = useMonitor(computed(() => authenticated.value === true && rightOpen.value && monitorTabActive.value));
 
 function readSidebarState(): void {
   try {
@@ -127,12 +130,14 @@ function onServerEvent(event: ServerEvent): void {
   if (authenticated.value !== true) return;
   appStore.applyEvent(event);
   sessionStore.applyEvent(event);
+  monitor.onEvent(event);
 }
 
 function onRealtimeStatus(status: ConnectionStatus): void {
   if (authenticated.value !== true) return;
   connection.value = status;
   if (status === "live") {
+    void monitor.refresh();
     // Initial connect or reconnect: reload the stores so we catch up to
     // events that may have fired while the socket was down. Reopening the
     // current session re-fetches messages/approvals/context consistently.
@@ -251,6 +256,7 @@ function onOpenSettings(): void {
 
 function endAuthSession(): void {
   authGeneration += 1;
+  monitorTabActive.value = false;
   authenticated.value = false;
   resetAuthCache();
   clearAuth();
@@ -432,6 +438,13 @@ onBeforeUnmount(() => {
         :children="childSessions"
         :audit="auditEntries"
         :tools="toolEntries"
+        :monitor-rows="monitor.rows.value"
+        :monitor-loading="monitor.loading.value"
+        :monitor-error="monitor.error.value"
+        :monitor-stopping="monitor.stopping.value"
+        @monitor-active="monitorTabActive = $event"
+        @stop-session="monitor.stop"
+        @refresh-monitor="monitor.refresh"
         @open-session="onOpenChildSession"
       />
     </template>

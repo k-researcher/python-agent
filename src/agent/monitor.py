@@ -35,6 +35,12 @@ class SessionRow:
     last_action: str
     project: str = ""
     path: str = ""
+    project_id: str = ""
+    parent_id: str | None = None
+    # The newest activity apart: "tool" (text = tool name), "assistant", "user" or "none".
+    action_kind: str = "none"
+    action_text: str = ""
+    title: str = ""
 
 
 def format_duration(seconds: int | float) -> str:
@@ -237,16 +243,23 @@ async def _latest_replica(db: AsyncSession, session_id: str) -> Message | None:
     return result.one_or_none()
 
 
-def _describe_action(tool: ToolCall | None, replica: Message | None) -> tuple[str, datetime]:
-    """Return the newest activity label and its timestamp."""
+def _describe_action(tool: ToolCall | None, replica: Message | None) -> tuple[str, str, datetime]:
+    """Return the kind, the text and the timestamp of the newest activity."""
     if tool is not None and (
         replica is None or _aware(tool.updated_at) > _aware(replica.created_at)
     ):
-        return f"tool:{tool.name}", _aware(tool.updated_at)
+        return "tool", tool.name, _aware(tool.updated_at)
     if replica is not None:
         content = (replica.content or "").replace("\n", " ").strip()
-        return f"{replica.role}: {content}", _aware(replica.created_at)
-    return "—", _aware(tool.updated_at) if tool is not None else datetime.min.replace(tzinfo=UTC)
+        return replica.role, content, _aware(replica.created_at)
+    return "none", "", datetime.min.replace(tzinfo=UTC)
+
+
+def _action_label(kind: str, text: str) -> str:
+    """The one-line label of the text table."""
+    if kind == "tool":
+        return f"tool:{text}"
+    return f"{kind}: {text}" if kind != "none" else "—"
 
 
 def _status_group(status: str) -> int:
@@ -263,7 +276,7 @@ def _status_group(status: str) -> int:
 async def collect(
     db: AsyncSession,
     *,
-    limit: int = 50,
+    limit: int | None = 50,
     history_minutes: int = 30,
     now: datetime | None = None,
 ) -> list[SessionRow]:
@@ -301,7 +314,7 @@ async def collect(
         project_name, root_path = projects.get(session.project_id, ("", ""))
         tool = await _latest_tool(db, session.id)
         replica = await _latest_replica(db, session.id)
-        action, event_time = _describe_action(tool, replica)
+        kind, text, event_time = _describe_action(tool, replica)
         created_at = _aware(session.created_at)
         updated_at = _aware(session.updated_at)
         last_time = max(updated_at, event_time)
@@ -316,9 +329,14 @@ async def collect(
                     status=session.status,
                     duration_seconds=max(0, int((current - created_at).total_seconds())),
                     idle_seconds=max(0, int((current - last_time).total_seconds())),
-                    last_action=action[:60],
+                    last_action=_action_label(kind, text)[:60],
                     project=project_name,
                     path=short_path(root_path),
+                    project_id=session.project_id,
+                    parent_id=session.parent_id,
+                    action_kind=kind,
+                    action_text=text[:200],
+                    title=session.title or "",
                 ),
                 last_time,
             )
