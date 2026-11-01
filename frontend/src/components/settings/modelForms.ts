@@ -85,7 +85,13 @@ export function suggestModel(
 ): { id: string; patch: ModelPatch } {
   const taken = new Set(models.map((item) => item.id));
   const base = found.id.replace(/[^A-Za-z0-9._:/@-]/g, "-").slice(0, 100) || "model";
-  const id = taken.has(base) ? `${provider.id}:${base}`.slice(0, 100) : base;
+  const prefix = taken.has(base) ? `${provider.id}:${base}`.slice(0, 100) : base;
+  let id = prefix;
+  let number = 2;
+  while (taken.has(id)) {
+    const suffix = `-${number++}`;
+    id = `${prefix.slice(0, 100 - suffix.length)}${suffix}`;
+  }
   const context = Math.max(MIN_CONTEXT, found.context_window ?? DEFAULT_CONTEXT);
   const answer = Math.min(8192, Math.floor(context / 4), found.max_output_tokens ?? Infinity);
   return {
@@ -131,8 +137,9 @@ export function keyStatus(provider: ProviderView): string {
   return "Ключ не нужен";
 }
 
-export function originLabel(origin: string): string {
-  return origin === "ui" ? "Добавлено здесь" : "Из файла";
+export function originLabel(origin: string, hasBase = false): string {
+  if (origin === "ui") return hasBase ? "Изменено здесь" : "Добавлено здесь";
+  return origin === "legacy" ? "Из настроек запуска" : "Из файла";
 }
 
 export function formatTokens(value: number | null): string {

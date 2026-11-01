@@ -32,6 +32,7 @@ from agent.engine_access import check_engine_access
 from agent.engine_adapters import EngineRegistry, configured_profiles
 from agent.events import broker, emit_event, publish
 from agent.message_tree import IDLE_STATUSES, append_message
+from agent.model_overrides import lock_model_settings
 from agent.model_registry import effective_registry, select_model
 from agent.models import (
     Approval,
@@ -139,6 +140,17 @@ async def _session_blocked(db: AsyncSession, session: Session, *, new_run: bool)
     return await budget_block_reason(db, settings, session, datetime.now(UTC), new_run=new_run)
 
 
+async def _check_session_model(db: AsyncSession, session: Session) -> None:
+    if session.engine_profile is not None:
+        return
+    await lock_model_settings(db)
+    models = await effective_registry(db, settings)
+    if session.llm_profile not in models.models:
+        raise HTTPException(
+            409, "Модель сессии отключена или удалена. Включите её или создайте новую сессию."
+        )
+
+
 async def _engine_access(db: AsyncSession, session: Session, request: Request) -> None:
     if session.engine_profile is None:
         return
@@ -194,7 +206,7 @@ async def ready() -> dict[str, object]:
 @router.get("/config/public")
 async def public_config(request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, object]:
     models = await effective_registry(db, settings)
-    default_model = models.get(models.default_id)
+    default_model = models.models.get(models.default_id)
     profiles = configured_profiles(settings)
     registry = EngineRegistry(profiles)
     actor = getattr(request.state, "actor_user_id", None)
@@ -204,16 +216,18 @@ async def public_config(request: Request, db: AsyncSession = Depends(get_db)) ->
             for name, profile in profiles.items()
             if profile.enabled and actor and profile.operator_user_id == actor
         ],
-        "llm_configured": default_model.configured,
-        "llm_model": default_model.model,
+        "llm_configured": default_model.configured if default_model else False,
+        "llm_model": default_model.model if default_model else "",
         "knowledge_base_enabled": settings.knowledge_base_enabled,
         "network_tools_enabled": settings.allow_network_tools,
         "raw_llm_log": settings.raw_llm_log,
-        "llm_destination": urlsplit(default_model.base_url).hostname or "",
+        "llm_destination": (urlsplit(default_model.base_url).hostname or "")
+        if default_model
+        else "",
         "network_allowlist": settings.network_allowlist,
         "database_connections": sorted(settings.database_connections),
         "ssh_connections": sorted(settings.ssh_connections),
-        "context_window": default_model.context_window,
+        "context_window": default_model.context_window if default_model else None,
         "context_reserved_tokens": settings.context_reserved_tokens,
         "max_child_depth": settings.max_child_depth,
         "api_auth_enabled": True,
@@ -234,7 +248,9 @@ async def public_config(request: Request, db: AsyncSession = Depends(get_db)) ->
                 "reasoning_efforts": model.reasoning.allowed_efforts,
                 "default_reasoning_effort": model.reasoning.default_effort,
                 # The last check: "ok", "failed" or None when the model is not checked.
-                "available": model_health.health(model.id, model.base_url, model.model),
+                "available": model_health.health(
+                    model.id, model.base_url, model.model, models.checksum
+                ),
             }
             for model in models.models.values()
         ],
@@ -411,7 +427,13 @@ async def session_context(session_id: str, db: AsyncSession = Depends(get_db)) -
     if session.engine_profile is not None:
         return {"status": "unknown", "context_window": None}
     models = await effective_registry(db, settings)
-    model = select_model(models, session.llm_profile, strict=False)
+    if session.llm_profile not in models.models:
+        return {
+            "status": "unknown",
+            "context_window": None,
+            "reason": "Модель отключена или удалена",
+        }
+    model = select_model(models, session.llm_profile)
     attributes.set_committed_value(session, "messages", await load_context_rows(db, session_id))
     decision = supervisor._reasoning_for(session, model)
     definitions = supervisor.registry.definitions(session.mode, model_ids=models.ids())
@@ -550,6 +572,7 @@ async def add_message(
     if session is None:
         raise HTTPException(404, "Session not found")
     await _engine_access(db, session, request)
+    await _check_session_model(db, session)
     for attempt in range(3):
         try:
             await lock_session(db, session_id)
@@ -623,6 +646,7 @@ async def start_session(
     if session is None:
         raise HTTPException(404, "Session not found")
     await _engine_access(db, session, request)
+    await _check_session_model(db, session)
     reason = await _session_blocked(db, session, new_run=True)
     if reason is not None:
         raise HTTPException(409, f"The session budget is exhausted: {reason}")

@@ -133,7 +133,7 @@ def test_reasoning_field_merge_and_reset(client: TestClient) -> None:
     assert entry["context_window"] == 16000
     assert entry["sources"]["reasoning"] == "ui"
     assert entry["sources"]["context_window"] == "file"
-    reset = client.delete(f"{PREFIX}/models/fast")
+    reset = client.post(f"{PREFIX}/models/fast/reset")
     assert reset.status_code == 200, reset.text
     assert model(reset.json())["reasoning"]["default_effort"] == "low"
     assert model(reset.json())["origin"] == "file"
@@ -172,11 +172,10 @@ def test_new_ui_model_and_provider_then_delete(client: TestClient) -> None:
     assert created.status_code == 200, created.text
     assert model(created.json(), "custom")["origin"] == "ui"
     assert set(model(created.json(), "custom")["sources"].values()) == {"ui"}
-    assert client.delete(f"{PREFIX}/providers/local").status_code == 422
-    deleted = client.delete(f"{PREFIX}/models/custom")
+    deleted = client.delete(f"{PREFIX}/providers/local")
     assert deleted.status_code == 200
     assert not any(item["id"] == "custom" for item in deleted.json()["models"])
-    assert client.delete(f"{PREFIX}/providers/local").status_code == 200
+    assert not any(item["id"] == "local" for item in deleted.json()["providers"])
     assert client.delete(f"{PREFIX}/models/absent").status_code == 404
 
 
@@ -195,11 +194,11 @@ def test_disabled_and_reset(client: TestClient) -> None:
 
     assert client.portal is not None
     client.portal.call(check_runtime)
-    reset = client.delete(f"{PREFIX}/models/spare")
+    reset = client.post(f"{PREFIX}/models/spare/reset")
     assert reset.status_code == 200
     assert model(reset.json(), "spare")["disabled"] is False
-    assert client.delete(f"{PREFIX}/providers/idle").status_code == 200
-    assert client.delete(f"{PREFIX}/models/fast?disable=true").status_code == 422
+    assert client.post(f"{PREFIX}/providers/idle/reset").status_code == 200
+    assert client.delete(f"{PREFIX}/models/fast?disable=true").status_code == 200
 
 
 def test_encryption_hints_env_switch_and_change_events(
@@ -236,7 +235,7 @@ def test_encryption_hints_env_switch_and_change_events(
     assert switched.status_code == 200, switched.text
     assert provider(switched.json())["api_key_hint"] == "…wxyz"
     assert provider(switched.json())["sources"]["api_key"] == "env"
-    assert client.delete(f"{PREFIX}/providers/cloud").status_code == 200
+    assert client.post(f"{PREFIX}/providers/cloud/reset").status_code == 200
     assert provider(client.get(PREFIX).json())["api_key_hint"] == "…abcd"
 
 

@@ -47,6 +47,12 @@ function apiMessage(id: number, overrides: Partial<Message> = {}): Message {
 }
 
 function prepareSession(id = "s1"): ReturnType<typeof useSessionStore> {
+  useAppStore().config = {
+    llm_configured: true, llm_model: "m", llm_destination: "dst", default_llm_profile: "default",
+    llm_profiles: [{ name: "default", model: "m", destination: "dst", configured: true }],
+    knowledge_base_enabled: false, network_tools_enabled: false, network_allowlist: [], api_auth_enabled: true,
+    execution_mode: "embedded",
+  };
   const session = useSessionStore();
   session.sessionId = id;
   session.session = {
@@ -82,6 +88,19 @@ afterEach(() => {
 });
 
 describe("SessionView", () => {
+  it("keeps history readable but blocks sending to an unavailable model", async () => {
+    const store = prepareSession();
+    useAppStore().config!.llm_profiles = [];
+    const send = vi.spyOn(store, "send");
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    expect(wrapper.text()).toContain("готово");
+    expect(wrapper.get('[data-testid="session-model-unavailable"]').text()).toContain("История сохранена");
+    expect(wrapper.get('[data-testid="composer-send"]').attributes("disabled")).toBeDefined();
+    wrapper.findComponent({ name: "Composer" }).vm.$emit("send", { text: "draft", effort: "auto" });
+    await flushPromises();
+    expect(send).not.toHaveBeenCalled();
+  });
   it("shows child approvals in the parent conversation and opens the child", async () => {
     const store = prepareSession();
     store.children = [{ ...store.session!, id: "child", parent_id: "s1",

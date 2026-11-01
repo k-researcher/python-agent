@@ -20,14 +20,22 @@ function byNewest(a: Session, b: Session): number {
 
 export const useAppStore = defineStore("app", () => {
   const config = ref<PublicConfig | null>(null);
+  const modelsChecksum = ref("");
   const projects = ref<Project[]>([]);
   const sessions = ref<Session[]>([]);
   const connection = ref<ConnectionStatus>("offline");
   const selectedProjectId = ref<string | null>(null);
   let generation = 0;
+  let configVersion = 0;
+  let configFlight: Promise<void> | null = null;
+  let configDirty = false;
 
   function reset(): void {
     generation += 1;
+    configVersion += 1;
+    configFlight = null;
+    configDirty = false;
+    modelsChecksum.value = "";
     config.value = null;
     projects.value = [];
     sessions.value = [];
@@ -60,20 +68,31 @@ export const useAppStore = defineStore("app", () => {
   /** config + projects + sessions in one round trip; picks a default project. */
   async function load(): Promise<void> {
     const expectedGeneration = generation;
+    const expectedConfigVersion = ++configVersion;
     const [cfg, pr, ss] = await Promise.all([api.config(), api.projects(), api.sessions()]);
     if (expectedGeneration !== generation) return;
-    config.value = cfg;
+    if (expectedConfigVersion === configVersion) config.value = cfg;
     projects.value = pr;
     sessions.value = ss;
     reconcileProject();
   }
 
   /** Read the public config again, for example after the model settings change. */
-  async function loadConfig(): Promise<void> {
+  function loadConfig(): Promise<void> {
+    if (configFlight) { configDirty = true; return configFlight; }
     const expectedGeneration = generation;
-    const cfg = await api.config();
-    if (expectedGeneration !== generation) return;
-    config.value = cfg;
+    configFlight = (async () => {
+      do {
+        configDirty = false;
+        const version = ++configVersion;
+        const cfg = await api.config();
+        if (expectedGeneration !== generation) return;
+        if (!configDirty && version === configVersion) config.value = cfg;
+      } while (configDirty);
+    })().finally(() => {
+      if (expectedGeneration === generation) configFlight = null;
+    });
+    return configFlight;
   }
 
   async function createProject(name: string, rootPath: string): Promise<Project> {
@@ -97,6 +116,7 @@ export const useAppStore = defineStore("app", () => {
       prompt: input.prompt,
       mode: input.mode,
       llm_profile: input.llm_profile,
+      ...(input.engine_profile ? { engine_profile: input.engine_profile } : {}),
       reasoning_effort: input.reasoning_effort,
       title: input.title,
       auto_start: input.auto_start,
@@ -128,6 +148,13 @@ export const useAppStore = defineStore("app", () => {
   function applyEvent(event: ServerEvent): void {
     if (isStreamDeltaEvent(event)) return;
     switch (event.type) {
+      case "settings.models.changed": {
+        const checksum = event.payload.checksum;
+        if (typeof checksum !== "string" || checksum === modelsChecksum.value) break;
+        modelsChecksum.value = checksum;
+        void loadConfig().catch(() => undefined);
+        break;
+      }
       case "project.created":
         void loadProjects();
         break;
@@ -146,6 +173,7 @@ export const useAppStore = defineStore("app", () => {
 
   return {
     config,
+    modelsChecksum,
     projects,
     sessions,
     connection,

@@ -48,6 +48,9 @@ const effectiveProfileId = computed(() => {
   if (selectedProfileId.value) return selectedProfileId.value;
   return defaultProfile.value ?? "";
 });
+const modelAvailable = computed(() => engineProfile.value
+  ? externalProfiles.value.some(profile => profile.id === engineProfile.value && profile.status === "available")
+  : configuredModels.value.some(model => model.id === effectiveProfileId.value));
 
 const defaultModelLabel = computed(() => {
   const profile = configuredModels.value.find((model) => model.id === defaultProfile.value);
@@ -98,6 +101,7 @@ function clearDraft(): void {
 
 async function onCreateSession(payload: SendPayload): Promise<void> {
   if (isCreating.value) return;
+  if (!modelAvailable.value) return;
   if (!appStore.selectedProjectId) {
     error.value = "Выберите проект в боковой панели.";
     return;
@@ -154,9 +158,14 @@ async function onCreateSession(payload: SendPayload): Promise<void> {
     </p>
 
     <p v-if="error" class="home-error" data-testid="home-error">{{ error }}</p>
+    <p v-if="!modelAvailable" class="home-error" data-testid="no-models">
+      Выберите доступную модель или внешнего агента.
+      <button type="button" @click="router.push({ name: 'settings-models' })">Настроить модели</button>
+    </p>
 
     <Composer
       :busy="isCreating"
+      :disabled="!modelAvailable"
       :stoppable="false"
       :draft-key="promptDraftKey"
       :efforts="efforts"

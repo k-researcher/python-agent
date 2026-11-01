@@ -265,7 +265,7 @@ async def test_runtime_hangs_share_one_deadline(tmp_path, monkeypatch, point):
         clock = Clock()
         entered = asyncio.Event()
         model = _model("primary")
-        session_id = await _create_session(tmp_path, "runtime-hang")
+        session_id = await _create_session(tmp_path, "runtime-hang", profile="primary")
         await _add_messages(session_id, _simple_history())
         supervisor = AgentSupervisor(Settings())
         sent = []
@@ -795,7 +795,7 @@ async def test_all_output_recoveries_keep_the_original_deadline(tmp_path, monkey
         clock = Clock()
         entered = asyncio.Event()
         guards, limits, efforts = [], [], []
-        session_id = await _create_session(tmp_path, "shared-output-deadline")
+        session_id = await _create_session(tmp_path, "shared-output-deadline", profile="primary")
         await _add_messages(session_id, _simple_history())
 
         class Client:
@@ -887,7 +887,7 @@ async def test_runtime_guard_has_no_completed_audit_message_or_tool(tmp_path, mo
         from agent.runtime import AgentSupervisor
 
         model, secondary = _model("primary"), _model("secondary")
-        session_id = await _create_session(tmp_path, "terminal-runtime")
+        session_id = await _create_session(tmp_path, "terminal-runtime", profile="primary")
         await _add_messages(session_id, _simple_history())
         calls = []
         from agent import context_inference as context_module

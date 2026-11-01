@@ -133,7 +133,7 @@ def _sha256(body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()
 
 
-async def _create_session(tmp_path: Path, name: str) -> str:
+async def _create_session(tmp_path: Path, name: str, *, profile: str = "default") -> str:
     """Build a running project/session in the shared database; return the session id."""
     await init_database(recover_running=False)
     async with session_factory() as db:
@@ -143,6 +143,7 @@ async def _create_session(tmp_path: Path, name: str) -> str:
         session = Session(
             project_id=project.id,
             title=name,
+            llm_profile=profile,
             configuration={},
             status="running",
         )

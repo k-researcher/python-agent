@@ -7,6 +7,7 @@ import { draftGeneration, readDraft, writeDraft } from "../../draftStorage";
 const props = withDefaults(
   defineProps<{
     busy?: boolean;
+    disabled?: boolean;
     stoppable?: boolean;
     draftKey?: string;
     efforts?: string[];
@@ -15,6 +16,7 @@ const props = withDefaults(
   }>(),
   {
     busy: false,
+    disabled: false,
     stoppable: true,
     draftKey: "",
     efforts: () => ["auto"],
@@ -95,7 +97,7 @@ function onKeydown(e: KeyboardEvent): void {
 
 function send(): void {
   const content = text.value.trim();
-  if (!content || props.busy) return;
+  if (!content || props.busy || props.disabled) return;
   emit("send", { text: content, effort: effort.value });
   text.value = "";
   void nextTick(resize);
@@ -111,7 +113,7 @@ function send(): void {
           v-model="text"
           rows="1"
           :placeholder="placeholder"
-          :disabled="busy"
+          :disabled="busy || disabled"
           data-testid="composer-input"
           @input="resize"
           @keydown="onKeydown"
@@ -130,7 +132,7 @@ function send(): void {
             v-else
             type="button"
             class="send"
-            :disabled="busy || !canSend"
+            :disabled="busy || disabled || !canSend"
             data-testid="composer-send"
             @click="send"
           >

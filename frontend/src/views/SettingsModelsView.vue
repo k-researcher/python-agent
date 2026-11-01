@@ -2,13 +2,14 @@
 // Model settings: connections to model servers, the models the agent may use and the
 // model for each role. Changes are stored on the server on top of the models file.
 
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { ArrowLeft, Plus, Search } from "lucide-vue-next";
 import { useRouter } from "vue-router";
 import { ApiError } from "../api/client";
 import {
   modelSettings,
   type DiscoveredModel,
+  type KeySource,
   type LocalServer,
   type ModelView,
   type ModelsView,
@@ -22,7 +23,6 @@ import {
   addedAs,
   canChat,
   describeFound,
-  isLocalUrl,
   isValidId,
   keyStatus,
   originLabel,
@@ -32,8 +32,7 @@ import {
   suggestModel,
 } from "../components/settings/modelForms";
 import { useAppStore } from "../stores/app";
-
-const IN_ROLE_HINT = "Модель назначена на роль: сначала выберите для роли другую модель";
+import { SESSION_MODES, modeLabel } from "../modes";
 
 const router = useRouter();
 const appStore = useAppStore();
@@ -55,15 +54,19 @@ type Check = ProbeResult | "checking";
 const foundChecks = reactive<Record<string, Check>>({});
 const modelChecks = reactive<Record<string, Check>>({});
 const foundKey = (provider: string, model: string) => `${provider} ${model}`;
+let probeVersion = 0;
+
+function invalidateChecks(): void {
+  probeVersion += 1;
+  for (const key of Object.keys(modelChecks)) delete modelChecks[key];
+  for (const key of Object.keys(foundChecks)) delete foundChecks[key];
+  for (const [id, discovery] of Object.entries(discoveries)) {
+    if (discovery.loading) delete discoveries[id];
+  }
+}
 
 const localServers = ref<LocalServer[] | null>(null);
 const scanning = ref(false);
-
-// The list of a cloud gateway can keep models that no longer answer, so its models are
-// checked before they can be added. A local server lists the models it really has.
-function needsCheck(provider: ProviderView): boolean {
-  return !isLocalUrl(provider.base_url);
-}
 
 function foundCheck(provider: ProviderView, found: DiscoveredModel): Check | undefined {
   return foundChecks[foundKey(provider.id, found.id)];
@@ -77,36 +80,31 @@ function failed(check: Check | undefined): check is ProbeResult {
   return !!check && check !== "checking" && !check.ok;
 }
 
-/** Found models offered for adding: a gateway's model only after it answered. */
-function offered(provider: ProviderView): DiscoveredModel[] {
-  return (discoveries[provider.id]?.found ?? []).filter(
-    (found) => !(needsCheck(provider) && canChat(found) && failed(foundCheck(provider, found))),
-  );
-}
-
-function dead(provider: ProviderView): string[] {
-  return (discoveries[provider.id]?.found ?? [])
-    .filter((found) => needsCheck(provider) && canChat(found) && failed(foundCheck(provider, found)))
-    .map((found) => `${found.id} (${probeText(foundCheck(provider, found) as ProbeResult).replace("Не отвечает: ", "")})`);
-}
-
 async function checkFound(provider: ProviderView, found: DiscoveredModel): Promise<void> {
   const key = foundKey(provider.id, found.id);
+  const version = probeVersion;
+  const discovery = discoveries[provider.id];
   foundChecks[key] = "checking";
+  let result: ProbeResult;
   try {
-    foundChecks[key] = await modelSettings.probeFound(provider.id, found.id);
+    result = await modelSettings.probeFound(provider.id, found.id);
   } catch (error) {
-    foundChecks[key] = { ok: false, status: null, seconds: null, message: message(error) };
+    result = { ok: false, status: null, seconds: null, message: message(error) };
   }
+  if (alive && version === probeVersion && discovery === discoveries[provider.id]) foundChecks[key] = result;
 }
 
 async function checkModel(item: ModelView): Promise<void> {
+  const version = probeVersion;
   modelChecks[item.id] = "checking";
+  let result: ProbeResult;
   try {
-    modelChecks[item.id] = await modelSettings.probeModel(item.id);
+    result = await modelSettings.probeModel(item.id);
   } catch (error) {
-    modelChecks[item.id] = { ok: false, status: null, seconds: null, message: message(error) };
+    result = { ok: false, status: null, seconds: null, message: message(error) };
   }
+  if (!alive || version !== probeVersion) return;
+  modelChecks[item.id] = result;
   // The composer hides a model that did not answer.
   await appStore.loadConfig().catch(() => undefined);
 }
@@ -126,16 +124,12 @@ async function connectLocal(server: LocalServer): Promise<void> {
   if (!view.value) return;
   const id = providerIdFor(server.server, view.value.providers);
   const saved = await apply(`provider:${id}`, () =>
-    modelSettings.putProvider(id, { kind: "openai", base_url: server.base_url }),
+    modelSettings.putProvider(id, { kind: "openai", base_url: server.base_url, key_source: "none" }, saveOptions(true)),
   );
   if (!saved) return;
   server.provider = id;
   const provider = view.value?.providers.find((item) => item.id === id);
   if (provider) await discover(provider);
-}
-
-function providerOf(item: ModelView): ProviderView | undefined {
-  return view.value?.providers.find((provider) => provider.id === item.provider);
 }
 
 const presetKey = ref(PROVIDER_PRESETS[0].key);
@@ -158,52 +152,126 @@ function addressError(value: string): string {
 async function saveAddress(item: ProviderView): Promise<void> {
   const value = addresses[item.id]?.trim() ?? "";
   if (addressError(value)) return;
-  const saved = await apply(`provider:${item.id}`, () => modelSettings.putProvider(item.id, { base_url: value }));
+  const saved = await apply(`provider:${item.id}`, () => modelSettings.putProvider(item.id, { base_url: value }, saveOptions()));
   if (!saved) return;
   delete addresses[item.id];
   delete discoveries[item.id];
+  for (const model of view.value?.models ?? []) if (model.provider === item.id) delete modelChecks[model.id];
 }
 
 // Edited context and answer limits, by model ID, until saved.
 const limits = reactive<Record<string, { context_window: number; max_tokens: number }>>({});
 
-const activeModels = computed(() => view.value?.models.filter((item) => !item.disabled) ?? []);
+const activeModels = computed(() => view.value?.models.filter((item) => !item.disabled && !item.provider_disabled) ?? []);
+const roleNames = computed(() => [...new Set([...SESSION_MODES, ...Object.keys(view.value?.routing.roles ?? {})])]);
+const keys = reactive<Record<string, { source: KeySource; value: string; env: string }>>({});
+
+function saveOptions(create = false) {
+  return { ...(view.value?.checksum ? { checksum: view.value.checksum } : {}), ...(create ? { create: true } : {}) };
+}
+
+function editKey(item: ProviderView): void {
+  keys[item.id] = {
+    source: item.key_source ?? (item.api_key_env ? "env" : item.api_key_set ? "ui" : "none"),
+    value: "", env: item.key_env ?? item.api_key_env ?? "",
+  };
+}
+
+function keyError(item: ProviderView): string {
+  const key = keys[item.id];
+  if (!key) return "";
+  if (key.source === "env" && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key.env)) return "Укажите имя переменной окружения";
+  if (key.source === "ui" && !key.value.trim() && !(item.key_source === "ui" && item.api_key_set)) return "Введите новый ключ";
+  return "";
+}
+
+async function saveKey(item: ProviderView): Promise<void> {
+  const key = keys[item.id];
+  if (!key || keyError(item)) return;
+  const patch = key.source === "env" ? { key_source: key.source, api_key_env: key.env }
+    : key.source === "ui" ? { key_source: key.source, ...(key.value ? { api_key: key.value } : {}) }
+      : { key_source: key.source };
+  if (await apply(`provider:${item.id}`, () => modelSettings.putProvider(item.id, patch, saveOptions()))) delete keys[item.id];
+}
+
 
 function message(error: unknown): string {
   return error instanceof ApiError ? error.message : "Сервер недоступен";
 }
 
 async function apply(task: string, action: () => Promise<ModelsView>): Promise<boolean> {
+  if (busy.value) return false;
   busy.value = task;
   actionError.value = "";
   try {
-    setView(await action());
+    loadVersion += 1;
+    const result = await action();
+    invalidateChecks();
+    setView(result, true);
     // The composer reads its model list from the public config.
     await appStore.loadConfig().catch(() => undefined);
     return true;
   } catch (error) {
     actionError.value = `Не удалось сохранить: ${message(error)}`;
+    if (error instanceof ApiError && error.status === 409) await load();
     return false;
   } finally {
     busy.value = "";
+    if (appStore.modelsChecksum && appStore.modelsChecksum !== view.value?.checksum) void load();
   }
 }
 
-function setView(next: ModelsView): void {
-  view.value = next;
+function setView(next: ModelsView, preserveEdits = true): void {
+  const previous = view.value;
+  if (previous && previous.checksum !== next.checksum) invalidateChecks();
+  for (const item of next.providers) {
+    if (JSON.stringify(previous?.providers.find(provider => provider.id === item.id)) !== JSON.stringify(item)) delete discoveries[item.id];
+  }
   for (const item of next.models) {
-    limits[item.id] = { context_window: item.context_window, max_tokens: item.max_tokens };
+    const old = previous?.models.find(model => model.id === item.id);
+    const edited = limits[item.id];
+    limits[item.id] = {
+      context_window: preserveEdits && old && edited && edited.context_window !== old.context_window ? edited.context_window : item.context_window,
+      max_tokens: preserveEdits && old && edited && edited.max_tokens !== old.max_tokens ? edited.max_tokens : item.max_tokens,
+    };
+    if (old?.model !== item.model || old?.provider !== item.provider
+      || previous?.providers.find(provider => provider.id === old?.provider)?.base_url
+        !== next.providers.find(provider => provider.id === item.provider)?.base_url) delete modelChecks[item.id];
   }
+  view.value = next;
 }
 
-async function load(): Promise<void> {
-  loadError.value = "";
-  try {
-    setView(await modelSettings.get());
-  } catch (error) {
-    loadError.value = `Настройки моделей не загрузились: ${message(error)}`;
-  }
+let alive = true;
+let loadVersion = 0;
+let loadFlight: Promise<void> | null = null;
+let reload = false;
+
+function load(): Promise<void> {
+  if (!alive) return Promise.resolve();
+  if (loadFlight) { reload = true; return loadFlight; }
+  loadFlight = (async () => {
+    do {
+      reload = false;
+      const version = loadVersion;
+      loadError.value = "";
+      try {
+        const result = await modelSettings.get();
+        if (alive && version === loadVersion && !reload) setView(result);
+      } catch (error) {
+        if (alive && version === loadVersion) loadError.value = `Настройки моделей не загрузились: ${message(error)}`;
+      }
+    } while (reload && alive);
+  })().finally(() => { loadFlight = null; });
+  return loadFlight;
 }
+
+watch(() => appStore.modelsChecksum, checksum => {
+  if (!checksum || checksum === view.value?.checksum || busy.value) return;
+  if (Object.keys(keys).length || Object.keys(addresses).length || view.value?.models.some(limitsChanged)) {
+    actionError.value = "Настройки изменены в другом окне. При сохранении будет проверена их версия.";
+  } else void load();
+});
+onBeforeUnmount(() => { alive = false; loadVersion += 1; });
 
 function choosePreset(key: string): void {
   presetKey.value = key;
@@ -231,8 +299,9 @@ async function addProvider(): Promise<void> {
     modelSettings.putProvider(id, {
       kind: "openai",
       base_url: form.baseUrl.trim(),
+      key_source: form.apiKey ? "ui" : "none",
       ...(form.apiKey ? { api_key: form.apiKey } : {}),
-    }),
+    }, saveOptions(true)),
   );
   if (!saved) return;
   form.apiKey = "";
@@ -242,10 +311,15 @@ async function addProvider(): Promise<void> {
 }
 
 async function discover(provider: ProviderView): Promise<void> {
-  const state: Discovery = { loading: true, message: "", found: [] };
+  const version = probeVersion;
+  for (const key of Object.keys(foundChecks)) {
+    if (key.startsWith(`${provider.id} `)) delete foundChecks[key];
+  }
+  const state = reactive<Discovery>({ loading: true, message: "", found: [] });
   discoveries[provider.id] = state;
   try {
     const result = await modelSettings.testProvider(provider.id);
+    if (!alive || version !== probeVersion || discoveries[provider.id] !== state) return;
     const found = result.details ?? result.models.map((id) => ({ id, context_window: null, kind: null }));
     discoveries[provider.id] = {
       loading: false,
@@ -254,18 +328,15 @@ async function discover(provider: ProviderView): Promise<void> {
         ? found.length ? "" : "Сервер не вернул ни одной модели"
         : "Сервер не отвечает. Проверьте, что он запущен и адрес верный.",
     };
-    if (result.ok && needsCheck(provider)) {
-      await Promise.all(found.filter(canChat).map((item) => checkFound(provider, item)));
-    }
   } catch (error) {
-    discoveries[provider.id] = { loading: false, found: [], message: message(error) };
+    if (alive && version === probeVersion && discoveries[provider.id] === state) discoveries[provider.id] = { loading: false, found: [], message: message(error) };
   }
 }
 
 async function addModel(provider: ProviderView, found: DiscoveredModel): Promise<void> {
   if (!view.value) return;
   const { id, patch } = suggestModel(provider, found, view.value.models);
-  await apply(`model:${id}`, () => modelSettings.putModel(id, patch));
+  await apply(`model:${id}`, () => modelSettings.putModel(id, patch, saveOptions(true)));
 }
 
 function limitsChanged(item: ModelView): boolean {
@@ -287,38 +358,43 @@ function limitsError(item: ModelView): string {
 
 async function saveLimits(item: ModelView): Promise<void> {
   if (limitsError(item)) return;
-  await apply(`model:${item.id}`, () => modelSettings.putModel(item.id, { ...limits[item.id] }));
+  await apply(`model:${item.id}`, () => modelSettings.putModel(item.id, { ...limits[item.id] }, saveOptions()));
 }
 
 function toggleProvider(item: ProviderView): Promise<boolean> {
-  return apply(`provider:${item.id}`, () => modelSettings.putProvider(item.id, { disabled: !item.disabled }));
+  return apply(`provider:${item.id}`, () => modelSettings.putProvider(item.id, { disabled: !item.disabled }, saveOptions()));
 }
 
 function toggleModel(item: ModelView): Promise<boolean> {
-  return apply(`model:${item.id}`, () => modelSettings.putModel(item.id, { disabled: !item.disabled }));
+  return apply(`model:${item.id}`, () => modelSettings.putModel(item.id, { disabled: !item.disabled }, saveOptions()));
 }
 
-function removeProvider(item: ProviderView): Promise<boolean> {
-  delete discoveries[item.id];
-  return apply(`provider:${item.id}`, () => modelSettings.removeProvider(item.id));
+async function removeProvider(item: ProviderView): Promise<boolean> {
+  const saved = await apply(`provider:${item.id}`, () => modelSettings.removeProvider(item.id, saveOptions()));
+  if (saved) {
+    delete discoveries[item.id];
+    delete keys[item.id];
+    delete addresses[item.id];
+  }
+  return saved;
 }
 
 function removeModel(item: ModelView): Promise<boolean> {
-  return apply(`model:${item.id}`, () => modelSettings.removeModel(item.id));
+  return apply(`model:${item.id}`, () => modelSettings.removeModel(item.id, saveOptions()));
 }
 
 function setDefault(value: string): Promise<boolean> {
-  return apply("routing", () => modelSettings.putRouting({ default: value }));
+  return apply("routing", () => modelSettings.putRouting({ default: value }, saveOptions()));
 }
 
 function setLight(value: string): Promise<boolean> {
-  return apply("routing", () => modelSettings.putRouting({ light: value || null }));
+  return apply("routing", () => modelSettings.putRouting({ light: value || null }, saveOptions()));
 }
 
 function toggleFallback(id: string): Promise<boolean> {
   const current = view.value?.routing.fallback ?? [];
   const fallback = current.includes(id) ? current.filter((item) => item !== id) : [...current, id];
-  return apply("routing", () => modelSettings.putRouting({ fallback }));
+  return apply("routing", () => modelSettings.putRouting({ fallback }, saveOptions()));
 }
 
 function back(): void {
@@ -326,15 +402,23 @@ function back(): void {
   else void router.push({ name: "home" });
 }
 
-onMounted(async () => {
-  await Promise.all([load(), scan()]);
-  // Check the cloud models at once; a local check would load the model into memory.
-  const remote = (view.value?.models ?? []).filter((item) => {
-    const provider = providerOf(item);
-    return !item.disabled && provider && !provider.disabled && needsCheck(provider);
-  });
-  await Promise.all(remote.map(checkModel));
-});
+function setRole(role: string, value: string): Promise<boolean> {
+  const roles = { ...view.value?.routing.roles };
+  if (value) roles[role] = value;
+  else delete roles[role];
+  return apply("routing", () => modelSettings.putRouting({ roles }, saveOptions()));
+}
+
+function resetProvider(id: string): Promise<boolean> {
+  return apply(`provider:${id}`, () => modelSettings.resetProvider(id, saveOptions()));
+}
+
+function resetModel(id: string): Promise<boolean> {
+  return apply(`model:${id}`, () => modelSettings.resetModel(id, saveOptions()));
+}
+
+onMounted(() => { void load(); void scan(); });
+
 </script>
 
 <template>
@@ -451,7 +535,10 @@ onMounted(async () => {
             <div class="card__main">
               <strong>{{ item.id }}</strong>
               <span class="mono muted">{{ item.base_url }}</span>
-              <span class="muted small">{{ keyStatus(item) }} · {{ originLabel(item.origin) }}</span>
+              <span class="muted small">{{ keyStatus(item) }} · {{ originLabel(item.origin, item.has_base) }}</span>
+              <span v-if="item.key_source" class="muted small" data-testid="provider-key-origin">
+                Источник ключа: {{ item.key_source === 'ui' ? 'сохранён в приложении' : item.key_source === 'env' ? 'окружение' : 'без ключа' }}
+              </span>
             </div>
             <div class="card__actions">
               <button
@@ -471,11 +558,12 @@ onMounted(async () => {
                 data-testid="provider-edit-url"
                 @click="addresses[item.id] = item.base_url"
               >Изменить адрес</button>
-              <button type="button" class="ghost" :disabled="!!busy" @click="toggleProvider(item)">
+              <button type="button" class="ghost" :disabled="!!busy" data-testid="provider-edit-key" @click="editKey(item)">Изменить ключ</button>
+              <button type="button" class="ghost" :disabled="!!busy" data-testid="provider-toggle" @click="toggleProvider(item)">
                 {{ item.disabled ? "Включить" : "Отключить" }}
               </button>
+              <button v-if="item.has_base && item.origin === 'ui'" type="button" class="ghost" :disabled="!!busy" data-testid="provider-reset" @click="resetProvider(item.id)">Сбросить изменения</button>
               <button
-                v-if="item.origin === 'ui'"
                 type="button"
                 class="ghost danger"
                 :disabled="!!busy"
@@ -497,11 +585,37 @@ onMounted(async () => {
             <span v-if="addressError(addresses[item.id])" class="field-error">{{ addressError(addresses[item.id]) }}</span>
           </form>
 
+          <form v-if="keys[item.id]" class="key-editor" data-testid="provider-key-form" @submit.prevent="saveKey(item)">
+            <label>
+              <span>Источник ключа</span>
+              <select v-model="keys[item.id].source" data-testid="provider-key-source">
+                <option value="ui">Сохранить в приложении</option>
+                <option value="env">Из окружения</option>
+                <option value="none">Без ключа</option>
+              </select>
+            </label>
+            <label v-if="keys[item.id].source === 'ui'">
+              <span>Новый ключ</span>
+              <input v-model="keys[item.id].value" type="password" autocomplete="new-password" data-testid="provider-key-value" />
+              <span v-if="item.key_source === 'ui' && item.api_key_set" class="hint">Оставьте пустым, чтобы сохранить текущий ключ.</span>
+            </label>
+            <label v-if="keys[item.id].source === 'env'">
+              <span>Переменная окружения</span>
+              <input v-model.trim="keys[item.id].env" autocomplete="off" data-testid="provider-key-env" />
+            </label>
+            <p v-if="keys[item.id].source === 'none'" class="hint">Сохранённый ключ будет очищен. Ключ из окружения использоваться не будет.</p>
+            <p v-if="keyError(item)" class="field-error">{{ keyError(item) }}</p>
+            <div class="actions">
+              <button type="submit" class="primary" :disabled="!!busy || !!keyError(item)">Сохранить ключ</button>
+              <button type="button" class="ghost" @click="delete keys[item.id]">Отмена</button>
+            </div>
+          </form>
+
           <div v-if="discoveries[item.id] && !discoveries[item.id].loading" class="found" data-testid="found-models">
             <p v-if="discoveries[item.id].message" class="muted small">{{ discoveries[item.id].message }}</p>
             <template v-else>
               <ul>
-                <li v-for="found in offered(item)" :key="found.id" class="found__row" :data-found="found.id">
+                <li v-for="found in discoveries[item.id].found" :key="found.id" class="found__row" :data-found="found.id">
                   <span class="mono">{{ found.id }}</span>
                   <span class="muted small">{{ describeFound(found) }}</span>
                   <span v-if="found.state" class="muted small">
@@ -519,18 +633,16 @@ onMounted(async () => {
                   </span>
                   <template v-else-if="canChat(found)">
                     <button
-                      v-if="!needsCheck(item) && !foundCheck(item, found)"
                       type="button"
                       class="ghost found__state"
-                      title="Короткий запрос к модели; сервер загрузит её в память"
+                      title="Пробный запрос генерации; может расходовать подписку"
                       data-testid="found-probe"
                       @click="checkFound(item, found)"
-                    >Проверить</button>
+                      :disabled="foundCheck(item, found) === 'checking'"
+                    >Проверить ответ</button>
                     <button
-                      v-if="!needsCheck(item) || answered(foundCheck(item, found))"
                       type="button"
                       class="ghost"
-                      :class="{ found__state: needsCheck(item) || !!foundCheck(item, found) }"
                       :disabled="!!busy"
                       data-testid="found-add"
                       @click="addModel(item, found)"
@@ -541,9 +653,6 @@ onMounted(async () => {
                   </template>
                 </li>
               </ul>
-              <p v-if="dead(item).length" class="small bad" data-testid="found-dead">
-                Не отвечают, добавить нельзя: {{ dead(item).join(", ") }}
-              </p>
             </template>
           </div>
         </article>
@@ -556,7 +665,7 @@ onMounted(async () => {
           v-for="item in view.models"
           :key="item.id"
           class="card"
-          :class="{ 'card--off': item.disabled }"
+          :class="{ 'card--off': item.disabled || item.provider_disabled }"
           data-testid="model-card"
           :data-model="item.id"
         >
@@ -564,8 +673,9 @@ onMounted(async () => {
             <div class="card__main">
               <strong>{{ item.id }}</strong>
               <span class="muted small">
-                <span class="mono">{{ item.model }}</span> · {{ item.provider }} · {{ originLabel(item.origin) }}
+                <span class="mono">{{ item.model }}</span> · {{ item.provider }} · {{ originLabel(item.origin, item.has_base) }}
               </span>
+              <span v-if="item.provider_disabled" class="small muted" data-testid="model-provider-off">Сервер отключён</span>
               <span v-if="rolesOf(view.routing, item.id).length" class="small" data-testid="model-roles">
                 Роль: {{ rolesOf(view.routing, item.id).join(", ") }}
               </span>
@@ -583,27 +693,25 @@ onMounted(async () => {
               <button
                 type="button"
                 class="ghost"
-                :disabled="item.disabled || modelChecks[item.id] === 'checking'"
-                :title="providerOf(item) && !needsCheck(providerOf(item)!) ? 'Сервер загрузит модель в память' : undefined"
+                :disabled="item.disabled || item.provider_disabled || modelChecks[item.id] === 'checking'"
+                title="Пробный запрос генерации; может расходовать подписку"
                 data-testid="model-probe"
                 @click="checkModel(item)"
-              >Проверить</button>
+              >Проверить ответ</button>
               <button
                 type="button"
                 class="ghost"
-                :disabled="!!busy || (!item.disabled && !!rolesOf(view.routing, item.id).length)"
-                :title="!item.disabled && rolesOf(view.routing, item.id).length ? IN_ROLE_HINT : undefined"
+                :disabled="!!busy"
                 data-testid="model-toggle"
                 @click="toggleModel(item)"
               >
                 {{ item.disabled ? "Включить" : "Отключить" }}
               </button>
+              <button v-if="item.has_base && item.origin === 'ui'" type="button" class="ghost" :disabled="!!busy" data-testid="model-reset" @click="resetModel(item.id)">Сбросить изменения</button>
               <button
-                v-if="item.origin === 'ui'"
                 type="button"
                 class="ghost danger"
-                :disabled="!!busy || !!rolesOf(view.routing, item.id).length"
-                :title="rolesOf(view.routing, item.id).length ? IN_ROLE_HINT : undefined"
+                :disabled="!!busy"
                 data-testid="model-remove"
                 @click="removeModel(item)"
               >Удалить</button>
@@ -631,6 +739,21 @@ onMounted(async () => {
         </article>
       </section>
 
+      <p v-if="!activeModels.length" class="notice" data-testid="models-empty">Нет включённых моделей. Подключите сервер и добавьте модель или включите существующую.</p>
+
+      <section v-if="view.deleted?.providers.length || view.deleted?.models.length" class="block" data-testid="deleted-settings">
+        <h2>Удалённые настройки из файла</h2>
+        <p class="hint">Они не используются. Восстановление явно вернёт файловые настройки.</p>
+        <div v-for="id in view.deleted?.providers" :key="`provider:${id}`" class="found__row">
+          <span>Сервер {{ id }}</span>
+          <button type="button" class="ghost" :disabled="!!busy" :data-restore-provider="id" @click="resetProvider(id)">Восстановить</button>
+        </div>
+        <div v-for="id in view.deleted?.models" :key="`model:${id}`" class="found__row">
+          <span>Модель {{ id }}</span>
+          <button type="button" class="ghost" :disabled="!!busy" :data-restore-model="id" @click="resetModel(id)">Восстановить</button>
+        </div>
+      </section>
+
       <section v-if="activeModels.length" class="block" aria-labelledby="roles-title">
         <h2 id="roles-title">Роли</h2>
         <div class="card roles">
@@ -653,6 +776,13 @@ onMounted(async () => {
               data-testid="routing-light"
               @change="setLight(($event.target as HTMLSelectElement).value)"
             >
+              <option value="">Как основная</option>
+              <option v-for="item in activeModels" :key="item.id" :value="item.id">{{ item.id }}</option>
+            </select>
+          </label>
+          <label v-for="role in roleNames" :key="role">
+            <span>{{ modeLabel(role) }}</span>
+            <select :value="view.routing.roles[role] ?? ''" :disabled="!!busy" :data-routing-role="role" @change="setRole(role, ($event.target as HTMLSelectElement).value)">
               <option value="">Как основная</option>
               <option v-for="item in activeModels" :key="item.id" :value="item.id">{{ item.id }}</option>
             </select>
@@ -804,6 +934,7 @@ button.link {
 }
 
 .form,
+.key-editor,
 .roles {
   display: flex;
   flex-direction: column;
@@ -926,6 +1057,8 @@ input.mono {
   flex: 1 1 18rem;
   min-width: 0;
 }
+
+.key-editor { margin-top: 12px; }
 
 .limits {
   display: flex;

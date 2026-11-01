@@ -63,6 +63,7 @@ export interface CreateSessionInput {
   prompt: string;
   mode?: string;
   llm_profile?: string;
+  engine_profile?: string;
   reasoning_effort?: string;
   title?: string;
   auto_start?: boolean;

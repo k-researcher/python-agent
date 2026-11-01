@@ -2,8 +2,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { flushPromises } from "@vue/test-utils";
 import { api } from "../api/client";
-import type { Project, ServerEvent, Session } from "../api/types";
+import type { Project, PublicConfig, ServerEvent, Session } from "../api/types";
 import { useAppStore } from "./app";
+
+function emptyConfig(): PublicConfig {
+  return { llm_configured: false, llm_model: "", llm_destination: "", default_llm_profile: "",
+    llm_profiles: [], knowledge_base_enabled: false, network_tools_enabled: false,
+    network_allowlist: [], api_auth_enabled: true, execution_mode: "embedded" };
+}
 
 function project(id: string, name = id): Project {
   return { id, name, root_path: `/root/${id}` };
@@ -34,6 +40,13 @@ describe("app store", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     setActivePinia(createPinia());
+  });
+
+  it("forwards an external profile even when no language model is configured", async () => {
+    const create = vi.spyOn(api, "createSession").mockResolvedValue(session("native"));
+    vi.spyOn(api, "sessions").mockResolvedValue([]);
+    await useAppStore().createSession({ project_id: "p1", prompt: "work", engine_profile: "personal", auto_start: true });
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ engine_profile: "personal" }));
   });
 
   it("load() fills config, projects and sessions and picks a default project", async () => {
@@ -196,6 +209,31 @@ describe("app store", () => {
   });
 
   describe("applyEvent", () => {
+    it("reloads config once for duplicate model settings events", async () => {
+      const spy = vi.spyOn(api, "config").mockResolvedValue(emptyConfig());
+      const store = useAppStore();
+      const event = persistentEvent("settings.models.changed", null, { checksum: "changed" });
+      store.applyEvent(event); store.applyEvent(event);
+      await flushPromises();
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(store.modelsChecksum).toBe("changed");
+      expect(store.config?.llm_profiles).toEqual([]);
+    });
+
+    it("uses the latest config after another change arrives during a reload", async () => {
+      let finish!: (value: Awaited<ReturnType<typeof api.config>>) => void;
+      const stale = new Promise<Awaited<ReturnType<typeof api.config>>>(resolve => { finish = resolve; });
+      const final = emptyConfig();
+      const spy = vi.spyOn(api, "config").mockReturnValueOnce(stale).mockResolvedValue(final);
+      const store = useAppStore();
+      store.applyEvent(persistentEvent("settings.models.changed", null, { checksum: "one" }));
+      store.applyEvent(persistentEvent("settings.models.changed", null, { checksum: "two" }));
+      finish({ ...final, llm_configured: true });
+      await flushPromises();
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(store.config).toEqual(final);
+      expect(store.modelsChecksum).toBe("two");
+    });
     it("reloads sessions on session.status", async () => {
       const fresh = session("live", { status: "running" });
       const spy = vi.spyOn(api, "sessions").mockResolvedValueOnce([fresh]);

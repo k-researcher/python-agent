@@ -206,6 +206,11 @@ class LLMClient:
         except AuthError as exc:
             raise LLMError(f"Model {self.model.id}: {exc}") from None
 
+    async def transport_settings(self) -> tuple[dict[str, str], ssl.SSLContext | bool]:
+        """Share authentication and TLS settings with explicit connection checks."""
+        headers, _ = await self._headers()
+        return headers, self._verify()
+
     def _auth_provider(self) -> AuthProvider | None:
         if self.model.auth is None:
             return None

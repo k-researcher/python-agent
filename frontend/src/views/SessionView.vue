@@ -71,6 +71,9 @@ const waitingChildren = computed(() => sessionStore.children.filter(
 ));
 const timelineItems = computed(() => toChatTimelineItems(sessionStore.timeline));
 const external = computed(() => !!session.value?.engine_profile);
+const modelAvailable = computed(() => external.value || !!appStore.config?.llm_profiles.some(
+  model => model.name === session.value?.llm_profile && model.configured,
+));
 const modelLabel = computed(() => {
   if (external.value) return `Внешний агент · ${session.value?.engine_profile}`;
   const profile = appStore.config?.llm_profiles.find((model) => model.name === session.value?.llm_profile);
@@ -146,6 +149,7 @@ watch(
 async function onSend(payload: SendPayload): Promise<void> {
   // Guard against a double POST: keep the composer busy for the whole call.
   if (isSending.value) return;
+  if (!modelAvailable.value) return;
   isSending.value = true;
   sendError.value = "";
   // Composer clears its own text + draft on emit, so the payload must be saved
@@ -248,9 +252,14 @@ function onOpenChild(id: string): void {
       </p>
 
       <p v-if="sendError" class="session-error" data-testid="send-error">{{ sendError }}</p>
+      <p v-if="!modelAvailable" class="session-error" data-testid="session-model-unavailable">
+        Модель этой сессии отключена или удалена. История сохранена.
+        <button type="button" @click="router.push({ name: 'settings-models' })">Настроить модели</button>
+      </p>
 
       <Composer
         :busy="busy"
+        :disabled="!modelAvailable"
         :draft-key="draftKey"
         :efforts="efforts"
         controls-target="#session-agent-controls"

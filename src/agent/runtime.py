@@ -1371,7 +1371,7 @@ class AgentSupervisor:
 
                 if models is None:
                     models = await self._models(db)
-                model = select_model(models, session.llm_profile, strict=False)
+                model = select_model(models, session.llm_profile)
                 definitions = self._tools.definitions(session.mode, model_ids=models.ids())
                 decisions = {
                     candidate.id: self._reasoning_for(session, candidate)
