@@ -306,7 +306,8 @@ h2 {
   background: var(--surface);
 }
 
-.card--off {
+/* Dim the details of a switched off item, but keep its buttons readable. */
+.card--off .card__main {
   opacity: 0.6;
 }
 
@@ -362,7 +363,12 @@ button:disabled {
 }
 
 button.danger {
+  border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
   color: var(--danger);
+}
+
+button.danger:not(:disabled):hover {
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
 }
 
 button.link {

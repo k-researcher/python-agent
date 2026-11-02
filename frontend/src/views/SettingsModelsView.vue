@@ -11,6 +11,7 @@ import {
   type DiscoveredModel,
   type KeySource,
   type LocalServer,
+  type ModelPatch,
   type ModelView,
   type ModelsView,
   type ProbeResult,
@@ -159,8 +160,35 @@ async function saveAddress(item: ProviderView): Promise<void> {
   for (const model of view.value?.models ?? []) if (model.provider === item.id) delete modelChecks[model.id];
 }
 
-// Edited context and answer limits, by model ID, until saved.
-const limits = reactive<Record<string, { context_window: number; max_tokens: number }>>({});
+// Edited limits and price, by model ID, until saved. "unset" is shown only while the
+// model has no price yet.
+type PriceMode = "free" | "paid" | "unset";
+interface LimitsEdit { context_window: number; max_tokens: number; price: PriceMode; input: number; output: number }
+const limits = reactive<Record<string, LimitsEdit>>({});
+
+function editOf(item: ModelView): LimitsEdit {
+  const pricing = item.pricing;
+  const price: PriceMode = !pricing ? "unset" : pricing.input_per_mtok || pricing.output_per_mtok ? "paid" : "free";
+  return {
+    context_window: item.context_window,
+    max_tokens: item.max_tokens,
+    price,
+    input: pricing?.input_per_mtok ?? 0,
+    output: pricing?.output_per_mtok ?? 0,
+  };
+}
+
+const priceKey = (edit: LimitsEdit) => (edit.price === "paid" ? `paid ${edit.input} ${edit.output}` : edit.price);
+
+function priceLabel(item: ModelView): string {
+  const edit = editOf(item);
+  if (edit.price === "unset") return "Цена не указана";
+  if (edit.price === "free") return "Без оплаты";
+  return `Платная: вход $${edit.input}, выход $${edit.output} за 1M токенов`;
+}
+
+// The session money ceiling from the server; a model without a price cannot start under it.
+const costLimit = computed(() => appStore.config?.session_cost_limit ?? null);
 
 const activeModels = computed(() => view.value?.models.filter((item) => !item.disabled && !item.provider_disabled) ?? []);
 const roleNames = computed(() => [...new Set([...SESSION_MODES, ...Object.keys(view.value?.routing.roles ?? {})])]);
@@ -230,9 +258,15 @@ function setView(next: ModelsView, preserveEdits = true): void {
   for (const item of next.models) {
     const old = previous?.models.find(model => model.id === item.id);
     const edited = limits[item.id];
+    const fresh = editOf(item);
+    const before = old && editOf(old);
+    const keep = preserveEdits && before && edited;
     limits[item.id] = {
-      context_window: preserveEdits && old && edited && edited.context_window !== old.context_window ? edited.context_window : item.context_window,
-      max_tokens: preserveEdits && old && edited && edited.max_tokens !== old.max_tokens ? edited.max_tokens : item.max_tokens,
+      context_window: keep && edited.context_window !== before.context_window ? edited.context_window : fresh.context_window,
+      max_tokens: keep && edited.max_tokens !== before.max_tokens ? edited.max_tokens : fresh.max_tokens,
+      ...(keep && priceKey(edited) !== priceKey(before)
+        ? { price: edited.price, input: edited.input, output: edited.output }
+        : { price: fresh.price, input: fresh.input, output: fresh.output }),
     };
     if (old?.model !== item.model || old?.provider !== item.provider
       || previous?.providers.find(provider => provider.id === old?.provider)?.base_url
@@ -339,9 +373,14 @@ async function addModel(provider: ProviderView, found: DiscoveredModel): Promise
   await apply(`model:${id}`, () => modelSettings.putModel(id, patch, saveOptions(true)));
 }
 
+function priceChanged(item: ModelView): boolean {
+  const edited = limits[item.id];
+  return !!edited && priceKey(edited) !== priceKey(editOf(item));
+}
+
 function limitsChanged(item: ModelView): boolean {
   const edited = limits[item.id];
-  return !!edited && (edited.context_window !== item.context_window || edited.max_tokens !== item.max_tokens);
+  return !!edited && (edited.context_window !== item.context_window || edited.max_tokens !== item.max_tokens || priceChanged(item));
 }
 
 function limitsError(item: ModelView): string {
@@ -353,12 +392,22 @@ function limitsError(item: ModelView): string {
   if (!Number.isInteger(edited.max_tokens) || edited.max_tokens < 1 || edited.max_tokens >= edited.context_window) {
     return "Ответ должен быть меньше контекста";
   }
+  if (edited.price === "paid" && ![edited.input, edited.output].every((value) => Number.isFinite(value) && value >= 0)) {
+    return "Цена — число от 0";
+  }
   return "";
 }
 
 async function saveLimits(item: ModelView): Promise<void> {
   if (limitsError(item)) return;
-  await apply(`model:${item.id}`, () => modelSettings.putModel(item.id, { ...limits[item.id] }, saveOptions()));
+  const edited = limits[item.id];
+  const patch: ModelPatch = { context_window: edited.context_window, max_tokens: edited.max_tokens };
+  if (priceChanged(item) && edited.price !== "unset") {
+    patch.pricing = edited.price === "free"
+      ? { input_per_mtok: 0, output_per_mtok: 0 }
+      : { input_per_mtok: edited.input, output_per_mtok: edited.output };
+  }
+  await apply(`model:${item.id}`, () => modelSettings.putModel(item.id, patch, saveOptions()));
 }
 
 function toggleProvider(item: ProviderView): Promise<boolean> {
@@ -625,26 +674,28 @@ onMounted(() => { void load(); void scan(); });
             <p v-if="discoveries[item.id].message" class="muted small">{{ discoveries[item.id].message }}</p>
             <template v-else>
               <ul>
-                <li v-for="found in discoveries[item.id].found" :key="found.id" class="found__row" :data-found="found.id">
-                  <span class="mono">{{ found.id }}</span>
-                  <span class="muted small">{{ describeFound(found) }}</span>
-                  <span v-if="found.state" class="muted small">
-                    {{ found.state === "loaded" ? "загружена в память" : "не загружена" }}
-                  </span>
-                  <span v-if="foundCheck(item, found) === 'checking'" class="muted small">Проверяю…</span>
-                  <span v-else-if="answered(foundCheck(item, found))" class="small ok" data-testid="found-check">
-                    {{ probeText(foundCheck(item, found) as ProbeResult) }}
-                  </span>
-                  <span v-else-if="failed(foundCheck(item, found))" class="small bad" data-testid="found-check">
-                    {{ probeText(foundCheck(item, found) as ProbeResult) }}
-                  </span>
-                  <span v-if="addedAs(view.models, item.id, found.id)" class="muted small found__state">
+                <li v-for="found in discoveries[item.id].found" :key="found.id" class="found__item" :data-found="found.id">
+                  <div class="found__info">
+                    <span class="mono found__name">{{ found.id }}</span>
+                    <span class="muted small">{{ describeFound(found) }}</span>
+                    <span v-if="found.state" class="muted small">
+                      {{ found.state === "loaded" ? "загружена в память" : "не загружена" }}
+                    </span>
+                    <span v-if="foundCheck(item, found) === 'checking'" class="muted small">Проверяю…</span>
+                    <span v-else-if="answered(foundCheck(item, found))" class="small ok" data-testid="found-check">
+                      {{ probeText(foundCheck(item, found) as ProbeResult) }}
+                    </span>
+                    <span v-else-if="failed(foundCheck(item, found))" class="small bad" data-testid="found-check">
+                      {{ probeText(foundCheck(item, found) as ProbeResult) }}
+                    </span>
+                  </div>
+                  <div v-if="addedAs(view.models, item.id, found.id)" class="found__actions muted small">
                     Добавлена как {{ addedAs(view.models, item.id, found.id) }}
-                  </span>
-                  <template v-else-if="canChat(found)">
+                  </div>
+                  <div v-else-if="canChat(found)" class="found__actions">
                     <button
                       type="button"
-                      class="ghost found__state"
+                      class="ghost"
                       title="Пробный запрос генерации; может расходовать подписку"
                       data-testid="found-probe"
                       @click="checkFound(item, found)"
@@ -660,7 +711,7 @@ onMounted(() => { void load(); void scan(); });
                       <Plus :size="14" aria-hidden="true" />
                       <span>Добавить</span>
                     </button>
-                  </template>
+                  </div>
                 </li>
               </ul>
             </template>
@@ -686,6 +737,11 @@ onMounted(() => { void load(); void scan(); });
                 <span class="mono">{{ item.model }}</span> · {{ item.provider }} · {{ originLabel(item.origin, item.has_base) }}
               </span>
               <span v-if="item.provider_disabled" class="small muted" data-testid="model-provider-off">Сервер отключён</span>
+              <span class="small muted" data-testid="model-price">{{ priceLabel(item) }}</span>
+              <span v-if="!item.pricing && costLimit" class="small bad" data-testid="model-price-warning">
+                У сессий есть лимит стоимости ${{ costLimit }}, поэтому модель без цены не запустится.
+                Выберите «Без оплаты» или укажите цену.
+              </span>
               <span v-if="rolesOf(view.routing, item.id).length" class="small" data-testid="model-roles">
                 Роль: {{ rolesOf(view.routing, item.id).join(", ") }}
               </span>
@@ -736,6 +792,24 @@ onMounted(() => { void load(); void scan(); });
               <span>Максимум ответа</span>
               <input v-model.number="limits[item.id].max_tokens" type="number" min="1" step="256" data-testid="model-max-tokens" />
             </label>
+            <label>
+              <span>Оплата</span>
+              <select v-model="limits[item.id].price" data-testid="model-price-mode">
+                <option v-if="!item.pricing" value="unset" disabled>Не указана</option>
+                <option value="free">Без оплаты</option>
+                <option value="paid">Платная</option>
+              </select>
+            </label>
+            <template v-if="limits[item.id].price === 'paid'">
+              <label>
+                <span>Вход, $ за 1M</span>
+                <input v-model.number="limits[item.id].input" type="number" min="0" step="0.01" data-testid="model-price-input" />
+              </label>
+              <label>
+                <span>Выход, $ за 1M</span>
+                <input v-model.number="limits[item.id].output" type="number" min="0" step="0.01" data-testid="model-price-output" />
+              </label>
+            </template>
             <button
               v-if="limitsChanged(item)"
               type="button"
@@ -889,7 +963,9 @@ h2 {
   background: var(--surface);
 }
 
-.card--off {
+/* Dim the details of a switched off item, but keep its buttons readable. */
+.card--off .card__main,
+.card--off .limits {
   opacity: 0.6;
 }
 
@@ -946,7 +1022,12 @@ button:disabled {
 }
 
 button.danger {
+  border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
   color: var(--danger);
+}
+
+button.danger:not(:disabled):hover {
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
 }
 
 button.link {
@@ -1075,6 +1156,41 @@ input.mono {
   margin-left: auto;
 }
 
+/* A found model: details on the left, actions in one group on the right. */
+.found__item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  padding: 6px 0;
+}
+
+.found__item + .found__item {
+  border-top: 1px dashed var(--border);
+}
+
+.found__info {
+  display: flex;
+  flex: 1 1 20rem;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+  min-width: 0;
+}
+
+.found__name {
+  overflow-wrap: anywhere;
+}
+
+.found__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-left: auto;
+}
+
 .address {
   display: flex;
   flex-wrap: wrap;
@@ -1100,6 +1216,12 @@ input.mono {
 
 .limits input {
   width: 9rem;
+}
+
+.limits input,
+.limits select {
+  box-sizing: border-box;
+  height: 34px;
 }
 
 fieldset {

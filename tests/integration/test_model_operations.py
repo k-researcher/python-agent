@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ssl
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from agent import llm, model_health, settings_api
+from agent import api, llm, model_health, settings_api
 from agent.config import Settings, get_settings
 from agent.database import session_factory
 from agent.model_overrides import LLMProviderOverride, load_effective_registry
@@ -587,3 +588,12 @@ async def test_concurrent_partial_changes_preserve_both_values(
         assert row is not None
         assert row.fields["max_retries"] == 2
         assert row.fields["timeout_seconds"] == 23
+
+
+def test_public_config_tells_the_session_cost_limit(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(api.settings, "max_session_cost", None)
+    assert client.get("/api/config/public").json()["session_cost_limit"] is None
+    monkeypatch.setattr(api.settings, "max_session_cost", Decimal("1.5"))
+    assert client.get("/api/config/public").json()["session_cost_limit"] == "1.5"

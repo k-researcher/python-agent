@@ -230,6 +230,10 @@ async def public_config(request: Request, db: AsyncSession = Depends(get_db)) ->
         "context_window": default_model.context_window if default_model else None,
         "context_reserved_tokens": settings.context_reserved_tokens,
         "max_child_depth": settings.max_child_depth,
+        # A model without a price cannot start while this money ceiling is set.
+        "session_cost_limit": (
+            str(settings.max_session_cost) if settings.max_session_cost is not None else None
+        ),
         "api_auth_enabled": True,
         "execution_mode": settings.execution_mode,
         "default_llm_profile": models.default_id,

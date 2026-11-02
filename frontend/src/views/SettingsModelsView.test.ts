@@ -220,6 +220,77 @@ describe("SettingsModelsView", () => {
     expect(calls.putModel).toHaveBeenCalledWith("main", { context_window: 256000, max_tokens: 8000 }, { checksum: "version-1" });
   });
 
+  it("warns that a model without a price cannot start under the session cost limit", async () => {
+    useAppStore().config = { session_cost_limit: "1" } as never;
+    const wrapper = await mountView();
+    const card = wrapper.get('[data-model="main"]');
+    expect(card.get('[data-testid="model-price"]').text()).toBe("Цена не указана");
+    expect(card.get('[data-testid="model-price-warning"]').text()).toContain("лимит стоимости $1");
+
+    useAppStore().config = { session_cost_limit: null } as never;
+    await flushPromises();
+    expect(card.find('[data-testid="model-price-warning"]').exists()).toBe(false);
+  });
+
+  it("marks a model as free with one choice and saves the zero price", async () => {
+    useAppStore().config = { session_cost_limit: "1" } as never;
+    const free = baseView();
+    free.models[0].pricing = { input_per_mtok: 0, output_per_mtok: 0 };
+    calls.putModel.mockResolvedValue(free);
+    const wrapper = await mountView();
+    const card = wrapper.get('[data-model="main"]');
+    await card.get('[data-testid="model-price-mode"]').setValue("free");
+    await card.get('[data-testid="model-save"]').trigger("click");
+    await flushPromises();
+    expect(calls.putModel).toHaveBeenCalledWith(
+      "main",
+      { context_window: 256000, max_tokens: 16000, pricing: { input_per_mtok: 0, output_per_mtok: 0 } },
+      { checksum: "version-1" },
+    );
+    expect(card.get('[data-testid="model-price"]').text()).toBe("Без оплаты");
+    expect(card.find('[data-testid="model-price-warning"]').exists()).toBe(false);
+    expect(card.find('[data-testid="model-save"]').exists()).toBe(false);
+  });
+
+  it("saves a paid price and refuses a negative one", async () => {
+    calls.putModel.mockResolvedValue(baseView());
+    const wrapper = await mountView();
+    const card = wrapper.get('[data-model="main"]');
+    await card.get('[data-testid="model-price-mode"]').setValue("paid");
+    await card.get('[data-testid="model-price-input"]').setValue(-1);
+    expect(card.text()).toContain("Цена — число от 0");
+    expect(card.get('[data-testid="model-save"]').attributes("disabled")).toBeDefined();
+    await card.get('[data-testid="model-price-input"]').setValue(0.14);
+    await card.get('[data-testid="model-price-output"]').setValue(0.28);
+    await card.get('[data-testid="model-save"]').trigger("click");
+    await flushPromises();
+    expect(calls.putModel).toHaveBeenCalledWith(
+      "main",
+      { context_window: 256000, max_tokens: 16000, pricing: { input_per_mtok: 0.14, output_per_mtok: 0.28 } },
+      { checksum: "version-1" },
+    );
+  });
+
+  it("shows a paid price in plain words", async () => {
+    const paid = baseView();
+    paid.models[0].pricing = { input_per_mtok: 0.14, output_per_mtok: 0.28 };
+    calls.get.mockResolvedValue(paid);
+    const wrapper = await mountView();
+    expect(wrapper.get('[data-model="main"] [data-testid="model-price"]').text()).toBe(
+      "Платная: вход $0.14, выход $0.28 за 1M токенов",
+    );
+  });
+
+  it("keeps the delete button active and readable on a switched off model", async () => {
+    const off = baseView();
+    off.models[0].disabled = true;
+    calls.get.mockResolvedValue(off);
+    const wrapper = await mountView();
+    const remove = wrapper.get('[data-model="main"] [data-testid="model-remove"]');
+    expect(remove.attributes("disabled")).toBeUndefined();
+    expect(remove.classes()).toContain("danger");
+  });
+
   it("changes the main and the service model", async () => {
     const two = baseView();
     two.models.push({ ...two.models[0], id: "light" });

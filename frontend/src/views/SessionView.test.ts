@@ -101,6 +101,26 @@ describe("SessionView", () => {
     await flushPromises();
     expect(send).not.toHaveBeenCalled();
   });
+  it("explains why a run stopped by itself and links to the model settings", async () => {
+    const store = prepareSession();
+    store.session = { ...store.session!, status: "stopped", error_code: "cost_unknown" };
+    const push = vi.spyOn(router, "push").mockResolvedValue(undefined);
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    const notice = wrapper.get('[data-testid="session-stop-reason"]');
+    expect(notice.text()).toContain("у модели не указана цена");
+    await notice.get("button").trigger("click");
+    expect(push).toHaveBeenCalledWith({ name: "settings-models" });
+
+    store.session = { ...store.session!, status: "running" };
+    await flushPromises();
+    expect(wrapper.find('[data-testid="session-stop-reason"]').exists()).toBe(false);
+
+    store.session = { ...store.session!, status: "stopped", error_code: "user_requested" };
+    await flushPromises();
+    expect(wrapper.find('[data-testid="session-stop-reason"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
   it("shows child approvals in the parent conversation and opens the child", async () => {
     const store = prepareSession();
     store.children = [{ ...store.session!, id: "child", parent_id: "s1",

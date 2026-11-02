@@ -13,7 +13,7 @@ import Composer from "../components/chat/Composer.vue";
 import AgentSettings from "../components/chat/AgentSettings.vue";
 import type { RejectPayload, SendPayload } from "../components/chat/types";
 import { toChatTimelineItems } from "../uiAdapters";
-import { sessionStatusLabel } from "../components/layout/status";
+import { sessionStatusLabel, stopReasonText } from "../components/layout/status";
 import { modeLabel as resolveModeLabel } from "../modes";
 
 const props = defineProps<{ id: string }>();
@@ -71,6 +71,7 @@ const waitingChildren = computed(() => sessionStore.children.filter(
 ));
 const timelineItems = computed(() => toChatTimelineItems(sessionStore.timeline));
 const external = computed(() => !!session.value?.engine_profile);
+const stopReason = computed(() => session.value?.status === "stopped" ? stopReasonText(session.value.error_code) : "");
 const modelAvailable = computed(() => external.value || !!appStore.config?.llm_profiles.some(
   model => model.name === session.value?.llm_profile && model.configured,
 ));
@@ -225,6 +226,12 @@ function onOpenChild(id: string): void {
         </p>
         <p v-if="session.error" class="session-error" data-testid="session-error">
           {{ session.error }}
+        </p>
+        <p v-if="stopReason" class="session-notice" role="status" data-testid="session-stop-reason">
+          {{ stopReason }}
+          <button v-if="session.error_code === 'cost_unknown'" type="button" @click="router.push({ name: 'settings-models' })">
+            Настроить модели
+          </button>
         </p>
       </header>
 
@@ -384,6 +391,16 @@ function onOpenChild(id: string): void {
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--danger) 8%, transparent);
   color: var(--danger);
+  font-size: 13px;
+}
+
+.session-notice {
+  margin: 8px 16px;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--warning) 8%, transparent);
+  color: var(--text);
   font-size: 13px;
 }
 
