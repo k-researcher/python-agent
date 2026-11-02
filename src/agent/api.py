@@ -63,6 +63,7 @@ from agent.schemas import (
     ProjectRead,
     SessionBudgetRead,
     SessionCreate,
+    SessionModelChange,
     SessionRead,
 )
 from agent.session_budget_store import (
@@ -697,6 +698,49 @@ async def unarchive_session(session_id: str, db: AsyncSession = Depends(get_db))
     await db.commit()
     await emit_event(db, "session.unarchived", {}, session.id)
     return {"archived": False}
+
+
+@router.post("/sessions/{session_id}/model", response_model=SessionRead)
+async def change_session_model(
+    session_id: str, payload: SessionModelChange, db: AsyncSession = Depends(get_db)
+) -> SessionRead:
+    """Move an inactive session to another model; the next run uses it."""
+    session = await db.get(Session, session_id)
+    if session is None:
+        raise HTTPException(404, "Session not found")
+    if session.engine_profile is not None:
+        raise HTTPException(409, "Модель внешнего агента сменить нельзя.")
+    # The lock keeps the model from being removed while the session moves to it.
+    await lock_model_settings(db)
+    if payload.llm_profile not in (await effective_registry(db, settings)).models:
+        raise HTTPException(422, "Модель недоступна. Выберите включённую модель.")
+    previous = session.llm_profile
+    if previous == payload.llm_profile:
+        await db.rollback()
+        await db.refresh(session)
+        return await _session_read(db, session)
+    result = cast(
+        CursorResult[Any],
+        await db.execute(
+            update(Session)
+            .where(Session.id == session_id, Session.status.in_(_INACTIVE))
+            .values(llm_profile=payload.llm_profile)
+            .execution_options(synchronize_session=False)
+        ),
+    )
+    if result.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(409, "Остановите сессию, чтобы сменить модель.")
+    pending = await add_event(
+        db,
+        "session.model_changed",
+        {"llm_profile": payload.llm_profile, "previous": previous},
+        session_id,
+    )
+    await db.commit()
+    await publish([pending])
+    await db.refresh(session)
+    return await _session_read(db, session)
 
 
 _INACTIVE = TERMINAL_STATUSES | {SessionStatus.interrupted.value}

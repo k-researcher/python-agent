@@ -101,6 +101,57 @@ describe("SessionView", () => {
     await flushPromises();
     expect(send).not.toHaveBeenCalled();
   });
+  it("moves an idle session to another model from the composer", async () => {
+    const store = prepareSession();
+    useAppStore().config!.llm_profiles.push({ name: "other", model: "m2", destination: "dst", configured: true });
+    const setModel = vi.spyOn(store, "setModel").mockResolvedValue();
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    const select = wrapper.get('[data-testid="session-model-select"]');
+    expect((select.element as HTMLSelectElement).value).toBe("default");
+    await select.setValue("other");
+    await flushPromises();
+    expect(setModel).toHaveBeenCalledWith("other");
+  });
+
+  it("keeps the model while a run is active", async () => {
+    const store = prepareSession();
+    store.session = { ...store.session!, status: "running" };
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    expect(wrapper.get('[data-testid="session-model-select"]').attributes("disabled")).toBeDefined();
+  });
+
+  it("offers a working model when the session model is gone", async () => {
+    const store = prepareSession();
+    useAppStore().config!.llm_profiles = [{ name: "other", model: "m2", destination: "dst", configured: true }];
+    const setModel = vi.spyOn(store, "setModel").mockResolvedValue();
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    expect(wrapper.get('[data-testid="session-model-unavailable"]').text()).toContain("Выберите другую модель");
+    const select = wrapper.get('[data-testid="session-model-select"]');
+    expect(select.attributes("disabled")).toBeUndefined();
+    const gone = select.findAll("option").find(option => option.attributes("value") === "default");
+    expect(gone?.text()).toContain("недоступна");
+    expect(gone?.attributes("disabled")).toBeDefined();
+    await select.setValue("other");
+    await flushPromises();
+    expect(setModel).toHaveBeenCalledWith("other");
+  });
+
+  it("restores the select and shows the reason when the change is refused", async () => {
+    const store = prepareSession();
+    useAppStore().config!.llm_profiles.push({ name: "other", model: "m2", destination: "dst", configured: true });
+    vi.spyOn(store, "setModel").mockRejectedValue(new Error("Остановите сессию, чтобы сменить модель."));
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    const select = wrapper.get('[data-testid="session-model-select"]');
+    await select.setValue("other");
+    await flushPromises();
+    expect((select.element as HTMLSelectElement).value).toBe("default");
+    expect(wrapper.get('[data-testid="session-model-error"]').text()).toContain("Остановите сессию");
+  });
+
   it("explains why a run stopped by itself and links to the model settings", async () => {
     const store = prepareSession();
     store.session = { ...store.session!, status: "stopped", error_code: "cost_unknown" };

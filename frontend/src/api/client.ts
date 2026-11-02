@@ -161,6 +161,11 @@ export const api = {
     request(`/api/sessions/${sessionId}/archive`, { method: "POST" }),
   unarchive: (sessionId: string): Promise<{ archived: boolean }> =>
     request(`/api/sessions/${sessionId}/unarchive`, { method: "POST" }),
+  setSessionModel: (sessionId: string, llmProfile: string): Promise<Session> =>
+    request<Session>(`/api/sessions/${sessionId}/model`, {
+      method: "POST",
+      body: JSON.stringify({ llm_profile: llmProfile }),
+    }),
   /** Deletes the session with its history; children only when asked explicitly. */
   deleteSession: (sessionId: string, withChildren: boolean): Promise<void> =>
     request(`/api/sessions/${sessionId}${withChildren ? "?with_children=true" : ""}`, { method: "DELETE" }),

@@ -131,6 +131,10 @@ class SessionRead(BaseModel):
     updated_at: UtcDatetime
 
 
+class SessionModelChange(BaseModel):
+    llm_profile: str = Field(min_length=1, max_length=100)
+
+
 class MessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=2_000_000)
     # Level for this message and the tool loop that follows it: "auto" or a model level.

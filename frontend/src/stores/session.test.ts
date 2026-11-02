@@ -543,6 +543,28 @@ describe("session store actions", () => {
     expect(store.streaming).toBeNull(); // stream reset after send
   });
 
+  it("setModel() moves the open session to another model and reloads it", async () => {
+    const changed = sessionRecord("s1", { llm_profile: "other", status: "completed" });
+    const setSpy = vi.spyOn(api, "setSessionModel").mockResolvedValue(changed);
+    vi.spyOn(api, "session").mockResolvedValue(changed);
+    const store = useSessionStore();
+    store.sessionId = "s1";
+    store.session = sessionRecord("s1", { status: "completed" });
+
+    await store.setModel("other");
+    expect(setSpy).toHaveBeenCalledWith("s1", "other");
+    expect(store.session?.llm_profile).toBe("other");
+  });
+
+  it("a model change from another tab reloads the open session", async () => {
+    const sessionSpy = vi.spyOn(api, "session");
+    const store = useSessionStore();
+    store.sessionId = "s1";
+    store.applyEvent(persistent("session.model_changed", { llm_profile: "other" }));
+    await flushPromises();
+    expect(sessionSpy).toHaveBeenCalledWith("s1");
+  });
+
   it("open() loads every slice for the session", async () => {
     const sessionRecord: Session = {
       id: "s1",
