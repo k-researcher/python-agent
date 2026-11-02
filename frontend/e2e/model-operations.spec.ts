@@ -78,6 +78,8 @@ test("model settings keep checks explicit and separate key edit, disable, delete
   await provider.getByTestId("provider-remove").click();
   await expect(provider).toHaveCount(0);
   await expect(page.getByTestId("deleted-settings")).toBeVisible();
+  await expect(page.locator('[data-remove-hint-provider="gateway"]')).toContainText("config/models.yaml");
+  await expectNoHorizontalOverflow(page);
   await page.locator('[data-restore-provider="gateway"]').click();
   await expect(provider).toBeVisible();
   await expect(page.locator('[data-routing-role="pm"]')).toHaveValue("chat");

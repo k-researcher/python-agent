@@ -75,3 +75,23 @@ test("found models keep their actions in one aligned group and delete stays visi
     await page.locator("#models-title").locator("..").screenshot({ path: `${shots}/${info.project.name}-models.png` });
   }
 });
+
+test("restore buttons of deleted file settings stand in one column", async ({ page }, info) => {
+  await openApp(page, info);
+  const view = settings();
+  view.deleted = { providers: ["letovo"], models: ["main", "light", "nemotron-3.5-transcribe-30b-a4b-ea"] };
+  await page.route("**/api/settings/models**", async route => {
+    const path = new URL(route.request().url()).pathname.replace("/api/settings/models", "");
+    if (path === "/local-servers") return route.fulfill({ json: [] });
+    return route.fulfill({ json: view });
+  });
+  await page.goto("/settings/models");
+  const buttons = page.getByTestId("deleted-settings").getByRole("button", { name: "Восстановить" });
+  await expect(buttons).toHaveCount(4);
+  const lefts = [];
+  for (const button of await buttons.all()) lefts.push((await button.boundingBox())!.x);
+  expect(Math.max(...lefts) - Math.min(...lefts)).toBeLessThan(2);
+  await expectNoHorizontalOverflow(page);
+  const shots = process.env.UI_E2E_SHOTS;
+  if (shots) await page.getByTestId("deleted-settings").screenshot({ path: `${shots}/${info.project.name}-deleted.png` });
+});
