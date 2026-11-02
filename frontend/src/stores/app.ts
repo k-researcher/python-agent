@@ -58,9 +58,15 @@ export const useAppStore = defineStore("app", () => {
     reconcileProject();
   }
 
+  // Active and archived sessions together: the sidebar shows the archive as its own group.
+  async function fetchSessions(): Promise<Session[]> {
+    const [active, archived] = await Promise.all([api.sessions(), api.archivedSessions()]);
+    return [...active, ...archived];
+  }
+
   async function loadSessions(): Promise<void> {
     const expectedGeneration = generation;
-    const result = await api.sessions();
+    const result = await fetchSessions();
     if (expectedGeneration !== generation) return;
     sessions.value = result;
   }
@@ -69,7 +75,7 @@ export const useAppStore = defineStore("app", () => {
   async function load(): Promise<void> {
     const expectedGeneration = generation;
     const expectedConfigVersion = ++configVersion;
-    const [cfg, pr, ss] = await Promise.all([api.config(), api.projects(), api.sessions()]);
+    const [cfg, pr, ss] = await Promise.all([api.config(), api.projects(), fetchSessions()]);
     if (expectedGeneration !== generation) return;
     if (expectedConfigVersion === configVersion) config.value = cfg;
     projects.value = pr;
@@ -109,6 +115,30 @@ export const useAppStore = defineStore("app", () => {
     return project;
   }
 
+  /** Session IDs of a subtree, the session itself first. */
+  function subtreeIds(sessionId: string): string[] {
+    const ids = [sessionId];
+    for (let index = 0; index < ids.length; index += 1) {
+      for (const item of sessions.value) if (item.parent_id === ids[index]) ids.push(item.id);
+    }
+    return ids;
+  }
+
+  async function setArchived(sessionId: string, archived: boolean): Promise<void> {
+    await (archived ? api.archive(sessionId) : api.unarchive(sessionId));
+    await loadSessions();
+  }
+
+  async function deleteSession(sessionId: string): Promise<void> {
+    await api.deleteSession(sessionId, subtreeIds(sessionId).length > 1);
+    await loadSessions();
+  }
+
+  async function deleteProject(projectId: string, name: string): Promise<void> {
+    await api.deleteProject(projectId, name);
+    await Promise.all([loadProjects(), loadSessions()]);
+  }
+
   async function createSession(input: NewSession): Promise<Session> {
     const expectedGeneration = generation;
     const session = await api.createSession({
@@ -125,10 +155,10 @@ export const useAppStore = defineStore("app", () => {
     return session;
   }
 
-  /** Root nodes (parent → children) for one project, newest first, archives hidden. */
+  /** Root nodes (parent → children) for one project, newest first, archived ones included. */
   function sessionTree(projectId: string | null): SessionNode[] {
     if (projectId == null) return [];
-    const own = sessions.value.filter((s) => s.project_id === projectId && !s.archived);
+    const own = sessions.value.filter((s) => s.project_id === projectId);
     const childrenByParent = new Map<string | null, Session[]>();
     for (const s of own) {
       const list = childrenByParent.get(s.parent_id);
@@ -158,10 +188,15 @@ export const useAppStore = defineStore("app", () => {
       case "project.created":
         void loadProjects();
         break;
+      case "project.deleted":
+        void loadProjects().catch(() => undefined);
+        void loadSessions().catch(() => undefined);
+        break;
       case "session.status":
       case "session.error":
       case "session.created":
       case "session.archived":
+      case "session.unarchived":
       case "session.child_created":
       case "session.deleted":
         void loadSessions();
@@ -184,6 +219,10 @@ export const useAppStore = defineStore("app", () => {
     createProject,
     createSession,
     sessionTree,
+    subtreeIds,
+    setArchived,
+    deleteSession,
+    deleteProject,
     applyEvent,
   };
 });

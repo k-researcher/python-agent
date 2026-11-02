@@ -18,6 +18,7 @@ from fastapi import (
 )
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import attributes, selectinload
 from sqlalchemy.sql.elements import ColumnElement
@@ -30,7 +31,7 @@ from agent.context_inference import ContextInference, ContextPreparationError, c
 from agent.database import get_db, session_factory
 from agent.engine_access import check_engine_access
 from agent.engine_adapters import EngineRegistry, configured_profiles
-from agent.events import broker, emit_event, publish
+from agent.events import add_event, broker, emit_event, publish
 from agent.message_tree import IDLE_STATUSES, append_message
 from agent.model_overrides import lock_model_settings
 from agent.model_registry import effective_registry, select_model
@@ -687,26 +688,126 @@ async def archive_session(session_id: str, db: AsyncSession = Depends(get_db)) -
     return {"archived": True}
 
 
-@router.delete("/sessions/{session_id}", status_code=204)
-async def delete_session(session_id: str, db: AsyncSession = Depends(get_db)) -> None:
+@router.post("/sessions/{session_id}/unarchive")
+async def unarchive_session(session_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, bool]:
     session = await db.get(Session, session_id)
     if session is None:
         raise HTTPException(404, "Session not found")
-    if session.status not in TERMINAL_STATUSES | {SessionStatus.interrupted.value}:
-        raise HTTPException(409, "Stop the session before deleting it")
-    child_id = (
-        await db.execute(select(Session.id).where(Session.parent_id == session_id).limit(1))
-    ).scalar_one_or_none()
-    if child_id is not None:
-        raise HTTPException(409, "Delete or archive child sessions first")
-    audience = (
-        {"_engine_actor_user_id": session.created_by_user_id} if session.engine_profile else {}
-    )
-    await db.execute(delete(Session).where(Session.id == session_id))
+    session.archived = False
     await db.commit()
-    await broker.broadcast(
-        {"type": "session.deleted", "session_id": session_id, "payload": {}, **audience}
-    )
+    await emit_event(db, "session.unarchived", {}, session.id)
+    return {"archived": False}
+
+
+_INACTIVE = TERMINAL_STATUSES | {SessionStatus.interrupted.value}
+
+
+async def _subtree(db: AsyncSession, root_id: str) -> list[Session]:
+    """Return a session and all its descendants, parents before children."""
+    rows = list(await db.scalars(select(Session).where(Session.id == root_id)))
+    frontier = [root_id]
+    while frontier:
+        children = list(await db.scalars(select(Session).where(Session.parent_id.in_(frontier))))
+        rows.extend(children)
+        frontier = [row.id for row in children]
+    return rows
+
+
+async def _remove_sessions(db: AsyncSession, rows: list[Session]) -> list[dict[str, Any]]:
+    """Delete inactive sessions with their history in the open transaction.
+
+    Only rows that are still inactive are deleted. When a run starts or a child
+    appears after the check, the transaction is rolled back and the caller gets 409.
+    Returns the deletion messages to broadcast after the commit.
+    """
+    ids = [row.id for row in rows]
+    messages: list[dict[str, Any]] = [
+        {
+            "type": "session.deleted",
+            "session_id": row.id,
+            "payload": {},
+            **({"_engine_actor_user_id": row.created_by_user_id} if row.engine_profile else {}),
+        }
+        for row in rows
+    ]
+    try:
+        result = cast(
+            CursorResult[Any],
+            await db.execute(
+                delete(Session).where(Session.id.in_(ids), Session.status.in_(_INACTIVE))
+            ),
+        )
+        changed = result.rowcount != len(ids)
+    except IntegrityError:
+        changed = True
+    if changed:
+        await db.rollback()
+        raise HTTPException(409, "Сессии изменились во время удаления. Повторите.")
+    return messages
+
+
+async def _check_deletable(
+    db: AsyncSession, rows: list[Session], request: Request, active_message: str
+) -> None:
+    actor = getattr(getattr(request, "state", None), "actor_user_id", None)
+    for row in rows:
+        if row.status not in _INACTIVE:
+            raise HTTPException(409, active_message)
+        try:
+            await check_engine_access(db, settings, row, actor)
+        except PermissionError:
+            raise HTTPException(409, "Среди сессий есть недоступные вам.") from None
+
+
+@router.delete("/sessions/{session_id}", status_code=204)
+async def delete_session(
+    session_id: str,
+    request: Request,
+    with_children: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    rows = await _subtree(db, session_id)
+    if not rows:
+        raise HTTPException(404, "Session not found")
+    if rows[0].status not in _INACTIVE:
+        raise HTTPException(409, "Stop the session before deleting it")
+    if len(rows) > 1 and not with_children:
+        raise HTTPException(409, "Delete or archive child sessions first")
+    await _check_deletable(db, rows, request, "Остановите дочерние сессии перед удалением.")
+    messages = await _remove_sessions(db, rows)
+    await db.commit()
+    for message in messages:
+        await broker.broadcast(message)
+
+
+@router.delete("/projects/{project_id}", status_code=204)
+async def delete_project(
+    project_id: str,
+    request: Request,
+    name: str = Query(),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Delete a project with its sessions and history. Files on disk stay untouched."""
+    project = await db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(404, "Project not found")
+    if project.workspace_id is not None:
+        raise HTTPException(409, "Удаление проектов рабочего пространства пока не поддерживается.")
+    if name != project.name:
+        raise HTTPException(409, "Имя проекта введено неверно.")
+    rows = list(await db.scalars(select(Session).where(Session.project_id == project_id)))
+    await _check_deletable(db, rows, request, "Остановите все сессии проекта перед удалением.")
+    messages = await _remove_sessions(db, rows) if rows else []
+    try:
+        await db.execute(delete(Project).where(Project.id == project_id))
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(409, "В проекте появились новые сессии. Повторите.") from None
+    pending = await add_event(db, "project.deleted", {"project_id": project_id})
+    await db.commit()
+    for message in messages:
+        await broker.broadcast(message)
+    await publish([pending])
 
 
 @router.get("/sessions/{session_id}/approvals", response_model=list[ApprovalRead])

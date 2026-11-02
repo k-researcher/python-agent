@@ -93,6 +93,7 @@ beforeEach(() => {
   });
   vi.spyOn(api, "projects").mockResolvedValue(projects);
   vi.spyOn(api, "sessions").mockResolvedValue([]);
+  vi.spyOn(api, "archivedSessions").mockResolvedValue([]);
 });
 
 afterEach(() => {

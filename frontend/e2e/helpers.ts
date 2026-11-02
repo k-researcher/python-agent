@@ -242,6 +242,10 @@ export async function installRoutes(page: Page): Promise<void> {
       return;
     }
     if (path === "/api/sessions") {
+      if (url.searchParams.get("archived") === "true") {
+        await json(route, 200, []);
+        return;
+      }
       if (req.method() === "POST") {
         await json(route, 500, { detail: "create failed" });
         return;

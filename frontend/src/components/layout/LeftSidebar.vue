@@ -3,12 +3,13 @@
 // Presentational only — data comes via props, actions go up through emits.
 // The tree uses WAI-ARIA tree semantics and roving-tabindex keyboard navigation.
 
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   Archive,
   ChevronRight,
   Folder,
   LogOut,
+  MoreHorizontal,
   Plus,
   Settings,
 } from "lucide-vue-next";
@@ -23,6 +24,7 @@ const props = withDefaults(
     selectedSessionId: string | null;
     isCreatingProject?: boolean;
     showCreateForm?: boolean;
+    isDeletingProject?: boolean;
   }>(),
   {
     projects: () => [],
@@ -31,6 +33,7 @@ const props = withDefaults(
     selectedSessionId: null,
     isCreatingProject: false,
     showCreateForm: false,
+    isDeletingProject: false,
   },
 );
 
@@ -43,7 +46,84 @@ const emit = defineEmits<{
   signOut: [];
   closeCreateForm: [];
   openCreateForm: [];
+  archiveSession: [id: string, archived: boolean];
+  deleteSession: [id: string];
+  deleteProject: [project: { id: string; name: string }];
 }>();
+
+// --- Row menus -------------------------------------------------------------
+// One menu at a time: "s:<id>" for a session row, "p:<id>" for a project row.
+
+const INACTIVE = new Set(["completed", "stopped", "error", "interrupted"]);
+const openMenu = ref<string | null>(null);
+const menuRoot = ref<HTMLElement | null>(null);
+
+function isInactive(node: SessionNode): boolean {
+  return INACTIVE.has(node.status);
+}
+
+function toggleMenu(key: string, event: Event): void {
+  if (openMenu.value === key) {
+    openMenu.value = null;
+    return;
+  }
+  openMenu.value = key;
+  const button = event.currentTarget as HTMLElement;
+  void nextTick(() => {
+    menuRoot.value = button.closest("[data-menu-root]");
+    menuRoot.value?.querySelector<HTMLElement>("[role=menuitem]:not(:disabled)")?.focus();
+  });
+}
+
+function closeMenu(returnFocus = false): void {
+  const root = menuRoot.value;
+  openMenu.value = null;
+  menuRoot.value = null;
+  if (returnFocus) root?.querySelector<HTMLElement>("[aria-haspopup=menu]")?.focus();
+}
+
+// A click inside any row menu is handled by that menu; any other click closes it.
+function onDocumentClick(event: MouseEvent): void {
+  if (openMenu.value && !(event.target as Element | null)?.closest?.("[data-menu-root]")) closeMenu();
+}
+
+onMounted(() => document.addEventListener("click", onDocumentClick));
+onBeforeUnmount(() => document.removeEventListener("click", onDocumentClick));
+
+function sessionAction(node: SessionNode, action: "archive" | "delete"): void {
+  closeMenu();
+  if (action === "delete") emit("deleteSession", node.id);
+  else emit("archiveSession", node.id, !node.archived);
+}
+
+// --- Delete-project confirmation ---------------------------------------------
+
+const projectToDelete = ref<{ id: string; name: string } | null>(null);
+const typedName = ref("");
+
+function askDeleteProject(project: { id: string; name: string }): void {
+  closeMenu();
+  projectToDelete.value = { id: project.id, name: project.name };
+  typedName.value = "";
+}
+
+function cancelDeleteProject(): void {
+  if (props.isDeletingProject) return;
+  projectToDelete.value = null;
+}
+
+function confirmDeleteProject(): void {
+  const project = projectToDelete.value;
+  if (!project || typedName.value !== project.name || props.isDeletingProject) return;
+  emit("deleteProject", project);
+}
+
+// The form closes by itself once the project is gone from the list.
+watch(() => props.projects, (projects) => {
+  if (projectToDelete.value && !projects.some((project) => project.id === projectToDelete.value?.id)) {
+    projectToDelete.value = null;
+  }
+});
 
 // --- Create-project form ---------------------------------------------------
 
@@ -325,7 +405,7 @@ function isSelected(item: VisNode): boolean {
       </form>
 
       <ul class="project-list">
-        <li v-for="project in projects" :key="project.id">
+        <li v-for="project in projects" :key="project.id" class="project-item" :data-project-item="project.id">
           <button
             type="button"
             class="project-row"
@@ -338,8 +418,63 @@ function isSelected(item: VisNode): boolean {
             <Folder :size="15" aria-hidden="true" class="project-row__icon" />
             <span class="project-row__name">{{ project.name }}</span>
           </button>
+          <span class="row-menu" data-menu-root @keydown.esc.stop="closeMenu(true)">
+            <button
+              type="button"
+              class="row-menu__button"
+              :class="{ 'row-menu__button--open': openMenu === `p:${project.id}` }"
+              :aria-label="`Действия с проектом «${project.name}»`"
+              aria-haspopup="menu"
+              :aria-expanded="openMenu === `p:${project.id}`"
+              data-project-menu
+              @click="toggleMenu(`p:${project.id}`, $event)"
+            >
+              <MoreHorizontal :size="15" aria-hidden="true" />
+            </button>
+            <span v-if="openMenu === `p:${project.id}`" class="row-menu__list" role="menu">
+              <button
+                type="button"
+                role="menuitem"
+                class="row-menu__item row-menu__item--danger"
+                data-project-delete
+                @click="askDeleteProject(project)"
+              >Удалить проект…</button>
+            </span>
+          </span>
         </li>
       </ul>
+      <form
+        v-if="projectToDelete"
+        class="create-project delete-project"
+        data-delete-project-form
+        :aria-busy="isDeletingProject"
+        @submit.prevent="confirmDeleteProject"
+      >
+        <p class="delete-project__text">
+          Удалить проект «{{ projectToDelete.name }}»? Удалятся все его сессии и история.
+          Файлы в папке проекта останутся.
+        </p>
+        <input
+          v-model="typedName"
+          class="create-project__input"
+          :placeholder="projectToDelete.name"
+          aria-label="Введите имя проекта для подтверждения"
+          autocomplete="off"
+          data-delete-project-name
+          :disabled="isDeletingProject"
+        />
+        <div class="create-project__actions">
+          <button
+            type="submit"
+            class="btn btn--danger"
+            data-delete-project-submit
+            :disabled="typedName !== projectToDelete.name || isDeletingProject"
+          >
+            {{ isDeletingProject ? "Удаление..." : "Удалить проект" }}
+          </button>
+          <button type="button" class="btn" :disabled="isDeletingProject" @click="cancelDeleteProject">Отмена</button>
+        </div>
+      </form>
       <p v-if="projects.length === 0" class="muted left-sidebar__hint">Нет проектов</p>
     </section>
 
@@ -396,6 +531,47 @@ function isSelected(item: VisNode): boolean {
               <Archive :size="12" />
             </span>
             <span class="tree-row__label">{{ item.node ? item.node.title : "Архив" }}</span>
+            <span
+              v-if="item.node"
+              class="row-menu"
+              data-menu-root
+              @click.stop
+              @keydown.stop
+              @keydown.esc="closeMenu(true)"
+            >
+              <button
+                type="button"
+                class="row-menu__button"
+                :class="{ 'row-menu__button--open': openMenu === `s:${item.node.id}` }"
+                :tabindex="activeKey === item.key ? 0 : -1"
+                :aria-label="`Действия с сессией «${item.node.title}»`"
+                aria-haspopup="menu"
+                :aria-expanded="openMenu === `s:${item.node.id}`"
+                data-session-menu
+                @click="toggleMenu(`s:${item.node.id}`, $event)"
+              >
+                <MoreHorizontal :size="15" aria-hidden="true" />
+              </button>
+              <span v-if="openMenu === `s:${item.node.id}`" class="row-menu__list" role="menu">
+                <button
+                  type="button"
+                  role="menuitem"
+                  class="row-menu__item"
+                  :disabled="!item.node.archived && !isInactive(item.node)"
+                  data-session-archive
+                  @click="sessionAction(item.node, 'archive')"
+                >{{ item.node.archived ? "Вернуть из архива" : "В архив" }}</button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  class="row-menu__item row-menu__item--danger"
+                  :disabled="!isInactive(item.node)"
+                  data-session-delete
+                  @click="sessionAction(item.node, 'delete')"
+                >Удалить</button>
+                <span v-if="!isInactive(item.node)" class="row-menu__hint">Сначала остановите сессию.</span>
+              </span>
+            </span>
           </div>
         </li>
       </ul>
@@ -675,6 +851,118 @@ function isSelected(item: VisNode): boolean {
   background: var(--accent);
   color: var(--accent-contrast);
   border-color: var(--accent);
+}
+
+.btn--danger {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: #fff;
+}
+
+.delete-project__text {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* Row menu: shown on hover, focus, for the selected row and always on touch screens. */
+.project-item {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.project-item .project-row {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.row-menu {
+  position: relative;
+  flex: none;
+  margin-left: auto;
+}
+
+.row-menu__button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  opacity: 0;
+  cursor: pointer;
+}
+
+.row-menu__button:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.tree-row:hover .row-menu__button,
+.tree-row--selected .row-menu__button,
+.project-item:hover .row-menu__button,
+.row-menu__button:focus-visible,
+.row-menu__button--open {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .row-menu__button {
+    opacity: 1;
+  }
+}
+
+.row-menu__list {
+  position: absolute;
+  top: calc(100% + 2px);
+  right: 0;
+  z-index: 20;
+  display: grid;
+  min-width: 170px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: 0 6px 18px color-mix(in srgb, #000 16%, transparent);
+  font-weight: 400;
+}
+
+.row-menu__item {
+  padding: 6px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.row-menu__item:hover:not(:disabled),
+.row-menu__item:focus-visible {
+  background: var(--bg-subtle);
+}
+
+.row-menu__item:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.row-menu__item--danger {
+  color: var(--danger);
+}
+
+.row-menu__hint {
+  padding: 2px 8px 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .btn:disabled,

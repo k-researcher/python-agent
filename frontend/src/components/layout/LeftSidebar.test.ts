@@ -324,3 +324,93 @@ describe("LeftSidebar — keyboard navigation", () => {
     expect(labels(wrapper)).toEqual(["Родитель", "Лист", "Архив"]);
   });
 });
+
+describe("LeftSidebar — session and project actions", () => {
+  async function openSessionMenu(wrapper: ReturnType<typeof mountSidebar>, title: string) {
+    const row = wrapper.findAll(".tree-row").find((item) => item.text().includes(title));
+    expect(row).toBeDefined();
+    await row!.get("[data-session-menu]").trigger("click");
+    return row!;
+  }
+
+  it("archives and deletes a stopped session from its row menu without selecting it", async () => {
+    const wrapper = mountSidebar();
+    const row = await openSessionMenu(wrapper, "Лист");
+    expect(row.get("[data-session-menu]").attributes("aria-expanded")).toBe("true");
+    await row.get("[data-session-archive]").trigger("click");
+    expect(wrapper.emitted("archiveSession")).toEqual([["leaf", true]]);
+    expect(wrapper.find('[role="menu"]').exists()).toBe(false);
+
+    await openSessionMenu(wrapper, "Лист");
+    await wrapper.get("[data-session-delete]").trigger("click");
+    expect(wrapper.emitted("deleteSession")).toEqual([["leaf"]]);
+    expect(wrapper.emitted("selectSession")).toBeUndefined();
+  });
+
+  it("does not offer to archive or delete a running session", async () => {
+    const wrapper = mountSidebar();
+    await openSessionMenu(wrapper, "Дочерний");
+    expect(wrapper.get("[data-session-archive]").attributes("disabled")).toBeDefined();
+    expect(wrapper.get("[data-session-delete]").attributes("disabled")).toBeDefined();
+    expect(wrapper.get('[role="menu"]').text()).toContain("Сначала остановите сессию");
+  });
+
+  it("offers to restore an archived session", async () => {
+    const wrapper = mountSidebar();
+    await wrapper.findAll(".tree-row").find((item) => item.text().includes("Архив"))!.trigger("click");
+    await openSessionMenu(wrapper, "Архивный");
+    const restore = wrapper.get("[data-session-archive]");
+    expect(restore.text()).toBe("Вернуть из архива");
+    await restore.trigger("click");
+    expect(wrapper.emitted("archiveSession")).toEqual([["old", false]]);
+  });
+
+  it("closes the menu with Escape and on a click elsewhere, and keeps tree keys inside", async () => {
+    const wrapper = mountSidebar();
+    await openSessionMenu(wrapper, "Лист");
+    await wrapper.get("[data-session-delete]").trigger("keydown", { key: "ArrowDown" });
+    expect(wrapper.emitted("selectSession")).toBeUndefined();
+    await wrapper.get('[role="menu"]').trigger("keydown", { key: "Escape" });
+    expect(wrapper.find('[role="menu"]').exists()).toBe(false);
+
+    await openSessionMenu(wrapper, "Лист");
+    document.body.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await nextTick();
+    expect(wrapper.find('[role="menu"]').exists()).toBe(false);
+  });
+
+  it("deletes a project only after its exact name is typed", async () => {
+    const wrapper = mountSidebar();
+    const item = wrapper.get('[data-project-item="p2"]');
+    await item.get("[data-project-menu]").trigger("click");
+    await item.get("[data-project-delete]").trigger("click");
+    const form = wrapper.get("[data-delete-project-form]");
+    expect(form.text()).toContain("«Проект два»");
+    expect(form.text()).toContain("Файлы в папке проекта останутся");
+    const submit = form.get("[data-delete-project-submit]");
+    await form.get("[data-delete-project-name]").setValue("проект два");
+    expect(submit.attributes("disabled")).toBeDefined();
+    await form.trigger("submit");
+    expect(wrapper.emitted("deleteProject")).toBeUndefined();
+
+    await form.get("[data-delete-project-name]").setValue("Проект два");
+    expect(submit.attributes("disabled")).toBeUndefined();
+    await form.trigger("submit");
+    expect(wrapper.emitted("deleteProject")).toEqual([[{ id: "p2", name: "Проект два" }]]);
+    expect(wrapper.emitted("selectProject")).toBeUndefined();
+
+    await wrapper.setProps({ projects: [projects[0]] });
+    expect(wrapper.find("[data-delete-project-form]").exists()).toBe(false);
+  });
+
+  it("keeps the project form open and locked while the deletion runs", async () => {
+    const wrapper = mountSidebar();
+    const item = wrapper.get('[data-project-item="p1"]');
+    await item.get("[data-project-menu]").trigger("click");
+    await item.get("[data-project-delete]").trigger("click");
+    await wrapper.setProps({ isDeletingProject: true });
+    const form = wrapper.get("[data-delete-project-form]");
+    expect(form.get("[data-delete-project-submit]").text()).toBe("Удаление...");
+    expect(form.get("[data-delete-project-name]").attributes("disabled")).toBeDefined();
+  });
+});
