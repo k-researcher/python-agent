@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { auditStatusLabel, sessionStatusLabel, statusDotClass, statusTone } from "./status";
+import { auditStatusLabel, sessionStatusLabel, statusDotClass, statusTone, stopReasonText } from "./status";
 
 describe("statusDotClass", () => {
   it("maps the spec statuses to their dedicated dot classes", () => {
@@ -57,5 +57,16 @@ describe("statusTone", () => {
     expect(statusTone("awaiting_confirmation")).toEqual({ "--status-color": "var(--warning)" });
     expect(statusTone("stopped")).toEqual({});
     expect(statusTone("constructor")).toEqual({});
+  });
+});
+
+describe("stopReasonText", () => {
+  it("explains budget stops in plain words and stays silent for other reasons", () => {
+    expect(stopReasonText("cost_unknown")).toContain("Без оплаты");
+    expect(stopReasonText("cost_exhausted")).toContain("лимит стоимости");
+    expect(stopReasonText("steps_exhausted")).toContain("лимит шагов");
+    expect(stopReasonText("user_requested")).toBe("");
+    expect(stopReasonText(null)).toBe("");
+    expect(stopReasonText("toString")).toBe("");
   });
 });

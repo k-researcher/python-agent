@@ -4,6 +4,7 @@
 import { request } from "./client";
 
 export type Origin = "file" | "ui" | "legacy";
+export type KeySource = "ui" | "env" | "none";
 
 export interface ProviderView {
   id: string;
@@ -15,6 +16,9 @@ export interface ProviderView {
   configured: boolean;
   disabled: boolean;
   origin: Origin;
+  has_base?: boolean;
+  key_source?: KeySource;
+  key_env?: string | null;
 }
 
 export interface ModelView {
@@ -26,6 +30,8 @@ export interface ModelView {
   pricing: { input_per_mtok: number; output_per_mtok: number } | null;
   disabled: boolean;
   origin: Origin;
+  has_base?: boolean;
+  provider_disabled?: boolean;
 }
 
 export interface RoutingView {
@@ -40,6 +46,8 @@ export interface ModelsView {
   models: ModelView[];
   routing: RoutingView;
   warnings: string[];
+  checksum?: string;
+  deleted?: { providers: string[]; models: string[] };
 }
 
 export interface DiscoveredModel {
@@ -78,6 +86,7 @@ export interface ProviderPatch {
   base_url?: string;
   api_key?: string;
   api_key_env?: string | null;
+  key_source?: KeySource;
   disabled?: boolean;
 }
 
@@ -94,21 +103,32 @@ const PREFIX = "/api/settings/models";
 
 // A model ID may contain "/" ("publisher/model"); the server route keeps it as a path.
 const modelPath = (id: string) => id.split("/").map(encodeURIComponent).join("/");
-const put = <T>(url: string, body: unknown) => request<T>(url, { method: "PUT", body: JSON.stringify(body) });
+export interface SaveOptions { checksum?: string; create?: boolean }
+
+const headers = (options?: SaveOptions): Record<string, string> => ({
+  ...(options?.checksum ? { "If-Match": options.checksum } : {}),
+  ...(options?.create ? { "If-None-Match": "*" } : {}),
+});
+const put = <T>(url: string, body: unknown, options?: SaveOptions) =>
+  request<T>(url, { method: "PUT", body: JSON.stringify(body), headers: headers(options) });
 
 export const modelSettings = {
   get: () => request<ModelsView>(PREFIX),
-  putProvider: (id: string, patch: ProviderPatch) =>
-    put<ModelsView>(`${PREFIX}/providers/${encodeURIComponent(id)}`, patch),
-  putModel: (id: string, patch: ModelPatch) => put<ModelsView>(`${PREFIX}/models/${modelPath(id)}`, patch),
-  putRouting: (patch: Partial<RoutingView>) => put<ModelsView>(`${PREFIX}/routing`, patch),
-  removeProvider: (id: string) =>
-    request<ModelsView>(`${PREFIX}/providers/${encodeURIComponent(id)}`, { method: "DELETE" }),
-  removeModel: (id: string) => request<ModelsView>(`${PREFIX}/models/${modelPath(id)}`, { method: "DELETE" }),
+  putProvider: (id: string, patch: ProviderPatch, options?: SaveOptions) =>
+    put<ModelsView>(`${PREFIX}/providers/${modelPath(id)}`, patch, options),
+  putModel: (id: string, patch: ModelPatch, options?: SaveOptions) => put<ModelsView>(`${PREFIX}/models/${modelPath(id)}`, patch, options),
+  putRouting: (patch: Partial<RoutingView>, options?: SaveOptions) => put<ModelsView>(`${PREFIX}/routing`, patch, options),
+  removeProvider: (id: string, options?: SaveOptions) =>
+    request<ModelsView>(`${PREFIX}/providers/${modelPath(id)}`, { method: "DELETE", headers: headers(options) }),
+  removeModel: (id: string, options?: SaveOptions) => request<ModelsView>(`${PREFIX}/models/${modelPath(id)}`, { method: "DELETE", headers: headers(options) }),
+  resetProvider: (id: string, options?: SaveOptions) =>
+    request<ModelsView>(`${PREFIX}/providers/${modelPath(id)}/reset`, { method: "POST", headers: headers(options) }),
+  resetModel: (id: string, options?: SaveOptions) =>
+    request<ModelsView>(`${PREFIX}/models/${modelPath(id)}/reset`, { method: "POST", headers: headers(options) }),
   testProvider: (id: string) =>
-    request<ConnectionResult>(`${PREFIX}/providers/${encodeURIComponent(id)}/test`, { method: "POST" }),
+    request<ConnectionResult>(`${PREFIX}/providers/${modelPath(id)}/test`, { method: "POST" }),
   probeFound: (providerId: string, model: string) =>
-    request<ProbeResult>(`${PREFIX}/providers/${encodeURIComponent(providerId)}/probe`, {
+    request<ProbeResult>(`${PREFIX}/providers/${modelPath(providerId)}/probe`, {
       method: "POST",
       body: JSON.stringify({ model }),
     }),

@@ -8,6 +8,7 @@ import {
   isLocalUrl,
   isValidId,
   keyStatus,
+  originLabel,
   probeText,
   providerIdFor,
   rolesOf,
@@ -44,6 +45,16 @@ function model(patch: Partial<ModelView> = {}): ModelView {
 }
 
 describe("suggestModel", () => {
+  it("keeps trying IDs when a prefixed or truncated name is taken", () => {
+    const taken = [model({ id: "chat" }), model({ id: "gateway:chat" })];
+    const result = suggestModel(provider({ id: "gateway" }), { id: "chat", context_window: null, kind: null }, taken);
+    expect(taken.some(item => item.id === result.id)).toBe(false);
+    const long = "a".repeat(100);
+    const existing = [model({ id: long }), model({ id: `gateway:${long}`.slice(0, 100) })];
+    const next = suggestModel(provider({ id: "gateway" }), { id: long, context_window: null, kind: null }, existing);
+    expect(next.id.length).toBeLessThanOrEqual(100);
+    expect(existing.some(item => item.id === next.id)).toBe(false);
+  });
   it("takes the context length from the server and a free price for a local server", () => {
     const { id, patch } = suggestModel(provider(), { id: "publisher/chat-model-35b", context_window: 262144, kind: "llm" }, []);
     expect(id).toBe("publisher/chat-model-35b");
@@ -102,6 +113,11 @@ describe("local servers and checks", () => {
 });
 
 describe("helpers", () => {
+  it("separates a changed base entry from an entry added in the UI", () => {
+    expect(originLabel("ui", true)).toBe("Изменено здесь");
+    expect(originLabel("ui", false)).toBe("Добавлено здесь");
+    expect(originLabel("legacy")).toBe("Из настроек запуска");
+  });
   it("recognises local addresses only", () => {
     expect(isLocalUrl("http://127.0.0.1:1234/v1")).toBe(true);
     expect(isLocalUrl("http://localhost:11434/v1")).toBe(true);

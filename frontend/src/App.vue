@@ -129,6 +129,11 @@ const connection = ref<ConnectionStatus>("offline");
 function onServerEvent(event: ServerEvent): void {
   if (authenticated.value !== true) return;
   appStore.applyEvent(event);
+  // The open session was deleted, maybe in another window: leave it.
+  if (event.type === "session.deleted" && event.session_id && event.session_id === sessionStore.sessionId) {
+    leaveSession();
+    return;
+  }
   sessionStore.applyEvent(event);
   monitor.onEvent(event);
 }
@@ -271,6 +276,7 @@ function endAuthSession(): void {
   shellNotice.value = "";
   isCreatingProject.value = false;
   isCreateFormVisible.value = false;
+  isDeletingProject.value = false;
   void router.replace({ name: "login" });
 }
 
@@ -281,6 +287,64 @@ async function onSignOut(): Promise<void> {
     await request;
   } catch {
     return;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Archive and deletion
+// ---------------------------------------------------------------------------
+
+const isDeletingProject = ref(false);
+
+function leaveSession(): void {
+  sessionStore.close();
+  void router.push({ name: "home" });
+}
+
+function failure(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}
+
+async function onArchiveSession(id: string, archived: boolean): Promise<void> {
+  projectError.value = "";
+  try {
+    await appStore.setArchived(id, archived);
+  } catch (cause) {
+    projectError.value = `Не удалось ${archived ? "убрать сессию в архив" : "вернуть сессию из архива"}: ${failure(cause)}`;
+  }
+}
+
+async function onDeleteSession(id: string): Promise<void> {
+  const ids = appStore.subtreeIds(id);
+  const title = appStore.sessions.find((item) => item.id === id)?.title ?? "";
+  const children = ids.length - 1;
+  const question = children
+    ? `Удалить сессию «${title}»? Вместе с ней удалятся дочерние сессии: ${children}. История удалится без возврата.`
+    : `Удалить сессию «${title}»? История удалится без возврата.`;
+  if (!window.confirm(question)) return;
+  projectError.value = "";
+  const open = sessionStore.sessionId;
+  try {
+    await appStore.deleteSession(id);
+    if (open && ids.includes(open)) leaveSession();
+  } catch (cause) {
+    projectError.value = `Не удалось удалить сессию: ${failure(cause)}`;
+  }
+}
+
+async function onDeleteProject(project: { id: string; name: string }): Promise<void> {
+  if (isDeletingProject.value) return;
+  projectError.value = "";
+  isDeletingProject.value = true;
+  const expectedGeneration = authGeneration;
+  const openProject = sessionStore.session?.project_id;
+  try {
+    await appStore.deleteProject(project.id, project.name);
+    if (expectedGeneration === authGeneration && openProject === project.id) leaveSession();
+  } catch (cause) {
+    if (expectedGeneration === authGeneration) projectError.value = `Не удалось удалить проект: ${failure(cause)}`;
+  } finally {
+    if (expectedGeneration === authGeneration) isDeletingProject.value = false;
   }
 }
 
@@ -413,6 +477,10 @@ onBeforeUnmount(() => {
         @sign-out="onSignOut"
         @open-create-form="isCreateFormVisible = true"
         @close-create-form="isCreateFormVisible = false"
+        :is-deleting-project="isDeletingProject"
+        @archive-session="onArchiveSession"
+        @delete-session="onDeleteSession"
+        @delete-project="onDeleteProject"
       />
     </template>
 

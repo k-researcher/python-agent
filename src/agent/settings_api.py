@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ssl
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -24,6 +26,7 @@ from agent import model_config, model_health
 from agent.config import Settings, get_settings
 from agent.database import get_db
 from agent.events import emit_event
+from agent.llm import LLMClient, LLMError
 from agent.model_config import ModelConfigError, ModelId, PricingSpec, ReasoningSpec
 from agent.model_overrides import (
     EffectiveModels,
@@ -35,9 +38,12 @@ from agent.model_overrides import (
     OverrideSnapshot,
     SecretKeyError,
     encrypt_secret,
+    entry_fields,
     load_layers,
+    lock_model_settings,
 )
 from agent.models import OutboundAudit, Session
+from agent.wire import build_wire_request
 
 
 def _safe_errors(error: ValidationError | RequestValidationError) -> list[dict[str, Any]]:
@@ -62,6 +68,7 @@ router = APIRouter(
 )
 Database = Annotated[AsyncSession, Depends(get_db)]
 Configuration = Annotated[Settings, Depends(get_settings)]
+_NO_REQUEST = cast(Request, None)
 
 
 class _Patch(BaseModel):
@@ -72,6 +79,7 @@ class ProviderPatch(_Patch):
     kind: Literal["openai", "anthropic", "jev"] | None = None
     base_url: str | None = None
     api_key_env: str | None = None
+    key_source: Literal["ui", "env", "none"] | None = None
     api_key: str | None = Field(
         default=None, repr=False, exclude=True, json_schema_extra={"writeOnly": True}
     )
@@ -110,7 +118,7 @@ def _merge(layers: ModelLayers, snapshot: OverrideSnapshot | None = None) -> Eff
     except ValidationError as error:
         raise HTTPException(422, detail=_safe_errors(error)) from None
     except ModelConfigError:
-        raise HTTPException(422, "Invalid model configuration") from None
+        raise HTTPException(422, "Некорректные ссылки в настройках моделей") from None
     except SecretKeyError as error:
         raise HTTPException(503, str(error)) from None
 
@@ -125,20 +133,52 @@ def _disabled(fields: dict[str, Any], previous: OverrideEntry) -> bool:
 async def _keep_session_models(
     db: AsyncSession, current: EffectiveModels, proposed: EffectiveModels
 ) -> None:
-    """Refuse a change that removes a model which a non-archived session uses."""
-    removed = set(current.registry.models) - set(proposed.registry.models)
+    """Keep active runs on the model and connection that they started with."""
+    removed = {
+        name
+        for name, model in current.registry.models.items()
+        if proposed.registry.models.get(name) != model
+    }
     if not removed:
         return
     in_use = (
         await db.scalars(
-            select(Session.llm_profile)
-            .where(Session.archived.is_(False), Session.llm_profile.in_(removed))
-            .distinct()
+            select(Session.id)
+            .where(
+                Session.status.in_({"pending", "running", "awaiting_confirmation"}),
+                Session.llm_profile.in_(removed),
+            )
+            .order_by(Session.id)
+            .limit(10)
         )
     ).all()
     if in_use:
         names = ", ".join(sorted(name for name in in_use if name is not None))
-        raise HTTPException(409, f"Sessions use these models; archive them first: {names}")
+        raise HTTPException(409, f"Сначала остановите активные сессии: {names}")
+
+
+async def _begin_change(
+    db: AsyncSession, settings: Settings, request: Request | None
+) -> ModelLayers:
+    await lock_model_settings(db)
+    layers = await _layers(db, settings)
+    expected = request.headers.get("If-Match") if request is not None else None
+    if expected is not None and expected.strip('"') != _merge(layers).registry.checksum:
+        raise HTTPException(
+            409, "Настройки изменились в другом окне. Проверьте актуальные значения."
+        )
+    return layers
+
+
+def _check_create(
+    layers: ModelLayers, category: str, element_id: str, request: Request | None
+) -> None:
+    if (
+        request is not None
+        and request.headers.get("If-None-Match") == "*"
+        and any(row["id"] == element_id for row in _merge(layers).view[category])
+    ):
+        raise HTTPException(409, "Такое имя уже занято. Выберите другое имя.")
 
 
 async def _changed(db: AsyncSession, effective: EffectiveModels) -> dict[str, Any]:
@@ -151,27 +191,50 @@ async def get_models(db: Database, settings: Configuration) -> dict[str, Any]:
     return _merge(await _layers(db, settings)).view
 
 
-@router.put("/providers/{provider_id}")
+@router.put("/providers/{provider_id:path}")
 async def put_provider(
-    provider_id: ModelId, body: ProviderPatch, db: Database, settings: Configuration
+    provider_id: ModelId,
+    body: ProviderPatch,
+    db: Database,
+    settings: Configuration,
+    request: Request = _NO_REQUEST,
 ) -> dict[str, Any]:
-    layers = await _layers(db, settings)
+    layers = await _begin_change(db, settings, request)
+    _check_create(layers, "providers", provider_id, request)
     previous = layers.overrides.providers.get(provider_id, OverrideEntry())
+    if previous.deleted:
+        previous = OverrideEntry()
     fields = body.model_dump(exclude_unset=True)
     disabled = _disabled(fields, previous)
     ciphertext = previous.api_key_ciphertext
+    key_source = fields.pop("key_source", previous.key_source)
     if {"api_key", "api_key_env"} <= body.model_fields_set:
         raise HTTPException(422, "Specify either api_key or api_key_env, not both")
     if "api_key_env" in body.model_fields_set:
         ciphertext = None
+        key_source = "env"
+        current_provider = next(
+            (item for item in _merge(layers).view["providers"] if item["id"] == provider_id), None
+        )
+        auth = current_provider.get("auth") if current_provider else None
+        if auth is not None and "key_env" in auth and body.api_key_env:
+            fields["auth"] = {**auth, "key_env": body.api_key_env}
+            fields["api_key_env"] = None
     if "api_key" in body.model_fields_set:
         try:
             ciphertext = (
                 encrypt_secret(body.api_key, settings, layers.env) if body.api_key else None
             )
+            key_source = "ui" if body.api_key else "none"
         except SecretKeyError as error:
             raise HTTPException(503, str(error)) from None
-    proposed = OverrideEntry(previous.fields | fields, disabled, ciphertext)
+    if body.key_source == "none":
+        ciphertext, key_source = None, "none"
+    elif body.key_source == "env":
+        ciphertext, key_source = None, "env"
+    elif body.key_source == "ui" and ciphertext is None:
+        raise HTTPException(422, "Введите ключ для сохранения в базе данных.")
+    proposed = OverrideEntry(previous.fields | fields, disabled, ciphertext, key_source=key_source)
     snapshot = replace(
         layers.overrides, providers=layers.overrides.providers | {provider_id: proposed}
     )
@@ -181,7 +244,7 @@ async def put_provider(
     if row is None:
         row = LLMProviderOverride(id=provider_id)
         db.add(row)
-    row.fields = proposed.fields
+    row.fields = entry_fields(proposed)
     row.disabled = proposed.disabled
     row.api_key_ciphertext = proposed.api_key_ciphertext
     return await _changed(db, effective)
@@ -190,10 +253,17 @@ async def put_provider(
 # ":path" lets a model ID keep its slash, as in "publisher/model".
 @router.put("/models/{model_id:path}")
 async def put_model(
-    model_id: ModelId, body: ModelPatch, db: Database, settings: Configuration
+    model_id: ModelId,
+    body: ModelPatch,
+    db: Database,
+    settings: Configuration,
+    request: Request = _NO_REQUEST,
 ) -> dict[str, Any]:
-    layers = await _layers(db, settings)
+    layers = await _begin_change(db, settings, request)
+    _check_create(layers, "models", model_id, request)
     previous = layers.overrides.models.get(model_id, OverrideEntry())
+    if previous.deleted:
+        previous = OverrideEntry()
     fields = body.model_dump(exclude_unset=True)
     disabled = _disabled(fields, previous)
     if body.reasoning is not None:
@@ -201,6 +271,11 @@ async def put_model(
     if body.pricing is not None:
         fields["pricing"] = body.pricing.model_dump()
     proposed = OverrideEntry(previous.fields | fields, disabled)
+    target_provider = proposed.fields.get("provider")
+    if target_provider is not None and not any(
+        row["id"] == target_provider for row in _merge(layers).view["providers"]
+    ):
+        raise HTTPException(422, "Выберите существующий сервер модели.")
     snapshot = replace(layers.overrides, models=layers.overrides.models | {model_id: proposed})
     effective = _merge(layers, snapshot)
     await _keep_session_models(db, _merge(layers), effective)
@@ -208,14 +283,31 @@ async def put_model(
     if row is None:
         row = LLMModelOverride(id=model_id)
         db.add(row)
-    row.fields = proposed.fields
+    row.fields = entry_fields(proposed)
     row.disabled = proposed.disabled
     return await _changed(db, effective)
 
 
 @router.put("/routing")
-async def put_routing(body: RoutingPatch, db: Database, settings: Configuration) -> dict[str, Any]:
-    layers = await _layers(db, settings)
+async def put_routing(
+    body: RoutingPatch,
+    db: Database,
+    settings: Configuration,
+    request: Request = _NO_REQUEST,
+) -> dict[str, Any]:
+    layers = await _begin_change(db, settings, request)
+    active = _merge(layers).registry.models
+    if any(getattr(body, name) is None for name in body.model_fields_set - {"light"}):
+        raise HTTPException(
+            422, "Назначение не может быть null. Используйте пустой список или объект."
+        )
+    names = [body.default] if body.default else []
+    names += body.fallback or []
+    names += list((body.roles or {}).values())
+    if body.light:
+        names.append(body.light)
+    if any(name not in active for name in names) or (body.default == "" and active):
+        raise HTTPException(422, "Для назначения выберите включённую модель.")
     proposed = layers.overrides.routing | body.model_dump(exclude_unset=True)
     effective = _merge(layers, replace(layers.overrides, routing=proposed))
     await _keep_session_models(db, _merge(layers), effective)
@@ -233,54 +325,129 @@ async def _delete_element(
     disable: bool,
     db: AsyncSession,
     settings: Settings,
+    request: Request | None = None,
+    *,
+    reset: bool = False,
 ) -> dict[str, Any]:
-    layers = await _layers(db, settings)
+    layers = await _begin_change(db, settings, request)
     current = _merge(layers)
-    if not any(item["id"] == element_id for item in current.view[category]):
-        raise HTTPException(404, "Unknown model settings ID")
+    item = next((row for row in current.view[category] if row["id"] == element_id), None)
+    has_base = (item is not None and item["has_base"]) or element_id in current.view["deleted"][
+        category
+    ]
+    if reset:
+        if not has_base:
+            raise HTTPException(404, "Для этой записи нет исходной настройки из файла.")
+    elif item is None:
+        raise HTTPException(404, "Настройка не найдена.")
     entries = dict(getattr(layers.overrides, category))
-    if disable:
+    if reset or (not disable and not has_base):
+        entries.pop(element_id, None)
+    elif disable:
         entries[element_id] = replace(entries.get(element_id, OverrideEntry()), disabled=True)
     else:
-        entries.pop(element_id, None)
-    snapshot = (
-        replace(layers.overrides, providers=entries)
-        if category == "providers"
-        else replace(layers.overrides, models=entries)
-    )
+        entries[element_id] = OverrideEntry(deleted=True)
+    routing = dict(layers.overrides.routing)
+    removed_models: dict[str, OverrideEntry | None] = {}
+    if not reset and not disable:
+        affected = (
+            {element_id}
+            if category == "models"
+            else {item["id"] for item in current.view["models"] if item["provider"] == element_id}
+        )
+        if routing.get("default") in affected:
+            routing.pop("default")
+        if routing.get("light") in affected:
+            routing["light"] = None
+        if "fallback" in routing:
+            routing["fallback"] = [name for name in routing["fallback"] if name not in affected]
+        if "roles" in routing:
+            routing["roles"] = {
+                role: name for role, name in routing["roles"].items() if name not in affected
+            }
+        if category == "providers" and not has_base:
+            removed_models = {
+                item["id"]: OverrideEntry(deleted=True) if item["has_base"] else None
+                for item in current.view["models"]
+                if item["id"] in affected
+            }
+    snapshot = replace(layers.overrides, **{category: entries}, routing=routing)
+    if removed_models:
+        models = dict(snapshot.models)
+        for name, entry in removed_models.items():
+            if entry is None:
+                models.pop(name, None)
+            else:
+                models[name] = entry
+        snapshot = replace(snapshot, models=models)
     effective = _merge(layers, snapshot)
-    await _keep_session_models(db, _merge(layers), effective)
-    row: LLMProviderOverride | LLMModelOverride | None
-    if category == "providers":
-        row = await db.get(LLMProviderOverride, element_id)
+    await _keep_session_models(db, current, effective)
+    table = LLMProviderOverride if category == "providers" else LLMModelOverride
+    row = cast(LLMProviderOverride | LLMModelOverride | None, await db.get(table, element_id))
+    proposed = entries.get(element_id)
+    if proposed is None:
+        if row is not None:
+            await db.delete(row)
     else:
-        row = await db.get(LLMModelOverride, element_id)
-    if disable:
         if row is None:
-            row = (
-                LLMProviderOverride(id=element_id, fields={})
-                if category == "providers"
-                else LLMModelOverride(id=element_id, fields={})
-            )
+            row = table(id=element_id)
             db.add(row)
-        row.disabled = True
-    elif row is not None:
-        await db.delete(row)
+        row.fields, row.disabled = entry_fields(proposed), proposed.disabled
+        if isinstance(row, LLMProviderOverride):
+            row.api_key_ciphertext = proposed.api_key_ciphertext
+    for name, entry in removed_models.items():
+        model_row = await db.get(LLMModelOverride, name)
+        if entry is None:
+            if model_row is not None:
+                await db.delete(model_row)
+        else:
+            if model_row is None:
+                model_row = LLMModelOverride(id=name)
+                db.add(model_row)
+            model_row.fields, model_row.disabled = entry_fields(entry), entry.disabled
+    routing_row = await db.get(LLMRoutingOverride, 1)
+    assert routing_row is not None
+    routing_row.fields = routing
     return await _changed(db, effective)
 
 
-@router.delete("/providers/{provider_id}")
+@router.delete("/providers/{provider_id:path}")
 async def delete_provider(
-    provider_id: ModelId, db: Database, settings: Configuration, disable: bool = False
+    provider_id: ModelId,
+    db: Database,
+    settings: Configuration,
+    disable: bool = False,
+    request: Request = _NO_REQUEST,
 ) -> dict[str, Any]:
-    return await _delete_element("providers", provider_id, disable, db, settings)
+    return await _delete_element("providers", provider_id, disable, db, settings, request)
 
 
 @router.delete("/models/{model_id:path}")
 async def delete_model(
-    model_id: ModelId, db: Database, settings: Configuration, disable: bool = False
+    model_id: ModelId,
+    db: Database,
+    settings: Configuration,
+    disable: bool = False,
+    request: Request = _NO_REQUEST,
 ) -> dict[str, Any]:
-    return await _delete_element("models", model_id, disable, db, settings)
+    return await _delete_element("models", model_id, disable, db, settings, request)
+
+
+@router.post("/providers/{provider_id:path}/reset")
+async def reset_provider(
+    provider_id: ModelId,
+    db: Database,
+    settings: Configuration,
+    request: Request = _NO_REQUEST,
+) -> dict[str, Any]:
+    return await _delete_element("providers", provider_id, False, db, settings, request, reset=True)
+
+
+@router.post("/models/{model_id:path}/reset")
+async def reset_model(
+    model_id: ModelId, db: Database, settings: Configuration, request: Request = _NO_REQUEST
+) -> dict[str, Any]:
+    return await _delete_element("models", model_id, False, db, settings, request, reset=True)
 
 
 # Listing fields that carry a limit; the first valid one wins.
@@ -330,7 +497,7 @@ def _empty_audit(destination: str, operation: str) -> OutboundAudit:
 
 
 async def _native_details(
-    db: AsyncSession, destination: str, key: str
+    db: AsyncSession, destination: str, model: model_config.ResolvedModel
 ) -> dict[str, dict[str, Any]]:
     """Read the context length and type of each model; a failure gives no details."""
     audit = _empty_audit(destination, "list_model_details")
@@ -338,10 +505,8 @@ async def _native_details(
     await db.commit()
     details: dict[str, dict[str, Any]] = {}
     try:
-        async with connection_client() as client:
-            response = await client.get(
-                destination, headers={"Authorization": f"Bearer {key}"} if key else {}
-            )
+        async with _transport(model) as (client, headers):
+            response = await client.get(destination, headers=headers)
         audit.detail = str(response.status_code)
         if response.is_success:
             data = response.json()
@@ -356,20 +521,52 @@ async def _native_details(
     return details
 
 
-def connection_client() -> httpx.AsyncClient:
+def connection_client(*, verify: ssl.SSLContext | bool = True) -> httpx.AsyncClient:
     """Create an isolated client with a bounded timeout and no redirects."""
-    return httpx.AsyncClient(timeout=10, follow_redirects=False, trust_env=False)
+    return httpx.AsyncClient(timeout=10, follow_redirects=False, trust_env=False, verify=verify)
 
 
-@router.post("/providers/{provider_id}/test")
+@asynccontextmanager
+async def _transport(
+    model: model_config.ResolvedModel,
+) -> AsyncIterator[tuple[httpx.AsyncClient, dict[str, str]]]:
+    transport = LLMClient(model)
+    try:
+        headers, verify = await transport.transport_settings()
+        client = connection_client() if verify is True else connection_client(verify=verify)
+        async with client:
+            yield client, headers
+    finally:
+        await transport.aclose()
+
+
+def _connection_model(
+    layers: ModelLayers, effective: EffectiveModels, provider_id: str, name: str
+) -> model_config.ResolvedModel:
+    provider = effective.config.providers[provider_id]
+    return model_config.resolve_model(
+        "connection",
+        model_config.ModelSpec(provider=provider_id, model=name, context_window=4096, max_tokens=1),
+        provider_id,
+        provider,
+        secret=effective.provider_keys[provider_id],
+        configured=True,
+        env=layers.env,
+        warn=lambda _location, _message: None,
+    )
+
+
+@router.post("/providers/{provider_id:path}/test")
 async def test_provider_connection(
     provider_id: ModelId, db: Database, settings: Configuration
 ) -> dict[str, Any]:
-    effective = _merge(await _layers(db, settings))
+    layers = await _layers(db, settings)
+    effective = _merge(layers)
     provider = effective.config.providers.get(provider_id)
     if provider is None:
         raise HTTPException(404, "Unknown or disabled provider")
     key = effective.provider_keys[provider_id]
+    model = _connection_model(layers, effective, provider_id, "listing")
     if provider.api_key_env is not None and not key:
         return {"ok": False, "status": None, "models": [], "message": "API key is not configured"}
     destination = f"{provider.base_url.rstrip('/')}/models"
@@ -379,10 +576,8 @@ async def test_provider_connection(
     result: dict[str, Any] = {"ok": False, "status": None, "models": [], "details": []}
     listed: list[dict[str, Any]] = []
     try:
-        async with connection_client() as client:
-            response = await client.get(
-                destination, headers={"Authorization": f"Bearer {key}"} if key else {}
-            )
+        async with _transport(model) as (client, headers):
+            response = await client.get(destination, headers=headers)
         result["status"] = response.status_code
         if response.is_success:
             data = response.json()
@@ -399,7 +594,7 @@ async def test_provider_connection(
             result["ok"] = True
         else:
             result["message"] = "Provider returned a non-success HTTP status"
-    except (httpx.HTTPError, httpx.InvalidURL):
+    except (httpx.HTTPError, httpx.InvalidURL, LLMError):
         result["message"] = "Cannot connect to provider within the request timeout"
     except (ValueError, UnicodeError):
         result["message"] = "Provider returned an invalid model listing"
@@ -408,7 +603,7 @@ async def test_provider_connection(
     await db.commit()
     if result["ok"]:
         native = _native_listing_url(provider.base_url)
-        extra = await _native_details(db, native, key) if native else {}
+        extra = await _native_details(db, native, model) if native else {}
         result["details"] = [
             {"id": item["id"]}
             | _model_details(item)
@@ -426,11 +621,16 @@ class ProbeRequest(_Patch):
 PROBE_TIMEOUT_SECONDS = 120.0
 
 
-async def _probe(db: AsyncSession, base_url: str, key: str, model: str) -> dict[str, Any]:
-    destination = f"{base_url.rstrip('/')}/chat/completions"
-    payload = json.dumps(
-        {"model": model, "messages": [{"role": "user", "content": "ok"}], "max_tokens": 1}
-    ).encode()
+async def _probe(db: AsyncSession, model: model_config.ResolvedModel) -> dict[str, Any]:
+    destination = f"{model.base_url.rstrip('/')}/chat/completions"
+    payload = build_wire_request(
+        model,
+        [{"role": "user", "content": "ok"}],
+        [],
+        max_tokens=1,
+        reasoning_effort=None,
+        stream=False,
+    ).body
     audit = OutboundAudit(
         category="llm",
         destination=destination,
@@ -445,12 +645,11 @@ async def _probe(db: AsyncSession, base_url: str, key: str, model: str) -> dict[
     result: dict[str, Any] = {"ok": False, "status": None, "seconds": None}
     started = time.monotonic()
     try:
-        async with connection_client() as client:
+        async with _transport(model) as (client, headers):
             response = await client.post(
                 destination,
                 content=payload,
-                headers={"Content-Type": "application/json"}
-                | ({"Authorization": f"Bearer {key}"} if key else {}),
+                headers=headers,
                 timeout=PROBE_TIMEOUT_SECONDS,
             )
         result["status"] = response.status_code
@@ -459,7 +658,7 @@ async def _probe(db: AsyncSession, base_url: str, key: str, model: str) -> dict[
             result["message"] = "The model did not answer"
     except httpx.TimeoutException:
         result["message"] = "The model did not answer within the time limit"
-    except (httpx.HTTPError, httpx.InvalidURL):
+    except (httpx.HTTPError, httpx.InvalidURL, LLMError):
         result["message"] = "Cannot connect to provider"
     result["seconds"] = round(time.monotonic() - started, 2)
     audit.status = "completed" if result["ok"] else "error"
@@ -468,16 +667,17 @@ async def _probe(db: AsyncSession, base_url: str, key: str, model: str) -> dict[
     return result
 
 
-@router.post("/providers/{provider_id}/probe")
+@router.post("/providers/{provider_id:path}/probe")
 async def probe_provider_model(
     provider_id: ModelId, body: ProbeRequest, db: Database, settings: Configuration
 ) -> dict[str, Any]:
     """Check a model that the server lists, before it is added."""
-    effective = _merge(await _layers(db, settings))
+    layers = await _layers(db, settings)
+    effective = _merge(layers)
     provider = effective.config.providers.get(provider_id)
     if provider is None:
         raise HTTPException(404, "Unknown or disabled provider")
-    return await _probe(db, provider.base_url, effective.provider_keys[provider_id], body.model)
+    return await _probe(db, _connection_model(layers, effective, provider_id, body.model))
 
 
 @router.post("/models/{model_id:path}/probe")
@@ -487,10 +687,15 @@ async def probe_agent_model(model_id: str, db: Database, settings: Configuration
     model = effective.registry.models.get(model_id)
     if model is None:
         raise HTTPException(404, "Unknown or disabled model")
-    result = await _probe(
-        db, model.base_url, effective.provider_keys[model.provider_id], model.model
+    result = await _probe(db, model)
+    model_health.record(
+        model_id,
+        model.base_url,
+        model.model,
+        result["ok"],
+        result["status"],
+        effective.registry.checksum,
     )
-    model_health.record(model_id, model.base_url, model.model, result["ok"], result["status"])
     return result
 
 

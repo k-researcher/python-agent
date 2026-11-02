@@ -64,6 +64,21 @@ afterEach(() => {
 });
 
 describe("HomeView", () => {
+  it("keeps the draft and disables sending when no model is enabled", async () => {
+    const store = prepareStore();
+    store.config!.llm_profiles = [];
+    store.config!.default_llm_profile = "";
+    store.config!.llm_configured = false;
+    const create = vi.spyOn(store, "createSession");
+    const wrapper = mount(HomeView, { global: { plugins: [router] } });
+    expect(wrapper.get('[data-testid="no-models"]').text()).toContain("Настроить модели");
+    expect(wrapper.get('[data-testid="composer-input"]').attributes("disabled")).toBeDefined();
+    expect(wrapper.get('[data-testid="composer-send"]').attributes("disabled")).toBeDefined();
+    expect(wrapper.find('[data-testid="composer-stop"]').exists()).toBe(false);
+    wrapper.findComponent({ name: "Composer" }).vm.$emit("send", { text: "draft", effort: "auto" });
+    await flushPromises();
+    expect(create).not.toHaveBeenCalled();
+  });
   it("groups model, role and reasoning controls inside the composer", () => {
     prepareStore();
     const wrapper = mount(HomeView, { global: { plugins: [router] } });
@@ -232,11 +247,15 @@ describe("HomeView", () => {
 
 it("selects an allowed external profile without model or CLI tuning", async () => {
   const store = prepareStore();
+  store.config!.llm_profiles = [];
+  store.config!.llm_configured = false;
+  store.config!.default_llm_profile = "";
   store.config!.engine_profiles = [{ id: "personal", status: "available" }];
   const create = vi.spyOn(store, "createSession").mockResolvedValue({ id: "native" } as never);
   const wrapper = mount(HomeView, { global: { plugins: [router] } });
   expect(wrapper.text()).toContain("Модель / внешний агент");
   await wrapper.get('[data-testid="model-select"]').setValue("engine:personal");
+  expect(wrapper.get('[data-testid="composer-input"]').attributes("disabled")).toBeUndefined();
   expect(wrapper.find('[data-testid="composer-effort"]').exists()).toBe(false);
   await wrapper.getComponent({ name: "Composer" }).vm.$emit("send", { text: "work", effort: "auto" });
   await flushPromises();

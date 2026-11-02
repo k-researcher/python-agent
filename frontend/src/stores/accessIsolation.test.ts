@@ -46,6 +46,7 @@ beforeEach(() => {
   vi.spyOn(api, "config").mockResolvedValue(config("new"));
   vi.spyOn(api, "projects").mockResolvedValue([project("new")]);
   vi.spyOn(api, "sessions").mockResolvedValue([session("new")]);
+  vi.spyOn(api, "archivedSessions").mockResolvedValue([]);
   vi.spyOn(api, "messages").mockResolvedValue([]);
   vi.spyOn(api, "approvals").mockResolvedValue([]);
   vi.spyOn(api, "children").mockResolvedValue([]);

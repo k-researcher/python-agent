@@ -47,6 +47,12 @@ function apiMessage(id: number, overrides: Partial<Message> = {}): Message {
 }
 
 function prepareSession(id = "s1"): ReturnType<typeof useSessionStore> {
+  useAppStore().config = {
+    llm_configured: true, llm_model: "m", llm_destination: "dst", default_llm_profile: "default",
+    llm_profiles: [{ name: "default", model: "m", destination: "dst", configured: true }],
+    knowledge_base_enabled: false, network_tools_enabled: false, network_allowlist: [], api_auth_enabled: true,
+    execution_mode: "embedded",
+  };
   const session = useSessionStore();
   session.sessionId = id;
   session.session = {
@@ -82,6 +88,90 @@ afterEach(() => {
 });
 
 describe("SessionView", () => {
+  it("keeps history readable but blocks sending to an unavailable model", async () => {
+    const store = prepareSession();
+    useAppStore().config!.llm_profiles = [];
+    const send = vi.spyOn(store, "send");
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    expect(wrapper.text()).toContain("готово");
+    expect(wrapper.get('[data-testid="session-model-unavailable"]').text()).toContain("История сохранена");
+    expect(wrapper.get('[data-testid="composer-send"]').attributes("disabled")).toBeDefined();
+    wrapper.findComponent({ name: "Composer" }).vm.$emit("send", { text: "draft", effort: "auto" });
+    await flushPromises();
+    expect(send).not.toHaveBeenCalled();
+  });
+  it("moves an idle session to another model from the composer", async () => {
+    const store = prepareSession();
+    useAppStore().config!.llm_profiles.push({ name: "other", model: "m2", destination: "dst", configured: true });
+    const setModel = vi.spyOn(store, "setModel").mockResolvedValue();
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    const select = wrapper.get('[data-testid="session-model-select"]');
+    expect((select.element as HTMLSelectElement).value).toBe("default");
+    await select.setValue("other");
+    await flushPromises();
+    expect(setModel).toHaveBeenCalledWith("other");
+  });
+
+  it("keeps the model while a run is active", async () => {
+    const store = prepareSession();
+    store.session = { ...store.session!, status: "running" };
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    expect(wrapper.get('[data-testid="session-model-select"]').attributes("disabled")).toBeDefined();
+  });
+
+  it("offers a working model when the session model is gone", async () => {
+    const store = prepareSession();
+    useAppStore().config!.llm_profiles = [{ name: "other", model: "m2", destination: "dst", configured: true }];
+    const setModel = vi.spyOn(store, "setModel").mockResolvedValue();
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    expect(wrapper.get('[data-testid="session-model-unavailable"]').text()).toContain("Выберите другую модель");
+    const select = wrapper.get('[data-testid="session-model-select"]');
+    expect(select.attributes("disabled")).toBeUndefined();
+    const gone = select.findAll("option").find(option => option.attributes("value") === "default");
+    expect(gone?.text()).toContain("недоступна");
+    expect(gone?.attributes("disabled")).toBeDefined();
+    await select.setValue("other");
+    await flushPromises();
+    expect(setModel).toHaveBeenCalledWith("other");
+  });
+
+  it("restores the select and shows the reason when the change is refused", async () => {
+    const store = prepareSession();
+    useAppStore().config!.llm_profiles.push({ name: "other", model: "m2", destination: "dst", configured: true });
+    vi.spyOn(store, "setModel").mockRejectedValue(new Error("Остановите сессию, чтобы сменить модель."));
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    const select = wrapper.get('[data-testid="session-model-select"]');
+    await select.setValue("other");
+    await flushPromises();
+    expect((select.element as HTMLSelectElement).value).toBe("default");
+    expect(wrapper.get('[data-testid="session-model-error"]').text()).toContain("Остановите сессию");
+  });
+
+  it("explains why a run stopped by itself and links to the model settings", async () => {
+    const store = prepareSession();
+    store.session = { ...store.session!, status: "stopped", error_code: "cost_unknown" };
+    const push = vi.spyOn(router, "push").mockResolvedValue(undefined);
+    const wrapper = mount(SessionView, { props: { id: "s1" }, global: { plugins: [router] } });
+    await flushPromises();
+    const notice = wrapper.get('[data-testid="session-stop-reason"]');
+    expect(notice.text()).toContain("у модели не указана цена");
+    await notice.get("button").trigger("click");
+    expect(push).toHaveBeenCalledWith({ name: "settings-models" });
+
+    store.session = { ...store.session!, status: "running" };
+    await flushPromises();
+    expect(wrapper.find('[data-testid="session-stop-reason"]').exists()).toBe(false);
+
+    store.session = { ...store.session!, status: "stopped", error_code: "user_requested" };
+    await flushPromises();
+    expect(wrapper.find('[data-testid="session-stop-reason"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
   it("shows child approvals in the parent conversation and opens the child", async () => {
     const store = prepareSession();
     store.children = [{ ...store.session!, id: "child", parent_id: "s1",

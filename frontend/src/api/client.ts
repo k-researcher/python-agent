@@ -63,6 +63,7 @@ export interface CreateSessionInput {
   prompt: string;
   mode?: string;
   llm_profile?: string;
+  engine_profile?: string;
   reasoning_effort?: string;
   title?: string;
   auto_start?: boolean;
@@ -122,6 +123,7 @@ export const api = {
       body: JSON.stringify({ name, root_path: rootPath }),
     }),
   sessions: (): Promise<Session[]> => request<Session[]>("/api/sessions"),
+  archivedSessions: (): Promise<Session[]> => request<Session[]>("/api/sessions?archived=true"),
   createSession: createSessionRequest,
   session: (sessionId: string): Promise<Session> =>
     snapshot<Session>(sessionId, "session"),
@@ -157,4 +159,17 @@ export const api = {
     request(`/api/sessions/${sessionId}/stop`, { method: "POST" }),
   archive: (sessionId: string): Promise<{ archived: boolean }> =>
     request(`/api/sessions/${sessionId}/archive`, { method: "POST" }),
+  unarchive: (sessionId: string): Promise<{ archived: boolean }> =>
+    request(`/api/sessions/${sessionId}/unarchive`, { method: "POST" }),
+  setSessionModel: (sessionId: string, llmProfile: string): Promise<Session> =>
+    request<Session>(`/api/sessions/${sessionId}/model`, {
+      method: "POST",
+      body: JSON.stringify({ llm_profile: llmProfile }),
+    }),
+  /** Deletes the session with its history; children only when asked explicitly. */
+  deleteSession: (sessionId: string, withChildren: boolean): Promise<void> =>
+    request(`/api/sessions/${sessionId}${withChildren ? "?with_children=true" : ""}`, { method: "DELETE" }),
+  /** Deletes the project records; the server checks the typed name. Files stay on disk. */
+  deleteProject: (projectId: string, name: string): Promise<void> =>
+    request(`/api/projects/${projectId}?name=${encodeURIComponent(name)}`, { method: "DELETE" }),
 };

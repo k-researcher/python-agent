@@ -37,6 +37,23 @@ const STATUS_TONE: Record<string, string> = {
   error: "var(--danger)",
 };
 
+// Why a run stopped by itself; a stop by the user has no text.
+const STOP_REASON: Record<string, string> = {
+  cost_unknown:
+    "Сессия не запустилась: у модели не указана цена, а у сессий есть лимит стоимости. Отметьте в настройках модели «Без оплаты» или укажите цену.",
+  cost_exhausted: "Сессия остановлена: достигнут лимит стоимости.",
+  tokens_exhausted: "Сессия остановлена: достигнут лимит токенов.",
+  token_usage_unknown: "Сессия остановлена: сервер модели не сообщает расход токенов, а лимит токенов включён.",
+  steps_exhausted: "Сессия остановлена: достигнут лимит шагов.",
+  deadline_exceeded: "Сессия остановлена: истекло отведённое время.",
+  start_time_unknown: "Сессия остановлена: не удалось проверить лимит времени.",
+};
+
+/** Plain words for a stop reason, or "" when there is nothing to explain. */
+export function stopReasonText(reason: string | null | undefined): string {
+  return reason && Object.hasOwn(STOP_REASON, reason) ? STOP_REASON[reason] : "";
+}
+
 export function statusDotClass(status: string): string {
   return STATUS_CLASS[status] ?? "status-dot--idle";
 }

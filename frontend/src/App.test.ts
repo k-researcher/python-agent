@@ -11,6 +11,7 @@ vi.mock("./api/client", () => ({
     config: vi.fn(),
     projects: vi.fn(),
     sessions: vi.fn(),
+    archivedSessions: vi.fn(() => Promise.resolve([])),
     createProject: vi.fn(),
     createSession: vi.fn(),
     session: vi.fn(),

@@ -3,6 +3,8 @@ import {
   openApp,
   assertComposerGeometry,
   ensureLeftPanelOpen,
+  mockSessions,
+  routeSnapshot,
   viewportWidthOf,
 } from "./helpers";
 
@@ -29,13 +31,33 @@ test.describe("session view", () => {
     await assertComposerGeometry(page);
   });
 
-  test("session shows its fixed role beside reasoning and status in the header", async ({ page }, testInfo) => {
+  test("session shows its model, fixed role, reasoning and status in the header", async ({ page }, testInfo) => {
     await openSessionViaSidebar(page, testInfo, "s1");
     await assertComposerGeometry(page);
     await expect(page.getByTestId("agent-controls").getByTestId("session-mode")).toHaveText("Разработчик");
-    await expect(page.getByTestId("agent-controls").getByTestId("session-profile")).toHaveText("default · model-a");
-    await expect(page.getByTestId("agent-controls").locator("select")).toHaveCount(1);
+    await expect(page.getByTestId("agent-controls").getByTestId("session-model-select")).toHaveValue("default");
+    await expect(page.getByTestId("agent-controls").locator("select")).toHaveCount(2);
     await expect(page.getByTestId("session-status")).toHaveText("Готова");
+  });
+
+  test("an idle session continues on another model", async ({ page }, testInfo) => {
+    await openSessionViaSidebar(page, testInfo, "s1");
+    const current = { ...mockSessions[0] };
+    const changes: unknown[] = [];
+    await routeSnapshot(page, "s1", "session", () => current);
+    await page.route("**/api/sessions/s1/model", async (route) => {
+      changes.push(route.request().postDataJSON());
+      current.llm_profile = "fast";
+      await route.fulfill({ json: current });
+    });
+    const controls = page.getByTestId("agent-controls");
+    await expect(controls.getByTestId("composer-effort").locator("option")).toHaveText(["Авто", "Низкий", "Высокий"]);
+    await page.getByTestId("agent-settings-button").click();
+    await controls.getByTestId("session-model-select").selectOption("fast");
+    await expect(controls.getByTestId("session-model-select")).toHaveValue("fast");
+    await expect(controls.getByTestId("composer-effort").locator("option")).toHaveText(["Авто", "Средний"]);
+    expect(changes).toEqual([{ llm_profile: "fast" }]);
+    await assertComposerGeometry(page);
   });
 
   test("composer restores the draft after a failed send", async ({ page }, testInfo) => {
@@ -69,14 +91,17 @@ test.describe("session view", () => {
     await openSessionViaSidebar(page, testInfo, "s1");
     const input = page.getByTestId("composer-input");
     const send = page.getByTestId("composer-send");
+    const model = page.getByTestId("session-model-select");
     const effort = page.getByTestId("composer-effort");
     const button = page.getByTestId("agent-settings-button");
     await button.focus();
     await page.keyboard.press("Enter");
-    await expect(effort).toBeFocused();
+    await expect(model).toBeFocused();
     await page.keyboard.press("Escape");
     await expect(button).toBeFocused();
     await button.press("Enter");
+    await expect(model).toBeFocused();
+    await page.keyboard.press("Tab");
     await expect(effort).toBeFocused();
     await page.keyboard.press("Tab");
     await expect(effort).toBeHidden();
@@ -85,6 +110,9 @@ test.describe("session view", () => {
     await input.click();
     await expect(input).toBeFocused();
 
+    // The order follows the screen: input, microphone, send.
+    await page.keyboard.press("Tab");
+    await expect(page.getByTestId("voice-start")).toBeFocused();
     await page.keyboard.press("Tab");
     await expect(send).toBeFocused();
   });

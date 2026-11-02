@@ -18,7 +18,14 @@ def frontend_dist(tmp_path: Path) -> Path:
     return directory
 
 
-APP_PATHS = ["", "login", "settings/models", "s/s1", "s/6c7125ba-a565-439c-895d-590c31514f99"]
+APP_PATHS = [
+    "",
+    "login",
+    "settings/models",
+    "settings/speech",
+    "s/s1",
+    "s/6c7125ba-a565-439c-895d-590c31514f99",
+]
 UNKNOWN_PATHS = [
     "api/unknown",
     "assets/missing.js",

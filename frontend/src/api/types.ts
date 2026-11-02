@@ -93,6 +93,8 @@ export interface PublicConfig {
   api_auth_enabled: boolean;
   execution_mode: "embedded" | "redis";
   default_llm_profile: string;
+  /** Money ceiling of one session in dollars; a model without a price cannot start under it. */
+  session_cost_limit?: string | null;
   llm_profiles: Array<{
     name: string;
     model: string;

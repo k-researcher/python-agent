@@ -8,6 +8,7 @@ from sqlalchemy import event, pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 import agent.model_overrides  # noqa: F401  (registers override tables on Base)
+import agent.speech  # noqa: F401  (registers the speech profile table on Base)
 from agent.config import get_settings
 from agent.database import configure_sqlite_connection
 from agent.models import Base

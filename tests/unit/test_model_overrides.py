@@ -17,7 +17,7 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from agent.config import PROJECT_ROOT, Settings
-from agent.model_config import ModelsConfig, load_models
+from agent.model_config import ModelConfigError, ModelsConfig, load_models
 from agent.model_overrides import (
     LLMModelOverride,
     OverrideEntry,
@@ -106,11 +106,13 @@ def test_disabled_elements_stay_visible_but_are_excluded_from_runtime(base: Mode
     assert result.view["providers"][1]["disabled"] is True
 
 
-def test_disabling_referenced_model_is_rejected(base: ModelsConfig) -> None:
-    with pytest.raises(ValidationError):
-        merge_layers(
-            base, None, OverrideSnapshot(models={"fast": OverrideEntry(disabled=True)}), {}
-        )
+def test_disabling_default_model_selects_an_enabled_model(base: ModelsConfig) -> None:
+    result = merge_layers(
+        base, None, OverrideSnapshot(models={"fast": OverrideEntry(disabled=True)}), {}
+    )
+    assert result.registry.default_id == "spare"
+    assert "fast" not in result.registry.models
+    assert result.view["models"][0]["disabled"] is True
 
 
 def test_new_ui_model_and_reset_to_file(base: ModelsConfig) -> None:
@@ -190,11 +192,11 @@ def test_routing_ui_beats_env_and_preserves_other_fields(base: ModelsConfig) -> 
 
 
 def test_invalid_merged_model_and_routing_are_rejected(base: ModelsConfig) -> None:
-    with pytest.raises(ValidationError):
+    with pytest.raises((ValidationError, ModelConfigError)):
         merge_layers(
             base, None, OverrideSnapshot(models={"fast": OverrideEntry({"max_tokens": 16000})}), {}
         )
-    with pytest.raises(ValidationError):
+    with pytest.raises((ValidationError, ModelConfigError)):
         merge_layers(base, None, OverrideSnapshot(routing={"default": "absent"}), {})
 
 

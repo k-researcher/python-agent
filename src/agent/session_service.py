@@ -16,6 +16,7 @@ from agent.context_summary import language_rule
 from agent.engine_access import require_operator, require_personal_project
 from agent.engine_adapters import configured_profiles
 from agent.message_tree import append_message
+from agent.model_overrides import lock_model_settings
 from agent.model_registry import effective_registry, select_model
 from agent.models import Project, Session, SessionStatus
 from agent.reasoning import validate_effort
@@ -77,6 +78,7 @@ async def create_session_record(
             "history_cursor": None,
         }
     else:
+        await lock_model_settings(db)
         model = select_model(await effective_registry(db, settings), llm_profile, role=mode)
         selected_profile = model.id
         validate_effort(model, configuration.get("reasoning_effort"))

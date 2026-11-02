@@ -2,8 +2,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { flushPromises } from "@vue/test-utils";
 import { api } from "../api/client";
-import type { Project, ServerEvent, Session } from "../api/types";
+import type { Project, PublicConfig, ServerEvent, Session } from "../api/types";
 import { useAppStore } from "./app";
+
+function emptyConfig(): PublicConfig {
+  return { llm_configured: false, llm_model: "", llm_destination: "", default_llm_profile: "",
+    llm_profiles: [], knowledge_base_enabled: false, network_tools_enabled: false,
+    network_allowlist: [], api_auth_enabled: true, execution_mode: "embedded" };
+}
 
 function project(id: string, name = id): Project {
   return { id, name, root_path: `/root/${id}` };
@@ -33,7 +39,15 @@ function persistentEvent(type: string, sessionId: string | null, payload: Record
 describe("app store", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.spyOn(api, "archivedSessions").mockResolvedValue([]);
     setActivePinia(createPinia());
+  });
+
+  it("forwards an external profile even when no language model is configured", async () => {
+    const create = vi.spyOn(api, "createSession").mockResolvedValue(session("native"));
+    vi.spyOn(api, "sessions").mockResolvedValue([]);
+    await useAppStore().createSession({ project_id: "p1", prompt: "work", engine_profile: "personal", auto_start: true });
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ engine_profile: "personal" }));
   });
 
   it("load() fills config, projects and sessions and picks a default project", async () => {
@@ -175,14 +189,16 @@ describe("app store", () => {
       expect(root.children.map((n) => n.session.id)).toEqual(["child2", "child1"]);
     });
 
-    it("hides archived sessions and foreign projects", () => {
+    it("keeps archived sessions in the tree for the archive group and hides foreign projects", () => {
       const store = useAppStore();
       store.sessions = [
         session("a1", { project_id: "p1", archived: true }),
         session("a2", { project_id: "p2" }),
         session("a3", { project_id: "p1", parent_id: "a1" }),
       ];
-      expect(store.sessionTree("p1")).toEqual([]);
+      const tree = store.sessionTree("p1");
+      expect(tree.map((n) => [n.session.id, n.session.archived])).toEqual([["a1", true]]);
+      expect(tree[0].children.map((n) => n.session.id)).toEqual(["a3"]);
       expect(store.sessionTree("p2").map((n) => n.session.id)).toEqual(["a2"]);
     });
 
@@ -196,6 +212,31 @@ describe("app store", () => {
   });
 
   describe("applyEvent", () => {
+    it("reloads config once for duplicate model settings events", async () => {
+      const spy = vi.spyOn(api, "config").mockResolvedValue(emptyConfig());
+      const store = useAppStore();
+      const event = persistentEvent("settings.models.changed", null, { checksum: "changed" });
+      store.applyEvent(event); store.applyEvent(event);
+      await flushPromises();
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(store.modelsChecksum).toBe("changed");
+      expect(store.config?.llm_profiles).toEqual([]);
+    });
+
+    it("uses the latest config after another change arrives during a reload", async () => {
+      let finish!: (value: Awaited<ReturnType<typeof api.config>>) => void;
+      const stale = new Promise<Awaited<ReturnType<typeof api.config>>>(resolve => { finish = resolve; });
+      const final = emptyConfig();
+      const spy = vi.spyOn(api, "config").mockReturnValueOnce(stale).mockResolvedValue(final);
+      const store = useAppStore();
+      store.applyEvent(persistentEvent("settings.models.changed", null, { checksum: "one" }));
+      store.applyEvent(persistentEvent("settings.models.changed", null, { checksum: "two" }));
+      finish({ ...final, llm_configured: true });
+      await flushPromises();
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(store.config).toEqual(final);
+      expect(store.modelsChecksum).toBe("two");
+    });
     it("reloads sessions on session.status", async () => {
       const fresh = session("live", { status: "running" });
       const spy = vi.spyOn(api, "sessions").mockResolvedValueOnce([fresh]);
@@ -267,6 +308,71 @@ describe("app store", () => {
 
       expect(projectsSpy).not.toHaveBeenCalled();
       expect(sessionsSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("archive and deletion", () => {
+    it("loads archived sessions together with the active ones", async () => {
+      vi.spyOn(api, "config").mockResolvedValue(emptyConfig());
+      vi.spyOn(api, "projects").mockResolvedValue([project("p1")]);
+      vi.spyOn(api, "sessions").mockResolvedValue([session("live")]);
+      vi.spyOn(api, "archivedSessions").mockResolvedValue([session("old", { archived: true })]);
+      const store = useAppStore();
+      await store.load();
+      expect(store.sessions.map((item) => [item.id, item.archived])).toEqual([["live", false], ["old", true]]);
+    });
+
+    it("archives and restores a session, then reloads the list", async () => {
+      const archive = vi.spyOn(api, "archive").mockResolvedValue({ archived: true });
+      const unarchive = vi.spyOn(api, "unarchive").mockResolvedValue({ archived: false });
+      const sessions = vi.spyOn(api, "sessions").mockResolvedValue([]);
+      const store = useAppStore();
+      await store.setArchived("s1", true);
+      await store.setArchived("s1", false);
+      expect(archive).toHaveBeenCalledWith("s1");
+      expect(unarchive).toHaveBeenCalledWith("s1");
+      expect(sessions).toHaveBeenCalledTimes(2);
+    });
+
+    it("asks the server to delete children only when the session has them", async () => {
+      const remove = vi.spyOn(api, "deleteSession").mockResolvedValue();
+      vi.spyOn(api, "sessions").mockResolvedValue([]);
+      const store = useAppStore();
+      store.sessions = [
+        session("root"),
+        session("child", { parent_id: "root" }),
+        session("grandchild", { parent_id: "child", archived: true }),
+        session("alone"),
+      ];
+      expect(store.subtreeIds("root")).toEqual(["root", "child", "grandchild"]);
+      await store.deleteSession("root");
+      expect(remove).toHaveBeenLastCalledWith("root", true);
+      store.sessions = [session("alone")];
+      await store.deleteSession("alone");
+      expect(remove).toHaveBeenLastCalledWith("alone", false);
+    });
+
+    it("deletes a project with the typed name and picks another project", async () => {
+      const remove = vi.spyOn(api, "deleteProject").mockResolvedValue();
+      vi.spyOn(api, "projects").mockResolvedValue([project("p2")]);
+      vi.spyOn(api, "sessions").mockResolvedValue([]);
+      const store = useAppStore();
+      store.projects = [project("p1"), project("p2")];
+      store.selectedProjectId = "p1";
+      await store.deleteProject("p1", "Мой проект");
+      expect(remove).toHaveBeenCalledWith("p1", "Мой проект");
+      expect(store.selectedProjectId).toBe("p2");
+    });
+
+    it("reloads projects and sessions when a project is deleted elsewhere", async () => {
+      const projects = vi.spyOn(api, "projects").mockResolvedValue([]);
+      const sessions = vi.spyOn(api, "sessions").mockResolvedValue([]);
+      const store = useAppStore();
+      store.applyEvent(persistentEvent("project.deleted", null, { project_id: "p1" }));
+      store.applyEvent(persistentEvent("session.unarchived", "s1", {}));
+      await flushPromises();
+      expect(projects).toHaveBeenCalledTimes(1);
+      expect(sessions).toHaveBeenCalledTimes(2);
     });
   });
 });

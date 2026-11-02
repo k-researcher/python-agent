@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 SESSION_ROUTE = re.compile(r"s/[A-Za-z0-9_-]+\Z")
 # Client routes without a parameter; a direct link or a reload of them gets the app page.
-APP_ROUTES = frozenset({"login", "settings/models"})
+APP_ROUTES = frozenset({"login", "settings/models", "settings/speech"})
 
 
 def frontend_response(directory: Path, path: str) -> FileResponse | JSONResponse:

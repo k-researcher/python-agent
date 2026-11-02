@@ -287,6 +287,17 @@ export const useSessionStore = defineStore("session", () => {
     }
   }
 
+  /** Continue the session on another model; the next run uses it. */
+  async function setModel(llmProfile: string): Promise<void> {
+    const id = sessionId.value;
+    const gen = generation;
+    if (id == null) return;
+    const updated = await api.setSessionModel(id, llmProfile);
+    if (!isCurrent(id, gen)) return;
+    session.value = updated;
+    await reloadAll();
+  }
+
   function streamNumber(payload: StreamDeltaEvent["payload"]): number | null {
     if (Number.isInteger(payload.stream_no) && (payload.stream_no ?? 0) > 0) return payload.stream_no!;
     return null;
@@ -379,6 +390,7 @@ export const useSessionStore = defineStore("session", () => {
       case "outbound.audit":
       case "context.compacted":
       case "session.child_created":
+      case "session.model_changed":
         void reloadAll().catch(() => {});
         break;
       default:
@@ -441,6 +453,7 @@ export const useSessionStore = defineStore("session", () => {
     send,
     resolve,
     stop,
+    setModel,
     applyEvent,
     reloadAll,
     timeline,

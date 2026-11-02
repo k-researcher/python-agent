@@ -17,19 +17,31 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, Integer, String, Text, select
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Integer,
+    String,
+    Text,
+    select,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from agent import model_config
 from agent.config import Settings
 from agent.model_config import (
+    DecisionsSpec,
     ModelConfigError,
     ModelsConfig,
     ModelSpec,
     ProviderSpec,
     ResolvedModel,
     ResolvedModelRegistry,
+    RoutingSpec,
 )
 from agent.model_registry import models_source, process_env
 from agent.models import Base, utcnow
@@ -75,6 +87,27 @@ class LLMRoutingOverride(Base):
     fields: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+async def lock_model_settings(db: AsyncSession) -> None:
+    """Serialize catalogue writes and new runs with the existing singleton row."""
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    statement = (
+        pg_insert(LLMRoutingOverride)
+        if db.get_bind().dialect.name == "postgresql"
+        else sqlite_insert(LLMRoutingOverride)
+    )
+    await db.execute(
+        statement.values(id=1, fields={}).on_conflict_do_nothing(index_elements=["id"])
+    )
+    await db.execute(
+        update(LLMRoutingOverride)
+        .where(LLMRoutingOverride.id == 1)
+        .values(fields=LLMRoutingOverride.fields)
+        .execution_options(synchronize_session=False)
     )
 
 
@@ -155,6 +188,25 @@ class OverrideEntry:
     fields: dict[str, Any] = field(default_factory=dict)
     disabled: bool = False
     api_key_ciphertext: str | None = field(default=None, repr=False)
+    deleted: bool = False
+    key_source: Literal["ui", "env", "none"] | None = None
+
+
+def entry_fields(entry: OverrideEntry) -> dict[str, Any]:
+    """Keep deletion and key-source markers in the existing override storage."""
+    fields = dict(entry.fields)
+    if entry.deleted:
+        fields["$deleted"] = True
+    if entry.key_source is not None:
+        fields["$key_source"] = entry.key_source
+    return fields
+
+
+def _entry(fields: dict[str, Any], disabled: bool, ciphertext: str | None = None) -> OverrideEntry:
+    fields = dict(fields)
+    deleted = fields.pop("$deleted", False) is True
+    source = fields.pop("$key_source", None)
+    return OverrideEntry(fields, disabled, ciphertext, deleted, source)
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,11 +219,11 @@ class OverrideSnapshot:
 async def read_overrides(db: AsyncSession) -> OverrideSnapshot:
     """Read one transaction's provider, model and routing overrides."""
     providers = {
-        row.id: OverrideEntry(dict(row.fields), row.disabled, row.api_key_ciphertext)
+        row.id: _entry(row.fields, row.disabled, row.api_key_ciphertext)
         for row in (await db.scalars(select(LLMProviderOverride))).all()
     }
     models = {
-        row.id: OverrideEntry(dict(row.fields), row.disabled)
+        row.id: _entry(row.fields, row.disabled)
         for row in (await db.scalars(select(LLMModelOverride))).all()
     }
     routing = await db.get(LLMRoutingOverride, 1)
@@ -210,9 +262,19 @@ def _legacy_config(registry: ResolvedModelRegistry) -> ModelsConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelCatalog:
+    """The active catalogue may be empty, unlike a declarative source file."""
+
+    providers: dict[str, ProviderSpec]
+    models: dict[str, ModelSpec]
+    routing: RoutingSpec
+    decisions: DecisionsSpec
+
+
+@dataclass(frozen=True, slots=True)
 class EffectiveModels:
     registry: ResolvedModelRegistry = field(repr=False)
-    config: ModelsConfig
+    config: ModelCatalog
     view: dict[str, Any]
     provider_keys: dict[str, str] = field(repr=False)
 
@@ -247,6 +309,8 @@ def merge_layers(
     for provider_id in dict.fromkeys([*base.providers, *overrides.providers]):
         original_provider = base.providers.get(provider_id)
         delta = overrides.providers.get(provider_id, OverrideEntry())
+        if delta.deleted:
+            continue
         spec = ProviderSpec.model_validate(
             (original_provider.model_dump() if original_provider else {}) | delta.fields
         )
@@ -254,7 +318,10 @@ def merge_layers(
             name: "ui" if name in delta.fields or original_provider is None else origin
             for name in ProviderSpec.model_fields
         }
-        if delta.api_key_ciphertext is not None:
+        if delta.key_source == "none":
+            key = ""
+            sources["api_key"] = "ui"
+        elif delta.api_key_ciphertext is not None and delta.key_source != "env":
             if settings is None:
                 raise SecretKeyError("Settings are required to decrypt UI API keys")
             key = decrypt_secret(delta.api_key_ciphertext, settings, env)
@@ -288,6 +355,17 @@ def merge_layers(
             {
                 "id": provider_id,
                 **spec.model_dump(),
+                "has_base": original_provider is not None,
+                "key_env": model_config.secret_env(spec),
+                "key_source": (
+                    "none"
+                    if delta.key_source == "none"
+                    else "ui"
+                    if delta.api_key_ciphertext is not None and delta.key_source != "env"
+                    else "env"
+                    if model_config.secret_env(spec)
+                    else "none"
+                ),
                 "api_key_set": bool(key),
                 "api_key_hint": f"…{key[-4:]}" if len(key) > 4 else "…" if key else "",
                 "configured": provider_configured[provider_id],
@@ -300,15 +378,24 @@ def merge_layers(
     for model_id in dict.fromkeys([*base.models, *overrides.models]):
         original_model = base.models.get(model_id)
         delta = overrides.models.get(model_id, OverrideEntry())
+        if delta.deleted:
+            continue
         spec_model = ModelSpec.model_validate(
             (original_model.model_dump() if original_model else {}) | delta.fields
         )
-        if not delta.disabled:
+        if spec_model.provider not in set(base.providers) | set(overrides.providers):
+            raise ModelConfigError(f"models.{model_id}.provider: unknown provider reference")
+        if overrides.providers.get(spec_model.provider, OverrideEntry()).deleted:
+            continue
+        provider_disabled = spec_model.provider not in providers
+        if not delta.disabled and not provider_disabled:
             models[model_id] = spec_model
         model_views.append(
             {
                 "id": model_id,
                 **spec_model.model_dump(),
+                "has_base": original_model is not None,
+                "provider_disabled": provider_disabled,
                 "disabled": delta.disabled,
                 "origin": "ui" if model_id in overrides.models else origin,
                 "sources": {
@@ -331,17 +418,47 @@ def merge_layers(
             )
     routing.update(overrides.routing)
     routing_sources.update(dict.fromkeys(overrides.routing, "ui"))
-    config = ModelsConfig.model_validate(
-        {
-            "providers": providers,
-            "models": models,
-            "routing": routing,
-            "decisions": base.decisions,
-        }
+    declared = set(base.models) | set(overrides.models)
+    references = [routing["default"], *routing["fallback"], *routing["roles"].values()]
+    if routing["light"] is not None:
+        references.append(routing["light"])
+    if any(name and name not in declared for name in references):
+        raise ModelConfigError("routing: unknown model reference")
+    # Preserve stored assignments; only the active routing is filtered.
+    active_routing = RoutingSpec(
+        default=routing["default"] if routing["default"] in models else next(iter(models), ""),
+        fallback=[name for name in routing["fallback"] if name in models],
+        roles={role: name for role, name in routing["roles"].items() if name in models},
+        light=routing["light"] if routing["light"] in models else None,
     )
+    decisions = base.decisions
+    if decisions.provider is not None and decisions.provider not in providers:
+        decisions = DecisionsSpec()
+    if models:
+        ModelsConfig.model_validate(
+            {
+                "providers": providers,
+                "models": models,
+                "routing": active_routing,
+                "decisions": decisions,
+            }
+        )
+    config = ModelCatalog(providers, models, active_routing, decisions)
     view: dict[str, Any] = {
         "providers": provider_views,
         "models": model_views,
+        "deleted": {
+            "providers": [
+                name
+                for name, entry in overrides.providers.items()
+                if entry.deleted and name in base.providers
+            ],
+            "models": [
+                name
+                for name, entry in overrides.models.items()
+                if entry.deleted and name in base.models
+            ],
+        },
         "routing": config.routing.model_dump() | {"sources": routing_sources},
         "warnings": warnings,
     }

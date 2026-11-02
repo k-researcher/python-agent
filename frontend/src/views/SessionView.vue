@@ -12,8 +12,8 @@ import ChatTimeline from "../components/chat/ChatTimeline.vue";
 import Composer from "../components/chat/Composer.vue";
 import AgentSettings from "../components/chat/AgentSettings.vue";
 import type { RejectPayload, SendPayload } from "../components/chat/types";
-import { toChatTimelineItems } from "../uiAdapters";
-import { sessionStatusLabel } from "../components/layout/status";
+import { toChatTimelineItems, toModelOptions } from "../uiAdapters";
+import { sessionStatusLabel, stopReasonText } from "../components/layout/status";
 import { modeLabel as resolveModeLabel } from "../modes";
 
 const props = defineProps<{ id: string }>();
@@ -27,6 +27,8 @@ const openError = ref("");
 const sendError = ref("");
 const isSending = ref(false);
 const selectedEffort = ref("auto");
+const isChangingModel = ref(false);
+const modelError = ref("");
 
 let openSeq = 0;
 
@@ -71,10 +73,23 @@ const waitingChildren = computed(() => sessionStore.children.filter(
 ));
 const timelineItems = computed(() => toChatTimelineItems(sessionStore.timeline));
 const external = computed(() => !!session.value?.engine_profile);
+const stopReason = computed(() => session.value?.status === "stopped" ? stopReasonText(session.value.error_code) : "");
+const modelAvailable = computed(() => external.value || !!appStore.config?.llm_profiles.some(
+  model => model.name === session.value?.llm_profile && model.configured,
+));
 const modelLabel = computed(() => {
   if (external.value) return `Внешний агент · ${session.value?.engine_profile}`;
   const profile = appStore.config?.llm_profiles.find((model) => model.name === session.value?.llm_profile);
   return profile ? `${profile.name} · ${profile.model}` : session.value?.llm_profile ?? "По умолчанию";
+});
+// The current model stays in the list even when it is off, so the select shows it.
+const modelOptions = computed(() => {
+  const options = toModelOptions(appStore.config).map(option => ({ ...option, disabled: false }));
+  const current = session.value?.llm_profile;
+  if (current && !options.some(option => option.id === current)) {
+    options.unshift({ id: current, label: `${current} · недоступна`, disabled: true });
+  }
+  return options;
 });
 const modeLabel = computed(() => resolveModeLabel(session.value?.mode));
 const engineHealthLabel = computed(() => {
@@ -146,6 +161,7 @@ watch(
 async function onSend(payload: SendPayload): Promise<void> {
   // Guard against a double POST: keep the composer busy for the whole call.
   if (isSending.value) return;
+  if (!modelAvailable.value) return;
   isSending.value = true;
   sendError.value = "";
   // Composer clears its own text + draft on emit, so the payload must be saved
@@ -190,6 +206,23 @@ async function onReject(payload: RejectPayload): Promise<void> {
   }
 }
 
+async function onModelChange(event: Event): Promise<void> {
+  const select = event.target as HTMLSelectElement;
+  const wanted = select.value;
+  const current = session.value?.llm_profile ?? "";
+  if (!wanted || wanted === current || isChangingModel.value) return;
+  isChangingModel.value = true;
+  modelError.value = "";
+  try {
+    await sessionStore.setModel(wanted);
+  } catch (cause) {
+    select.value = current;
+    modelError.value = cause instanceof Error ? cause.message : String(cause);
+  } finally {
+    isChangingModel.value = false;
+  }
+}
+
 function onOpenChild(id: string): void {
   void router.push(`/s/${id}`);
 }
@@ -222,6 +255,12 @@ function onOpenChild(id: string): void {
         <p v-if="session.error" class="session-error" data-testid="session-error">
           {{ session.error }}
         </p>
+        <p v-if="stopReason" class="session-notice" role="status" data-testid="session-stop-reason">
+          {{ stopReason }}
+          <button v-if="session.error_code === 'cost_unknown'" type="button" @click="router.push({ name: 'settings-models' })">
+            Настроить модели
+          </button>
+        </p>
       </header>
 
       <div v-if="waitingChildren.length" class="child-waiting" role="status" data-testid="child-waiting">
@@ -248,9 +287,16 @@ function onOpenChild(id: string): void {
       </p>
 
       <p v-if="sendError" class="session-error" data-testid="send-error">{{ sendError }}</p>
+      <p v-if="modelError" class="session-error" role="alert" data-testid="session-model-error">{{ modelError }}</p>
+      <p v-if="!modelAvailable" class="session-error" data-testid="session-model-unavailable">
+        Модель этой сессии отключена или удалена. История сохранена.
+        Выберите другую модель ниже, чтобы продолжить.
+        <button type="button" @click="router.push({ name: 'settings-models' })">Настроить модели</button>
+      </p>
 
       <Composer
         :busy="busy"
+        :disabled="!modelAvailable"
         :draft-key="draftKey"
         :efforts="efforts"
         controls-target="#session-agent-controls"
@@ -260,10 +306,24 @@ function onOpenChild(id: string): void {
         @update:effort="selectedEffort = $event"
       >
         <template #options>
-          <div class="agent-control" title="Модель задаётся при создании сессии">
-            <span>{{ external ? "Внешний агент" : "Модель" }}</span>
+          <div v-if="external" class="agent-control" title="Внешний агент задаётся при создании сессии">
+            <span>Внешний агент</span>
             <span class="agent-value" data-testid="session-profile">{{ modelLabel }}</span>
           </div>
+          <label v-else class="agent-control" title="Новая модель отвечает со следующего сообщения">
+            <span>Модель</span>
+            <select
+              :value="session.llm_profile ?? ''"
+              :disabled="busy || isChangingModel || modelOptions.length === 0"
+              aria-label="Модель сессии"
+              data-testid="session-model-select"
+              @change="onModelChange"
+            >
+              <option v-for="option in modelOptions" :key="option.id" :value="option.id" :disabled="option.disabled">
+                {{ option.label }}
+              </option>
+            </select>
+          </label>
           <div class="agent-control" title="Роль задаётся при создании сессии">
             <span>Роль</span>
             <span class="agent-value" data-testid="session-mode">{{ modeLabel }}</span>
@@ -375,6 +435,16 @@ function onOpenChild(id: string): void {
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--danger) 8%, transparent);
   color: var(--danger);
+  font-size: 13px;
+}
+
+.session-notice {
+  margin: 8px 16px;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--warning) 8%, transparent);
+  color: var(--text);
   font-size: 13px;
 }
 

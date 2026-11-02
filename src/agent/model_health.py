@@ -15,7 +15,7 @@ FAILED_FOR = timedelta(minutes=5)
 
 @dataclass(frozen=True)
 class _Check:
-    target: tuple[str, str]
+    target: tuple[str, str, str | None]
     health: Health
     status: int | None
     checked_at: datetime
@@ -30,15 +30,22 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def record(model_id: str, base_url: str, model: str, ok: bool, status: int | None) -> None:
+def record(
+    model_id: str,
+    base_url: str,
+    model: str,
+    ok: bool,
+    status: int | None,
+    revision: str | None = None,
+) -> None:
     _checks[model_id] = _Check(
-        (base_url.rstrip("/"), model), "ok" if ok else "failed", status, _now()
+        (base_url.rstrip("/"), model, revision), "ok" if ok else "failed", status, _now()
     )
 
 
-def health(model_id: str, base_url: str, model: str) -> Health | None:
+def health(model_id: str, base_url: str, model: str, revision: str | None = None) -> Health | None:
     check = _checks.get(model_id)
-    if check is None or check.target != (base_url.rstrip("/"), model):
+    if check is None or check.target != (base_url.rstrip("/"), model, revision):
         return None
     if check.health == "failed" and _now() - check.checked_at > FAILED_FOR:
         return None
