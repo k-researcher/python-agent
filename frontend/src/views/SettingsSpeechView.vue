@@ -199,6 +199,14 @@ onMounted(load);
               <span class="muted small">
                 {{ roleOf(item) }} · {{ languageLabel(item.language) }}{{ item.model ? ` · модель ${item.model}` : "" }}
               </span>
+              <button
+                v-if="roleOf(item) !== 'Основной' && !item.disabled"
+                type="button"
+                class="link small card__link"
+                :disabled="busy"
+                data-testid="speech-primary"
+                @click="run(() => speechSettings.makePrimary(item.id))"
+              >Сделать основным</button>
               <span
                 v-if="checks[item.id]"
                 class="small"
@@ -209,16 +217,8 @@ onMounted(load);
             <div class="card__actions">
               <button type="button" class="ghost" :disabled="checks[item.id] === 'checking'" data-testid="speech-test" @click="check(item)">Проверить</button>
               <button
-                v-if="roleOf(item) !== 'Основной' && !item.disabled"
                 type="button"
-                class="ghost"
-                :disabled="busy"
-                data-testid="speech-primary"
-                @click="run(() => speechSettings.makePrimary(item.id))"
-              >Сделать основным</button>
-              <button
-                type="button"
-                class="ghost"
+                class="ghost toggle"
                 :disabled="busy"
                 data-testid="speech-toggle"
                 @click="run(() => speechSettings.putProfile(item.id, { disabled: !item.disabled }))"
@@ -307,8 +307,16 @@ h2 {
 }
 
 /* Dim the details of a switched off item, but keep its buttons readable. */
-.card--off .card__main {
+.card--off .card__main > :not(.card__link) {
   opacity: 0.6;
+}
+
+/* An optional action sits under the label it belongs to, so every card has the same buttons. */
+.card__link {
+  align-self: flex-start;
+  min-height: 0;
+  height: auto;
+  padding: 0;
 }
 
 .card__row {
@@ -327,10 +335,19 @@ h2 {
   overflow-wrap: anywhere;
 }
 
+/* Buttons keep to the right edge; a wrapped group stays there too. */
 .card__actions {
   display: flex;
   flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
+  margin-left: auto;
+}
+
+/* "Включить" and "Отключить" take the same width, so the next buttons do not move. */
+.toggle {
+  min-width: 7.2em;
+  justify-content: center;
 }
 
 .small {
