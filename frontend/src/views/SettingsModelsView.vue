@@ -825,19 +825,6 @@ onMounted(() => { void load(); void scan(); });
 
       <p v-if="!activeModels.length" class="notice" data-testid="models-empty">Нет включённых моделей. Подключите сервер и добавьте модель или включите существующую.</p>
 
-      <section v-if="view.deleted?.providers.length || view.deleted?.models.length" class="block" data-testid="deleted-settings">
-        <h2>Удалённые настройки из файла</h2>
-        <p class="hint">Они не используются. Восстановление явно вернёт файловые настройки.</p>
-        <div v-for="id in view.deleted?.providers" :key="`provider:${id}`" class="found__row">
-          <span>Сервер {{ id }}</span>
-          <button type="button" class="ghost" :disabled="!!busy" :data-restore-provider="id" @click="resetProvider(id)">Восстановить</button>
-        </div>
-        <div v-for="id in view.deleted?.models" :key="`model:${id}`" class="found__row">
-          <span>Модель {{ id }}</span>
-          <button type="button" class="ghost" :disabled="!!busy" :data-restore-model="id" @click="resetModel(id)">Восстановить</button>
-        </div>
-      </section>
-
       <section v-if="activeModels.length" class="block" aria-labelledby="roles-title">
         <h2 id="roles-title">Роли</h2>
         <div class="card roles">
@@ -884,6 +871,24 @@ onMounted(() => { void load(); void scan(); });
               <span>{{ item.id }}</span>
             </label>
           </fieldset>
+        </div>
+      </section>
+
+      <section v-if="view.deleted?.providers.length || view.deleted?.models.length" class="block" data-testid="deleted-settings">
+        <h2>Удалённые настройки из файла</h2>
+        <div v-for="id in view.deleted?.providers" :key="`provider:${id}`" class="found__row">
+          <span>Сервер {{ id }}</span>
+          <button type="button" class="ghost" :disabled="!!busy" :data-restore-provider="id" @click="resetProvider(id)">Восстановить</button>
+          <span class="muted small" :data-remove-hint-provider="id">
+            Чтобы убрать совсем, удалите блок <code>{{ id }}</code> из раздела <code>providers</code> в config/models.yaml.
+          </span>
+        </div>
+        <div v-for="id in view.deleted?.models" :key="`model:${id}`" class="found__row">
+          <span>Модель {{ id }}</span>
+          <button type="button" class="ghost" :disabled="!!busy" :data-restore-model="id" @click="resetModel(id)">Восстановить</button>
+          <span class="muted small" :data-remove-hint-model="id">
+            Чтобы убрать совсем, удалите блок <code>{{ id }}</code> из раздела <code>models</code> в config/models.yaml.
+          </span>
         </div>
       </section>
     </template>

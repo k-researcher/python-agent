@@ -459,6 +459,17 @@ describe("SettingsModelsView", () => {
     expect(calls.putProvider).toHaveBeenLastCalledWith("gateway", { key_source: "env", api_key_env: "OTHER_KEY" }, { checksum: "version-1" });
   });
 
+  it("shows deleted file settings last, after the model roles", async () => {
+    const view = baseView();
+    view.deleted = { providers: [], models: ["old"] };
+    calls.get.mockResolvedValue(view);
+    const wrapper = await mountView();
+    const roles = wrapper.get("#roles-title").element;
+    const deleted = wrapper.get('[data-testid="deleted-settings"]');
+    expect(roles.compareDocumentPosition(deleted.element) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(deleted.text()).not.toContain("Они не используются");
+  });
+
   it("uses reset only when the owner requests restoration", async () => {
     const removed = baseView();
     removed.providers = []; removed.models = [];
@@ -468,6 +479,8 @@ describe("SettingsModelsView", () => {
     const wrapper = await mountView();
     expect(calls.resetProvider).not.toHaveBeenCalled();
     expect(wrapper.get('[data-testid="models-empty"]').text()).toContain("Нет включённых моделей");
+    expect(wrapper.get('[data-remove-hint-provider="gateway"]').text()).toContain("удалите блок gateway из раздела providers в config/models.yaml");
+    expect(wrapper.get('[data-remove-hint-model="chat"]').text()).toContain("удалите блок chat из раздела models в config/models.yaml");
     await wrapper.get('[data-restore-provider="gateway"]').trigger("click");
     await flushPromises();
     expect(calls.resetProvider).toHaveBeenCalledExactlyOnceWith("gateway", { checksum: "version-1" });
