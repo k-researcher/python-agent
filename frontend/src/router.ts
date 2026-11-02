@@ -6,6 +6,7 @@ import LoginView from "./views/LoginView.vue";
 import HomeView from "./views/HomeView.vue";
 import SessionView from "./views/SessionView.vue";
 import SettingsModelsView from "./views/SettingsModelsView.vue";
+import SettingsSpeechView from "./views/SettingsSpeechView.vue";
 
 let authenticated: boolean | null = null;
 let authGeneration = 0;
@@ -63,6 +64,7 @@ export const router = createRouter({
     { path: "/", name: "home", component: HomeView },
     { path: "/s/:id", name: "session", component: SessionView, props: true },
     { path: "/settings/models", name: "settings-models", component: SettingsModelsView },
+    { path: "/settings/speech", name: "settings-speech", component: SettingsSpeechView },
     { path: "/login", name: "login", component: LoginView },
     { path: "/:pathMatch(.*)*", redirect: { name: "home" } },
   ],

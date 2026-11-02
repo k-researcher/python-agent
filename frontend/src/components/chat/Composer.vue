@@ -3,6 +3,9 @@ import { computed, nextTick, onMounted, ref, watch } from "vue";
 import type { SendPayload } from "./types";
 import { reasoningLabel } from "./reasoning";
 import { draftGeneration, readDraft, writeDraft } from "../../draftStorage";
+import { Mic } from "lucide-vue-next";
+import { transcribe } from "../../api/speech";
+import { insertText, useVoiceInput } from "./voice";
 
 const props = withDefaults(
   defineProps<{
@@ -95,6 +98,29 @@ function onKeydown(e: KeyboardEvent): void {
   }
 }
 
+// Recognized speech goes to the cursor for editing; it is not sent by itself.
+const voice = useVoiceInput({
+  transcribe: async (audio) => (await transcribe(audio)).text,
+  onText: (piece) => {
+    const el = textarea.value;
+    const start = el?.selectionStart ?? text.value.length;
+    const end = el?.selectionEnd ?? text.value.length;
+    const result = insertText(text.value, start, end, piece);
+    text.value = result.text;
+    void nextTick(() => {
+      resize();
+      el?.focus();
+      el?.setSelectionRange(result.caret, result.caret);
+    });
+  },
+});
+const voiceState = voice.state;
+const voiceError = voice.error;
+const recordTime = computed(() => {
+  const value = voice.seconds.value;
+  return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, "0")}`;
+});
+
 function send(): void {
   const content = text.value.trim();
   if (!content || props.busy || props.disabled) return;
@@ -119,6 +145,34 @@ function send(): void {
           @keydown="onKeydown"
         />
         <div class="actions">
+          <template v-if="voiceState === 'recording' || voiceState === 'transcribing'">
+            <span class="voice-status" role="status" data-testid="voice-status">
+              <span v-if="voiceState === 'recording'" class="voice-dot" aria-hidden="true" />
+              {{ voiceState === "recording" ? `Запись ${recordTime}` : "Распознаю…" }}
+            </span>
+            <button type="button" class="voice-cancel" data-testid="voice-cancel" @click="voice.cancel()">Отмена</button>
+            <button
+              v-if="voiceState === 'recording'"
+              type="button"
+              class="send"
+              data-testid="voice-finish"
+              @click="voice.finish()"
+            >
+              Готово
+            </button>
+          </template>
+          <template v-else>
+          <button
+            type="button"
+            class="voice"
+            :disabled="busy || disabled || voiceState === 'requesting'"
+            aria-label="Голосовой ввод"
+            title="Голосовой ввод"
+            data-testid="voice-start"
+            @click="voice.start()"
+          >
+            <Mic :size="16" aria-hidden="true" />
+          </button>
           <button
             v-if="busy && stoppable"
             type="button"
@@ -138,8 +192,13 @@ function send(): void {
           >
             {{ busy ? "Подождите…" : "Отправить" }}
           </button>
+          </template>
         </div>
       </div>
+      <p v-if="voiceError" class="voice-error" role="alert" data-testid="voice-error">
+        {{ voiceError }}
+        <button type="button" class="voice-error__close" aria-label="Скрыть" @click="voiceError = ''">×</button>
+      </p>
     </div>
     <Teleport :to="controlsHost ?? 'body'" :disabled="!controlsHost">
     <div class="controls" :class="{ 'controls--hosted': controlsHost }" role="group" aria-label="Параметры агента" data-testid="agent-controls">
@@ -177,6 +236,74 @@ function send(): void {
 .actions {
   display: flex;
   flex-shrink: 0;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+button.voice {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  padding: 0;
+  background: var(--bg-subtle);
+  color: var(--text);
+}
+
+button.voice:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+button.voice-cancel {
+  background: transparent;
+  color: var(--text);
+}
+
+.voice-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.voice-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
+  animation: voice-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes voice-pulse {
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .voice-dot { animation: none; }
+}
+
+.voice-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 6px 0 0;
+  font-size: 0.8rem;
+  color: var(--danger);
+}
+
+.voice-error__close {
+  height: auto;
+  margin-left: auto;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 1rem;
+  line-height: 1;
 }
 
 textarea {

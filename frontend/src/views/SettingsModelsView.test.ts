@@ -87,6 +87,7 @@ async function mountView() {
     routes: [
       { path: "/", name: "home", component: { template: "<div/>" } },
       { path: "/settings/models", name: "settings-models", component: SettingsModelsView },
+      { path: "/settings/speech", name: "settings-speech", component: { template: "<div/>" } },
     ],
   });
   await router.push("/settings/models");
@@ -95,7 +96,11 @@ async function mountView() {
   return wrapper;
 }
 
+const confirm = vi.fn((_question?: string) => true);
+
 beforeEach(() => {
+  confirm.mockReset().mockReturnValue(true);
+  Object.defineProperty(window, "confirm", { value: confirm, configurable: true });
   setActivePinia(createPinia());
   for (const call of Object.values(calls)) call.mockReset();
   calls.get.mockResolvedValue(baseView());
@@ -406,6 +411,30 @@ describe("SettingsModelsView", () => {
     expect(calls.removeProvider).toHaveBeenCalledExactlyOnceWith("gateway", { checksum: "version-1" });
     expect(calls.resetProvider).not.toHaveBeenCalled();
     expect(wrapper.find('[data-provider="gateway"]').exists()).toBe(false);
+  });
+
+  it("asks before removing a connection with its models and keeps it when cancelled", async () => {
+    const wrapper = await mountView();
+    const models = baseView().models.filter((model) => model.provider === "gateway").length;
+    confirm.mockReturnValue(false);
+    await wrapper.get('[data-provider="gateway"] [data-testid="provider-remove"]').trigger("click");
+    await flushPromises();
+    expect(confirm).toHaveBeenCalledWith(
+      `Удалить подключение «gateway»? Вместе с ним удалятся его модели: ${models}.`,
+    );
+    expect(calls.removeProvider).not.toHaveBeenCalled();
+    expect(wrapper.find('[data-provider="gateway"]').exists()).toBe(true);
+  });
+
+  it("asks before removing a model", async () => {
+    const wrapper = await mountView();
+    confirm.mockReturnValue(false);
+    const button = wrapper.findAll('[data-testid="model-remove"]').find((item) => item.attributes("disabled") === undefined);
+    expect(button).toBeDefined();
+    await button!.trigger("click");
+    await flushPromises();
+    expect(confirm.mock.calls[0][0]).toMatch(/^Удалить модель «.+»\?$/);
+    expect(calls.removeModel).not.toHaveBeenCalled();
   });
 
   it("edits named role mappings and excludes models of disabled providers", async () => {

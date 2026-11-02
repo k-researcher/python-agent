@@ -203,6 +203,10 @@ async function json(route: import("@playwright/test").Route, status: number, bod
   });
 }
 
+export const mockSpeechSettings = {
+  profiles: [{ id: "local", base_url: "http://127.0.0.1:8178/v1", model: "", language: "ru", disabled: false }],
+};
+
 export async function installRoutes(page: Page): Promise<void> {
   await page.route("**/*", async (route) => {
     const req = route.request();
@@ -252,6 +256,16 @@ export async function installRoutes(page: Page): Promise<void> {
 
     if (path === "/api/settings/models" && req.method() === "GET") {
       await json(route, 200, mockModelSettings);
+      return;
+    }
+
+    if (path === "/api/settings/speech" && req.method() === "GET") {
+      await json(route, 200, mockSpeechSettings);
+      return;
+    }
+
+    if (path === "/api/speech/transcribe" && req.method() === "POST") {
+      await json(route, 200, { text: "распознанный текст", profile: "local" });
       return;
     }
 

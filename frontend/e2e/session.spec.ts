@@ -85,6 +85,9 @@ test.describe("session view", () => {
     await input.click();
     await expect(input).toBeFocused();
 
+    // The order follows the screen: input, microphone, send.
+    await page.keyboard.press("Tab");
+    await expect(page.getByTestId("voice-start")).toBeFocused();
     await page.keyboard.press("Tab");
     await expect(send).toBeFocused();
   });

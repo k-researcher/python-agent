@@ -370,6 +370,11 @@ function toggleModel(item: ModelView): Promise<boolean> {
 }
 
 async function removeProvider(item: ProviderView): Promise<boolean> {
+  const linked = (view.value?.models ?? []).filter((model) => model.provider === item.id).length;
+  const question = linked
+    ? `Удалить подключение «${item.id}»? Вместе с ним удалятся его модели: ${linked}.`
+    : `Удалить подключение «${item.id}»?`;
+  if (!window.confirm(question)) return false;
   const saved = await apply(`provider:${item.id}`, () => modelSettings.removeProvider(item.id, saveOptions()));
   if (saved) {
     delete discoveries[item.id];
@@ -380,6 +385,7 @@ async function removeProvider(item: ProviderView): Promise<boolean> {
 }
 
 function removeModel(item: ModelView): Promise<boolean> {
+  if (!window.confirm(`Удалить модель «${item.id}»?`)) return Promise.resolve(false);
   return apply(`model:${item.id}`, () => modelSettings.removeModel(item.id, saveOptions()));
 }
 
@@ -429,6 +435,10 @@ onMounted(() => { void load(); void scan(); });
         <span>Назад</span>
       </button>
       <h1>Модели</h1>
+      <nav class="settings__nav" aria-label="Разделы настроек">
+        <RouterLink :to="{ name: 'settings-models' }" aria-current="page">Модели</RouterLink>
+        <RouterLink :to="{ name: 'settings-speech' }" data-testid="settings-speech-link">Голос</RouterLink>
+      </nav>
     </header>
 
     <p v-if="loadError" class="notice notice--error" role="alert">
@@ -819,9 +829,29 @@ onMounted(() => { void load(); void scan(); });
 
 .settings__header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
   margin-bottom: 12px;
+}
+
+.settings__nav {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.settings__nav a {
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.settings__nav a[aria-current="page"] {
+  background: var(--bg-subtle);
+  color: var(--text);
 }
 
 h1 {

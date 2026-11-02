@@ -69,6 +69,12 @@ test("model settings keep checks explicit and separate key edit, disable, delete
   await provider.getByTestId("provider-toggle").click();
   await expect(page.getByTestId("models-empty")).toBeVisible();
   await expect(page.getByTestId("model-provider-off")).toHaveText("Сервер отключён");
+  // Removal asks first and names the models that go with the connection.
+  page.once("dialog", (dialog) => {
+    expect(dialog.type()).toBe("confirm");
+    expect(dialog.message()).toContain("Удалить подключение");
+    void dialog.accept();
+  });
   await provider.getByTestId("provider-remove").click();
   await expect(provider).toHaveCount(0);
   await expect(page.getByTestId("deleted-settings")).toBeVisible();
