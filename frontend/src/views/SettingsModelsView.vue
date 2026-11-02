@@ -876,19 +876,27 @@ onMounted(() => { void load(); void scan(); });
 
       <section v-if="view.deleted?.providers.length || view.deleted?.models.length" class="block" data-testid="deleted-settings">
         <h2>Удалённые настройки из файла</h2>
-        <div v-for="id in view.deleted?.providers" :key="`provider:${id}`" class="found__row">
-          <span>Сервер {{ id }}</span>
-          <button type="button" class="ghost" :disabled="!!busy" :data-restore-provider="id" @click="resetProvider(id)">Восстановить</button>
-          <span class="muted small" :data-remove-hint-provider="id">
-            Чтобы убрать совсем, удалите блок <code>{{ id }}</code> из раздела <code>providers</code> в config/models.yaml.
-          </span>
+        <div v-for="id in view.deleted?.providers" :key="`provider:${id}`" class="found__item">
+          <div class="found__info deleted__info">
+            <span class="found__name">Сервер {{ id }}</span>
+            <span class="muted small" :data-remove-hint-provider="id">
+              Чтобы убрать совсем, удалите блок <code>{{ id }}</code> из раздела <code>providers</code> в config/models.yaml.
+            </span>
+          </div>
+          <div class="found__actions">
+            <button type="button" class="ghost" :disabled="!!busy" :data-restore-provider="id" @click="resetProvider(id)">Восстановить</button>
+          </div>
         </div>
-        <div v-for="id in view.deleted?.models" :key="`model:${id}`" class="found__row">
-          <span>Модель {{ id }}</span>
-          <button type="button" class="ghost" :disabled="!!busy" :data-restore-model="id" @click="resetModel(id)">Восстановить</button>
-          <span class="muted small" :data-remove-hint-model="id">
-            Чтобы убрать совсем, удалите блок <code>{{ id }}</code> из раздела <code>models</code> в config/models.yaml.
-          </span>
+        <div v-for="id in view.deleted?.models" :key="`model:${id}`" class="found__item">
+          <div class="found__info deleted__info">
+            <span class="found__name">Модель {{ id }}</span>
+            <span class="muted small" :data-remove-hint-model="id">
+              Чтобы убрать совсем, удалите блок <code>{{ id }}</code> из раздела <code>models</code> в config/models.yaml.
+            </span>
+          </div>
+          <div class="found__actions">
+            <button type="button" class="ghost" :disabled="!!busy" :data-restore-model="id" @click="resetModel(id)">Восстановить</button>
+          </div>
         </div>
       </section>
     </template>
@@ -1186,6 +1194,12 @@ input.mono {
 
 .found__name {
   overflow-wrap: anywhere;
+}
+
+/* The hint goes under the name, so every restore button keeps the same column. */
+.deleted__info {
+  flex-direction: column;
+  align-items: flex-start;
 }
 
 .found__actions {
