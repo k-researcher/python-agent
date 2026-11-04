@@ -59,7 +59,16 @@ def lower_effort(model: ResolvedModel, effort: str | None) -> str | None:
     return allowed[-1] if allowed else None
 
 
+def _raise(model: ResolvedModel, level: str, steps: int) -> str:
+    """Return the allowed level ``steps`` positions above ``level``, at most the highest."""
+    allowed = [effort for effort in EFFORT_ORDER if effort in model.reasoning.allowed_efforts]
+    return allowed[min(allowed.index(level) + steps, len(allowed) - 1)]
+
+
 def _auto(model: ResolvedModel, mode: str, task_chars: int, recent_errors: int) -> tuple[str, str]:
+    default = model.reasoning.default_effort
+    if default is not None and default != "none":
+        return _auto_from_default(model, default, task_chars, recent_errors)
     level = "low" if tool_profile(mode) == "ask" else "medium"
     reason = f"mode {mode}"
     if task_chars >= LONG_TASK_CHARS:
@@ -70,6 +79,26 @@ def _auto(model: ResolvedModel, mode: str, task_chars: int, recent_errors: int) 
         level = EFFORT_ORDER[min(EFFORT_ORDER.index(level) + 1, len(EFFORT_ORDER) - 1)]
         reason = "one failed step"
     return _nearest(model, level) or level, reason
+
+
+def _auto_from_default(
+    model: ResolvedModel, default: str, task_chars: int, recent_errors: int
+) -> tuple[str, str]:
+    """Start from the level that the model declares as its default and raise it step by step.
+
+    A model default is a measured choice for that model, so a long task or a failed step
+    only moves to the next allowed level instead of a fixed high one.
+    """
+    if recent_errors >= 2:
+        return _raise(model, default, len(EFFORT_ORDER)), "two failed steps in a row"
+    steps = int(task_chars >= LONG_TASK_CHARS) + int(recent_errors == 1)
+    if recent_errors == 1:
+        reason = "one failed step"
+    elif steps:
+        reason = "long task"
+    else:
+        reason = "model default"
+    return _raise(model, default, steps), reason
 
 
 def decide(
@@ -84,7 +113,8 @@ def decide(
 ) -> ReasoningDecision:
     """Message override, then the session level, then the model default.
 
-    "auto" selects a level from the mode, the task size and recent tool errors. Within one
+    "auto" starts from the model default or, without one, from the mode; a long task and
+    recent tool errors raise the level. Within one
     turn it does not go below ``turn_effort``, the highest level already sent in the turn:
     each change of the level makes the provider read the prompt prefix again without the
     cache. The same interface will later take a decision from the decision layer (Jev).

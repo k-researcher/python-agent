@@ -45,15 +45,50 @@ def test_message_beats_session_beats_model() -> None:
     assert (chosen.effective, chosen.source) == ("medium", "model")
 
 
-def test_auto_uses_mode_size_and_errors() -> None:
-    assert decide(FULL, message_effort=AUTO, session_effort=None, mode="ask").effective == "low"
-    assert decide(FULL, message_effort=AUTO, session_effort=None, mode="dev").effective == "medium"
-    long_task = decide(FULL, message_effort=AUTO, session_effort=None, mode="dev", task_chars=9000)
-    assert long_task.effective == "high"
-    one_error = decide(FULL, message_effort=AUTO, session_effort=None, mode="dev", recent_errors=1)
-    assert one_error.effective == "high"
-    two_errors = decide(FULL, message_effort=AUTO, session_effort=None, mode="ask", recent_errors=2)
-    assert two_errors.effective == "max"
+LEVELS = ["none", "minimal", "low", "medium", "high", "max"]
+MEASURED = model(["none", "minimal", "low", "high", "max"], "minimal")
+
+
+@pytest.mark.parametrize(
+    "plain", [model(["none", "low", "medium", "high", "max"], None), model(LEVELS, "none")]
+)
+def test_auto_without_a_model_default_uses_mode_size_and_errors(plain: ResolvedModel) -> None:
+    def auto(mode: str, task_chars: int = 0, recent_errors: int = 0) -> str | None:
+        chosen = decide(
+            plain,
+            message_effort=AUTO,
+            session_effort=None,
+            mode=mode,
+            task_chars=task_chars,
+            recent_errors=recent_errors,
+        )
+        return chosen.effective
+
+    assert auto("ask") == "low"
+    assert auto("dev") == "medium"
+    assert auto("dev", task_chars=9000) == "high"
+    assert auto("dev", recent_errors=1) == "high"
+    assert auto("ask", recent_errors=2) == "max"
+
+
+def test_auto_starts_from_the_model_default_and_raises_it_step_by_step() -> None:
+    def auto(mode: str, task_chars: int = 0, recent_errors: int = 0) -> tuple[str | None, str]:
+        chosen = decide(
+            MEASURED,
+            message_effort=AUTO,
+            session_effort=None,
+            mode=mode,
+            task_chars=task_chars,
+            recent_errors=recent_errors,
+        )
+        return chosen.effective, chosen.reason
+
+    assert auto("ask") == ("minimal", "model default")
+    assert auto("dev") == ("minimal", "model default")
+    assert auto("dev", task_chars=9000) == ("low", "long task")
+    assert auto("dev", recent_errors=1) == ("low", "one failed step")
+    assert auto("dev", task_chars=9000, recent_errors=1) == ("high", "one failed step")
+    assert auto("ask", recent_errors=2) == ("max", "two failed steps in a row")
 
 
 def test_auto_picks_the_nearest_allowed_level() -> None:
