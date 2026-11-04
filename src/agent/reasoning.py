@@ -80,11 +80,14 @@ def decide(
     mode: str,
     task_chars: int = 0,
     recent_errors: int = 0,
+    turn_effort: str | None = None,
 ) -> ReasoningDecision:
     """Message override, then the session level, then the model default.
 
-    "auto" selects a level from the mode, the task size and recent tool errors. The same
-    interface will later take a decision from the decision layer (Jev).
+    "auto" selects a level from the mode, the task size and recent tool errors. Within one
+    turn it does not go below ``turn_effort``, the highest level already sent in the turn:
+    each change of the level makes the provider read the prompt prefix again without the
+    cache. The same interface will later take a decision from the decision layer (Jev).
     """
     if not model.reasoning.supported:
         return ReasoningDecision(None, None, "none", "model has no reasoning control")
@@ -92,6 +95,12 @@ def decide(
     source: Source = "message" if message_effort else "session" if session_effort else "model"
     if requested == AUTO:
         effective, reason = _auto(model, mode, task_chars, recent_errors)
+        if (
+            turn_effort in model.reasoning.allowed_efforts
+            and turn_effort in EFFORT_ORDER
+            and EFFORT_ORDER.index(turn_effort) > EFFORT_ORDER.index(effective)
+        ):
+            effective, reason = turn_effort, "level kept for this turn"
         return ReasoningDecision(AUTO, effective, "auto", reason)
     if requested and requested in model.reasoning.allowed_efforts:
         return ReasoningDecision(requested, requested, source, f"{source} setting")
