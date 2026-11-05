@@ -70,9 +70,29 @@ class SessionBudgetRead(BaseModel):
     stop_reason: str | None
 
 
+class AttachmentIn(BaseModel):
+    """A text file attached to a user message."""
+
+    name: str = Field(min_length=1, max_length=255)
+    text: str = Field(max_length=200 * 1024)
+
+
+class AttachmentFile(BaseModel):
+    name: str
+    size: int
+    chars: int
+
+
+class MessageAttachments(BaseModel):
+    # Number of characters of typed text at the start of the content; the files follow it.
+    text_end: int
+    files: list[AttachmentFile]
+
+
 class SessionCreate(BaseModel):
     project_id: str
-    prompt: str = Field(min_length=1, max_length=2_000_000)
+    prompt: str = Field(max_length=2_000_000)
+    attachments: list[AttachmentIn] = Field(default_factory=list)
     mode: SessionMode = "dev"
     llm_profile: str | None = Field(default=None, min_length=1, max_length=100)
     engine_profile: str | None = Field(default=None, min_length=1, max_length=100)
@@ -85,6 +105,8 @@ class SessionCreate(BaseModel):
     def one_backend(self) -> Self:
         if self.engine_profile is not None and self.llm_profile is not None:
             raise ValueError("llm_profile and engine_profile are mutually exclusive")
+        if not self.prompt.strip() and not self.attachments:
+            raise ValueError("prompt must contain text or attachments")
         return self
 
 
@@ -136,9 +158,10 @@ class SessionModelChange(BaseModel):
 
 
 class MessageCreate(BaseModel):
-    content: str = Field(min_length=1, max_length=2_000_000)
+    content: str = Field(max_length=2_000_000)
     # Level for this message and the tool loop that follows it: "auto" or a model level.
     reasoning_effort: str | None = Field(default=None, max_length=20)
+    attachments: list[AttachmentIn] = Field(default_factory=list)
 
     @field_validator("content")
     @classmethod
@@ -146,6 +169,12 @@ class MessageCreate(BaseModel):
         if "\x00" in content:
             raise ValueError("NUL is not allowed in messages")
         return content
+
+    @model_validator(mode="after")
+    def text_or_files(self) -> Self:
+        if not self.content.strip() and not self.attachments:
+            raise ValueError("content must contain text or attachments")
+        return self
 
 
 class MessageRead(BaseModel):
@@ -166,6 +195,7 @@ class MessageRead(BaseModel):
     source_hash: str | None
     summary_version: int | None
     summary_model: str | None
+    attachments: MessageAttachments | None = None
     created_at: UtcDatetime
 
 

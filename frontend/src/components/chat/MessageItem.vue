@@ -8,6 +8,8 @@ import MarkdownView from "./MarkdownView.vue";
 import ReasoningBlock from "./ReasoningBlock.vue";
 import { reasoningLabel } from "./reasoning";
 import { formatLocalTime } from "../../time";
+import { FileText } from "lucide-vue-next";
+import { formatSize } from "./attachments";
 
 const props = defineProps<{ message: ChatMessage }>();
 
@@ -27,6 +29,13 @@ const effortLabel = computed(() => {
   <div class="message-row" :class="{ user: isUser }" data-testid="message">
     <div class="bubble" :class="{ user: isUser }">
       <MarkdownView v-if="message.content" :source="message.content" />
+      <ul v-if="message.attachments?.length" class="files" aria-label="Приложенные файлы" data-testid="message-files">
+        <li v-for="(file, index) in message.attachments" :key="`${index}:${file.name}`" class="file">
+          <FileText :size="13" aria-hidden="true" />
+          <span class="file__name" :title="file.name">{{ file.name }}</span>
+          <span class="file__size">{{ formatSize(file.size) }}</span>
+        </li>
+      </ul>
       <ReasoningBlock
         v-if="message.reasoning_content"
         :text="message.reasoning_content"
@@ -60,6 +69,40 @@ const effortLabel = computed(() => {
 }
 .bubble:not(.user) {
   background: transparent;
+}
+
+.files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+.files:first-child {
+  margin-top: 0;
+}
+.file {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: 0.75rem;
+}
+.file__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file__size {
+  flex-shrink: 0;
+  color: var(--text-muted);
 }
 
 .meta {

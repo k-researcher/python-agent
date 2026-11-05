@@ -12,6 +12,7 @@ import ChatTimeline from "../components/chat/ChatTimeline.vue";
 import Composer from "../components/chat/Composer.vue";
 import AgentSettings from "../components/chat/AgentSettings.vue";
 import type { RejectPayload, SendPayload } from "../components/chat/types";
+import { toUpload } from "../components/chat/attachments";
 import { toChatTimelineItems, toModelOptions } from "../uiAdapters";
 import { sessionStatusLabel, stopReasonText } from "../components/layout/status";
 import { modeLabel as resolveModeLabel } from "../modes";
@@ -35,6 +36,7 @@ let openSeq = 0;
 // Draft storage key per session; becomes a fresh key after a failed send so the
 // Composer remounts/re-reads the restored text.
 const draftKey = ref(`draft:${props.id}`);
+const composer = ref<InstanceType<typeof Composer> | null>(null);
 let draftRetryCounter = 0;
 
 function restoreDraft(text: string): void {
@@ -171,12 +173,14 @@ async function onSend(payload: SendPayload): Promise<void> {
     await sessionStore.send(
       pendingText,
       !external.value && payload.effort !== "auto" ? payload.effort : undefined,
+      toUpload(payload.files),
     );
     clearDraft();
   } catch (cause) {
     sendError.value = cause instanceof Error ? cause.message : String(cause);
     // Restore the lost text into the composer via a fresh draft key (remount).
     restoreDraft(pendingText);
+    composer.value?.restoreFiles(payload.files);
   } finally {
     isSending.value = false;
   }
@@ -295,6 +299,7 @@ function onOpenChild(id: string): void {
       </p>
 
       <Composer
+        ref="composer"
         :busy="busy"
         :disabled="!modelAvailable"
         :draft-key="draftKey"

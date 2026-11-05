@@ -54,7 +54,8 @@ DbSession = Annotated[AsyncSession, Depends(get_db)]
 class EditRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    content: str = Field(min_length=1, max_length=2_000_000)
+    # Only the typed text: the attached files of the message stay as they are.
+    content: str = Field(max_length=2_000_000)
 
 
 class RegenerateRequest(BaseModel):
@@ -91,6 +92,15 @@ async def edit_message_endpoint(
     payload: EditRequest,
     db: DbSession,
 ) -> MessageRead:
+    if not payload.content:
+        record = await db.scalar(
+            sa.select(Message.attachments).where(
+                Message.id == message_id, Message.session_id == session_id
+            )
+        )
+        if not record:
+            # Text may be empty only when the message keeps attached files.
+            raise HTTPException(422, "The message text is empty")
     try:
         message = await edit_message(db, session_id, message_id, payload.content)
         generation = await _claimed_generation(db, session_id)

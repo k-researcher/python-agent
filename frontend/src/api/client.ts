@@ -1,5 +1,6 @@
 import type {
   Approval,
+  AttachmentInput,
   ContextStats,
   Message,
   MonitorRow,
@@ -67,6 +68,7 @@ export interface CreateSessionInput {
   reasoning_effort?: string;
   title?: string;
   auto_start?: boolean;
+  attachments?: AttachmentInput[];
 }
 
 // Object form (session store — forwards optional NewSession fields) and legacy
@@ -100,6 +102,7 @@ function createSessionRequest(
       reasoning_effort: input.reasoning_effort ?? null,
       title: input.title,
       auto_start: input.auto_start ?? true,
+      attachments: input.attachments ?? [],
     }),
   });
 }
@@ -135,12 +138,18 @@ export const api = {
     snapshot<OutboundAudit[]>(sessionId, "audit"),
   context: (sessionId: string): Promise<ContextStats> =>
     snapshot<ContextStats>(sessionId, "context"),
-  sendMessage: (sessionId: string, content: string, reasoningEffort?: string): Promise<Message> =>
+  sendMessage: (
+    sessionId: string,
+    content: string,
+    reasoningEffort?: string,
+    attachments: AttachmentInput[] = [],
+  ): Promise<Message> =>
     request<Message>(`/api/sessions/${sessionId}/messages`, {
       method: "POST",
       body: JSON.stringify({
         content,
         reasoning_effort: reasoningEffort && reasoningEffort.trim() !== "" ? reasoningEffort : null,
+        attachments,
       }),
     }),
   approvals: (sessionId: string): Promise<Approval[]> =>

@@ -130,6 +130,8 @@ export interface Message {
   kind: string;
   reasoning_content: string | null;
   reasoning_effort: string | null;
+  // User message with files: the end of the typed text and the file names and sizes.
+  attachments?: MessageAttachments | null;
   created_at: string;
   // Summary/context metadata (nullable/optional for compatibility with older rows).
   covers_until?: number | null;
@@ -154,9 +156,20 @@ export interface Approval {
   created_at?: string;
 }
 
+export interface MessageAttachments {
+  text_end: number;
+  files: { name: string; size: number; chars: number }[];
+}
+
+export interface AttachmentInput {
+  name: string;
+  text: string;
+}
+
 export interface NewSession {
   project_id: string;
   prompt: string;
+  attachments?: AttachmentInput[];
   mode?: SessionMode;
   llm_profile?: string;
   engine_profile?: string;

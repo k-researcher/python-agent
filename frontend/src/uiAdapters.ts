@@ -23,6 +23,7 @@ import type {
   AuditEntry,
   ToolEntry,
 } from "./components/layout/types";
+import { firstCodePoints } from "./components/chat/attachments";
 import type {
   ChatMessage,
   TimelineItem as ChatTimelineItem,
@@ -126,10 +127,14 @@ function toChatRole(role: string): "user" | "assistant" {
 }
 
 export function toChatMessage(message: ApiMessage): ChatMessage {
+  const record = message.attachments;
+  const content = message.content ?? "";
   return {
     id: String(message.id),
     role: toChatRole(message.role),
-    content: message.content ?? "",
+    // The file texts follow the typed text in the content; the bubble shows the files as chips.
+    content: record ? firstCodePoints(content, record.text_end) : content,
+    ...(record ? { attachments: record.files.map(({ name, size }) => ({ name, size })) } : {}),
     reasoning_content: message.reasoning_content,
     reasoning_effort: message.reasoning_effort,
     created_at: message.created_at,

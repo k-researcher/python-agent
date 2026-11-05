@@ -24,6 +24,7 @@ from sqlalchemy.orm import attributes, selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
 from agent import model_health, monitor
+from agent.attachments import check_files, compose
 from agent.auth import check_request
 from agent.checkpoints import load_context_rows
 from agent.config import Settings, get_settings
@@ -357,6 +358,7 @@ async def create_session(
             project,
             payload.prompt,
             payload.mode,
+            attachments=payload.attachments,
             llm_profile=payload.llm_profile,
             engine_profile=payload.engine_profile,
             title=payload.title,
@@ -579,6 +581,16 @@ async def add_message(
         raise HTTPException(404, "Session not found")
     await _engine_access(db, session, request)
     await _check_session_model(db, session)
+    if payload.attachments:
+        window = None
+        if session.engine_profile is None:
+            registry = await effective_registry(db, settings)
+            window = select_model(registry, session.llm_profile, strict=False).context_window
+        try:
+            check_files(payload.attachments, window)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    content, attachments = compose(payload.content, payload.attachments)
     for attempt in range(3):
         try:
             await lock_session(db, session_id)
@@ -609,8 +621,9 @@ async def add_message(
         db,
         session.id,
         role="user",
-        content=payload.content,
+        content=content,
         reasoning_effort=payload.reasoning_effort,
+        attachments=attachments,
     )
     event = Event(
         session_id=session.id,

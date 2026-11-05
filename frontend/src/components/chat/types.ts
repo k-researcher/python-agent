@@ -7,7 +7,9 @@ export type ChatRole = "user" | "assistant";
 export interface ChatMessage {
   id: string;
   role: ChatRole;
+  // User message with files: only the typed text; the files are listed in ``attachments``.
   content: string;
+  attachments?: { name: string; size: number }[];
   reasoning_content: string | null;
   reasoning_effort: string | null;
   created_at: string;
@@ -68,9 +70,17 @@ export type TimelineItem =
   | { kind: "streaming"; content: string; reasoning: string };
 
 /** Payload of the Composer `send` event. */
+/** A text file attached in the composer. */
+export interface AttachedFile {
+  name: string;
+  text: string;
+  size: number;
+}
+
 export interface SendPayload {
   text: string;
   effort: string;
+  files: AttachedFile[];
 }
 
 /** Payload of the ToolCallCard / ApprovalInline `reject` event. */

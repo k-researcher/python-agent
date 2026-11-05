@@ -75,7 +75,7 @@ describe("HomeView", () => {
     expect(wrapper.get('[data-testid="composer-input"]').attributes("disabled")).toBeDefined();
     expect(wrapper.get('[data-testid="composer-send"]').attributes("disabled")).toBeDefined();
     expect(wrapper.find('[data-testid="composer-stop"]').exists()).toBe(false);
-    wrapper.findComponent({ name: "Composer" }).vm.$emit("send", { text: "draft", effort: "auto" });
+    wrapper.findComponent({ name: "Composer" }).vm.$emit("send", { text: "draft", effort: "auto", files: [] });
     await flushPromises();
     expect(create).not.toHaveBeenCalled();
   });
@@ -257,7 +257,7 @@ it("selects an allowed external profile without model or CLI tuning", async () =
   await wrapper.get('[data-testid="model-select"]').setValue("engine:personal");
   expect(wrapper.get('[data-testid="composer-input"]').attributes("disabled")).toBeUndefined();
   expect(wrapper.find('[data-testid="composer-effort"]').exists()).toBe(false);
-  await wrapper.getComponent({ name: "Composer" }).vm.$emit("send", { text: "work", effort: "auto" });
+  await wrapper.getComponent({ name: "Composer" }).vm.$emit("send", { text: "work", effort: "auto", files: [] });
   await flushPromises();
   expect(create).toHaveBeenCalledWith(expect.objectContaining({ engine_profile: "personal", llm_profile: undefined }));
   wrapper.unmount();

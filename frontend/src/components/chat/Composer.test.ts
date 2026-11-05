@@ -48,7 +48,7 @@ describe("Composer", () => {
     await wrapper.get('[data-testid="composer-effort"]').setValue("high");
     await wrapper.get('[data-testid="composer-input"]').trigger("keydown", { key: "Enter" });
     expect(wrapper.emitted("send")).toBeTruthy();
-    expect(wrapper.emitted("send")?.[0]).toEqual([{ text: "найти баг", effort: "high" }]);
+    expect(wrapper.emitted("send")?.[0]).toEqual([{ text: "найти баг", effort: "high", files: [] }]);
     expect((wrapper.get('[data-testid="composer-input"]').element as HTMLTextAreaElement).value).toBe("");
   });
 

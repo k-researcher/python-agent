@@ -26,6 +26,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agent.attachments import replace_text
 from agent.config import get_settings
 from agent.model_registry import effective_registry, select_model
 from agent.models import (
@@ -215,7 +216,12 @@ async def _cancel_unfinished_calls(db: AsyncSession, session_id: str) -> None:
 
 
 async def _replace_user_turn(
-    db: AsyncSession, session_id: str, user: Message, content: str, reasoning_effort: str | None
+    db: AsyncSession,
+    session_id: str,
+    user: Message,
+    content: str,
+    reasoning_effort: str | None,
+    attachments: dict[str, Any] | None,
 ) -> Message:
     """Hide ``user`` and its tail; add a new user row with the same parent. No commit."""
     await _hide_from(db, session_id, user.id)
@@ -225,6 +231,7 @@ async def _replace_user_turn(
         role="user",
         content=content,
         reasoning_effort=reasoning_effort,
+        attachments=attachments,
     )
     db.add(new_user)
     await db.flush()
@@ -237,13 +244,26 @@ async def edit_message(db: AsyncSession, session_id: str, message_id: int, conte
     After the commit, schedule the run with ``supervisor.start(session_id, new_run=False)``:
     the new generation is already set here.
     """
-    if not content.strip():
+    if not content.strip() and not await _has_attachments(db, session_id, message_id):
         raise TreeError("The message text is empty", 400)
     await _claim_idle(db, session_id, start_run=True)
     user = await _active_message(db, session_id, message_id)
     if user.role != "user":
         raise TreeError("Only a user message can be edited", 409)
-    return await _replace_user_turn(db, session_id, user, content, user.reasoning_effort)
+    # The new text replaces only the typed part; the attached files stay.
+    new_content, attachments = replace_text(user.content or "", user.attachments, content)
+    return await _replace_user_turn(
+        db, session_id, user, new_content, user.reasoning_effort, attachments
+    )
+
+
+async def _has_attachments(db: AsyncSession, session_id: str, message_id: int) -> bool:
+    record = await db.scalar(
+        sa.select(Message.attachments).where(
+            Message.id == message_id, Message.session_id == session_id
+        )
+    )
+    return bool(record)
 
 
 async def regenerate(
@@ -288,7 +308,9 @@ async def regenerate(
             sa.update(Session).where(Session.id == session_id).values(llm_profile=llm_profile)
         )
     effort = reasoning_effort if reasoning_effort is not None else user.reasoning_effort
-    return await _replace_user_turn(db, session_id, user, user.content or "", effort)
+    return await _replace_user_turn(
+        db, session_id, user, user.content or "", effort, user.attachments
+    )
 
 
 async def _nearest_user_ancestor(db: AsyncSession, session_id: str, message: Message) -> Message:
@@ -418,6 +440,7 @@ async def fork(
             token_count=row.token_count,
             reasoning_content=row.reasoning_content,
             reasoning_effort=row.reasoning_effort,
+            attachments=row.attachments,
         )
         db.add(clone)
         await db.flush()

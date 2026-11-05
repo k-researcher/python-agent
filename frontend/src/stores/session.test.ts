@@ -536,7 +536,7 @@ describe("session store actions", () => {
     expect(messagesSpy).toHaveBeenCalledTimes(1);
 
     await store.send("задача", "high");
-    expect(sendSpy).toHaveBeenCalledWith("s1", "задача", "high");
+    expect(sendSpy).toHaveBeenCalledWith("s1", "задача", "high", []);
 
     // Dedup by id: the reloaded copy and the local append must not duplicate.
     expect(store.messages.filter((m) => m.id === 42)).toHaveLength(1);
@@ -859,7 +859,7 @@ describe("session store open races", () => {
     await store.open("B");
 
     expect(sendSpy).toHaveBeenCalledTimes(1);
-    expect(sendSpy).toHaveBeenCalledWith("A", "hello", undefined);
+    expect(sendSpy).toHaveBeenCalledWith("A", "hello", undefined, []);
 
     sendD.resolve(msg(42, { session_id: "A", content: "from-A" }));
     await flushPromises();

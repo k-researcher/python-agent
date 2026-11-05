@@ -4,6 +4,7 @@ import { api } from "../api/client";
 import {
   isStreamDeltaEvent,
   type Approval,
+  type AttachmentInput,
   type ContextStats,
   type Message,
   type OutboundAudit,
@@ -237,11 +238,15 @@ export const useSessionStore = defineStore("session", () => {
     await reloadAll();
   }
 
-  async function send(content: string, reasoningEffort?: string): Promise<void> {
+  async function send(
+    content: string,
+    reasoningEffort?: string,
+    attachments: AttachmentInput[] = [],
+  ): Promise<void> {
     const id = sessionId.value;
     const gen = generation;
     if (id == null) throw new Error("Нет открытой сессии");
-    const created = await api.sendMessage(id, content, reasoningEffort);
+    const created = await api.sendMessage(id, content, reasoningEffort, attachments);
     if (!isCurrent(id, gen)) return;
     resetStream();
     // A `message.created` WS event may already have reloaded the list (including the

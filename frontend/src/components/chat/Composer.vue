@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from "vue";
-import type { SendPayload } from "./types";
+import type { AttachedFile, SendPayload } from "./types";
 import { reasoningLabel } from "./reasoning";
 import { draftGeneration, readDraft, writeDraft } from "../../draftStorage";
-import { Mic } from "lucide-vue-next";
+import { Mic, Paperclip, X } from "lucide-vue-next";
+import { addFiles, formatSize } from "./attachments";
 import { transcribe } from "../../api/speech";
 import { insertText, useVoiceInput } from "./voice";
 
@@ -50,7 +51,48 @@ function resolveControlsHost(): void {
 onMounted(resolveControlsHost);
 watch(() => props.controlsTarget, resolveControlsHost, { flush: "post" });
 
-const canSend = computed(() => text.value.trim().length > 0);
+const files = ref<AttachedFile[]>([]);
+const fileError = ref("");
+const fileInput = ref<HTMLInputElement | null>(null);
+const dragging = ref(false);
+
+const canSend = computed(() => text.value.trim().length > 0 || files.value.length > 0);
+
+async function attach(list: Iterable<File>): Promise<void> {
+  const result = await addFiles(files.value, list);
+  files.value = result.files;
+  fileError.value = result.errors.join(" ");
+}
+
+function onFileChosen(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  void attach(Array.from(input.files ?? []));
+  input.value = "";
+}
+
+function onPaste(event: ClipboardEvent): void {
+  const pasted = Array.from(event.clipboardData?.files ?? []);
+  if (!pasted.length) return;
+  event.preventDefault();
+  void attach(pasted);
+}
+
+function onDrop(event: DragEvent): void {
+  dragging.value = false;
+  if (props.busy || props.disabled) return;
+  void attach(Array.from(event.dataTransfer?.files ?? []));
+}
+
+function removeFile(index: number): void {
+  files.value = files.value.filter((_, position) => position !== index);
+}
+
+/** Put the files back after a failed send; the text comes back through the draft. */
+function restoreFiles(restored: AttachedFile[]): void {
+  files.value = restored;
+}
+
+defineExpose({ restoreFiles });
 
 watch(
   () => props.draftKey,
@@ -123,16 +165,41 @@ const recordTime = computed(() => {
 
 function send(): void {
   const content = text.value.trim();
-  if (!content || props.busy || props.disabled) return;
-  emit("send", { text: content, effort: effort.value });
+  if ((!content && !files.value.length) || props.busy || props.disabled) return;
+  emit("send", { text: content, effort: effort.value, files: files.value });
   text.value = "";
+  files.value = [];
+  fileError.value = "";
   void nextTick(resize);
 }
 </script>
 
 <template>
-  <div class="composer" :aria-busy="busy" data-testid="composer">
+  <div
+    class="composer"
+    :class="{ 'composer--drop': dragging }"
+    :aria-busy="busy"
+    data-testid="composer"
+    @dragover.prevent="dragging = !busy && !disabled"
+    @dragleave="dragging = false"
+    @drop.prevent="onDrop"
+  >
     <div class="input-container">
+      <ul v-if="files.length" class="files" aria-label="Приложенные файлы" data-testid="composer-files">
+        <li v-for="(file, index) in files" :key="`${index}:${file.name}`" class="file">
+          <span class="file__name" :title="file.name">{{ file.name }}</span>
+          <span class="file__size">{{ formatSize(file.size) }}</span>
+          <button
+            type="button"
+            class="file__remove"
+            :aria-label="`Убрать файл ${file.name}`"
+            :disabled="busy"
+            @click="removeFile(index)"
+          >
+            <X :size="12" aria-hidden="true" />
+          </button>
+        </li>
+      </ul>
       <div class="input-row">
         <textarea
           ref="textarea"
@@ -143,6 +210,7 @@ function send(): void {
           data-testid="composer-input"
           @input="resize"
           @keydown="onKeydown"
+          @paste="onPaste"
         />
         <div class="actions">
           <template v-if="voiceState === 'recording' || voiceState === 'transcribing'">
@@ -162,6 +230,25 @@ function send(): void {
             </button>
           </template>
           <template v-else>
+          <input
+            ref="fileInput"
+            type="file"
+            multiple
+            hidden
+            data-testid="composer-file-input"
+            @change="onFileChosen"
+          />
+          <button
+            type="button"
+            class="voice"
+            :disabled="busy || disabled"
+            aria-label="Приложить текстовый файл"
+            title="Приложить текстовый файл"
+            data-testid="composer-attach"
+            @click="fileInput?.click()"
+          >
+            <Paperclip :size="16" aria-hidden="true" />
+          </button>
           <button
             type="button"
             class="voice"
@@ -195,6 +282,10 @@ function send(): void {
           </template>
         </div>
       </div>
+      <p v-if="fileError" class="voice-error" role="alert" data-testid="composer-file-error">
+        {{ fileError }}
+        <button type="button" class="voice-error__close" aria-label="Скрыть" @click="fileError = ''">×</button>
+      </p>
       <p v-if="voiceError" class="voice-error" role="alert" data-testid="voice-error">
         {{ voiceError }}
         <button type="button" class="voice-error__close" aria-label="Скрыть" @click="voiceError = ''">×</button>
@@ -225,6 +316,59 @@ function send(): void {
 
 .input-container {
   width: 100%;
+}
+
+.composer--drop {
+  outline: 2px dashed var(--link);
+  outline-offset: -4px;
+}
+
+.files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 6px;
+  padding: 0;
+  list-style: none;
+}
+
+.file {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 0 4px 0 8px;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  font-size: 0.75rem;
+}
+
+.file__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file__size {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+button.file__remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
 }
 
 .input-row {
