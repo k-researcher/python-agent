@@ -18,5 +18,8 @@ describe("reasoning stats label", () => {
   it("gives a slow speed with one decimal and a fast one as a whole number", () => {
     expect(reasoningStatsParts(90, { tokens: 23, exact: true, seconds: 4 })[2]).toBe("5,8 ток/с");
     expect(reasoningStatsParts(90, { tokens: 230, exact: false, seconds: 4 })[2]).toBe("58 ток/с");
+    // A short reasoning of a fast model still gets its speed.
+    expect(reasoningStatsParts(99, { tokens: 35, exact: true, seconds: 0.26 })[2]).toBe("135 ток/с");
+    expect(reasoningStatsParts(99, { tokens: 35, exact: true, seconds: 0.1 })).toHaveLength(2);
   });
 });

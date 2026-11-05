@@ -23,13 +23,16 @@ export function plural(count: number, one: string, few: string, many: string): s
   return many;
 }
 
+const MIN_SPEED_SECONDS = 0.2;
+
 function number(value: number): string {
   return value.toLocaleString("ru-RU");
 }
 
 /**
  * Parts of the reasoning label: characters, tokens and tokens per second.
- * An estimated token count gets "≈"; the speed needs at least one second of reasoning.
+ * An estimated token count gets "≈". The speed needs a measurable span of reasoning: on a
+ * shorter span the arrival of a single fragment changes it too much.
  */
 export function reasoningStatsParts(
   chars: number,
@@ -40,7 +43,7 @@ export function reasoningStatsParts(
   if (tokens == null || tokens <= 0) return parts;
   parts.push(`${stats?.exact ? "" : "≈"}${number(tokens)} ${plural(tokens, "токен", "токена", "токенов")}`);
   const seconds = stats?.seconds;
-  if (seconds != null && seconds >= 1) {
+  if (seconds != null && seconds >= MIN_SPEED_SECONDS) {
     const speed = tokens / seconds;
     parts.push(`${speed < 10 ? number(Math.round(speed * 10) / 10) : number(Math.round(speed))} ток/с`);
   }

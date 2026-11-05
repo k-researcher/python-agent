@@ -84,7 +84,7 @@ describe("ReasoningBlock", () => {
     expect(toggle.attributes("title")).toContain("оценка");
 
     const done = mount(ReasoningBlock, {
-      props: { text: "x".repeat(21), streaming: false, stats: { tokens: 21, exact: true, seconds: 0.5 } },
+      props: { text: "x".repeat(21), streaming: false, stats: { tokens: 21, exact: true, seconds: 0.1 } },
     });
     const label = done.get('[data-testid="reasoning-toggle"]');
     expect(label.text()).toBe("▸Рассуждения · 21 символ · 21 токен");
