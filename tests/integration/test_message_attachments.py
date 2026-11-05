@@ -105,7 +105,7 @@ def test_files_can_go_without_text_and_start_a_session(tmp_path: Path, fake: Any
     ("files", "detail"),
     [
         ([{"name": f"{index}.txt", "text": "x"} for index in range(11)], "не больше 10"),
-        ([{"name": "big.txt", "text": "я" * 110_000}], "больше 200 КБ"),
+        ([{"name": "big.txt", "text": "я" * 530_000}], "больше 1 МБ"),
         ([{"name": "image.png", "text": "\x89PNG\x00data"}], "не текстовый"),
         ([{"name": f"{index}.txt", "text": "x" * 13_000} for index in range(10)], "четверти"),
     ],

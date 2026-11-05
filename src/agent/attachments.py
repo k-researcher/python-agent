@@ -12,7 +12,7 @@ from typing import Any
 from agent.schemas import AttachmentIn
 
 MAX_FILES = 10
-MAX_FILE_BYTES = 200 * 1024
+MAX_FILE_BYTES = 1024 * 1024
 _UNSAFE_NAME = str.maketrans({'"': "'", "<": "(", ">": ")", "\n": " ", "\r": " ", "\t": " "})
 
 
@@ -34,7 +34,7 @@ def check_files(files: list[AttachmentIn], context_window: int | None) -> None:
         if "\x00" in item.text:
             raise ValueError(f"Файл {clean_name(item.name)} не текстовый.")
         if len(item.text.encode("utf-8")) > MAX_FILE_BYTES:
-            raise ValueError(f"Файл {clean_name(item.name)} больше 200 КБ.")
+            raise ValueError(f"Файл {clean_name(item.name)} больше 1 МБ.")
     total = sum(len(item.text) for item in files)
     if context_window is not None and total > context_window:
         raise ValueError("Файлы слишком большие для этой модели: всего больше четверти контекста.")

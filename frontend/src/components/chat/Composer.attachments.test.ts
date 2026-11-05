@@ -61,22 +61,40 @@ describe("Composer attachments", () => {
     expect(wrapper.find('[data-testid="composer-files"]').exists()).toBe(false);
   });
 
-  it("refuses binary, non UTF-8, too large and extra files with a message", async () => {
+  it("lists binary, non UTF-8, too large and extra files with the reason and the fix", async () => {
     const wrapper = mountComposer();
     await choose(wrapper, [
       new File([new Uint8Array([0x89, 0x50, 0x00, 0x47])], "image.png"),
       new File([new Uint8Array([0xff, 0xfe, 0x41])], "latin1.txt"),
       textFile("big.txt", "x".repeat(MAX_FILE_BYTES + 1)),
+      textFile("ok.txt", "ok"),
     ]);
-    expect(chips(wrapper)).toEqual([]);
-    const error = wrapper.get('[data-testid="composer-file-error"]').text();
-    expect(error).toContain("image.png не текстовый");
-    expect(error).toContain("latin1.txt не в кодировке UTF-8");
-    expect(error).toContain("big.txt больше 200 КБ");
+    expect(chips(wrapper)).toEqual(["ok.txt2 Б"]);
+    const notice = wrapper.get('[data-testid="composer-file-error"]');
+    expect(notice.get(".notice__title").text()).toBe("Не все файлы приложены");
+    expect(notice.findAll("li").map((item) => item.text())).toEqual([
+      "image.png: Это не текстовый файл. Сейчас можно приложить только текст: код, Markdown, логи, CSV.",
+      "latin1.txt: Текст не в кодировке UTF-8. Сохраните файл в UTF-8 и приложите снова.",
+      "big.txt: Файл больше 1 МБ. Разделите файл на части.",
+    ]);
+    expect(notice.element.parentElement?.getAttribute("role")).toBe("status");
 
     await choose(wrapper, Array.from({ length: 11 }, (_, index) => textFile(`${index}.txt`, "x")));
     expect(chips(wrapper)).toHaveLength(10);
-    expect(wrapper.get('[data-testid="composer-file-error"]').text()).toContain("не больше 10");
+    expect(wrapper.get('[data-testid="composer-file-error"] li').text()).toBe(
+      "В сообщение помещается до 10 файлов, остальные не добавлены.",
+    );
+  });
+
+  it("names a single refused file in the title and hides the notice on close", async () => {
+    const wrapper = mountComposer();
+    await choose(wrapper, [textFile("dump.log", "x".repeat(3 * 1024 * 1024))]);
+    const notice = wrapper.get('[data-testid="composer-file-error"]');
+    expect(notice.get(".notice__title").text()).toBe("Не удалось приложить dump.log");
+    expect(notice.get(".notice__text").text()).toBe("Размер 3 МБ, а можно до 1 МБ. Разделите файл на части.");
+
+    await wrapper.get('[aria-label="Скрыть сообщение"]').trigger("click");
+    expect(wrapper.find('[data-testid="composer-file-error"]').exists()).toBe(false);
   });
 
   it("takes files from paste and drop and puts them back after a failed send", async () => {
@@ -134,5 +152,7 @@ describe("attached files in the timeline", () => {
     expect(firstCodePoints("ab", 5)).toBe("ab");
     expect(formatSize(900)).toBe("900 Б");
     expect(formatSize(200 * 1024)).toBe("200 КБ");
+    expect(formatSize(1024 * 1024)).toBe("1 МБ");
+    expect(formatSize(1.45 * 1024 * 1024)).toBe("1,5 МБ");
   });
 });

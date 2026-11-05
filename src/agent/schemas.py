@@ -74,7 +74,7 @@ class AttachmentIn(BaseModel):
     """A text file attached to a user message."""
 
     name: str = Field(min_length=1, max_length=255)
-    text: str = Field(max_length=200 * 1024)
+    text: str = Field(max_length=1024 * 1024)
 
 
 class AttachmentFile(BaseModel):

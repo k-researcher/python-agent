@@ -3,8 +3,8 @@ import { computed, nextTick, onMounted, ref, watch } from "vue";
 import type { AttachedFile, SendPayload } from "./types";
 import { reasoningLabel } from "./reasoning";
 import { draftGeneration, readDraft, writeDraft } from "../../draftStorage";
-import { Mic, Paperclip, X } from "lucide-vue-next";
-import { addFiles, formatSize } from "./attachments";
+import { CircleAlert, Mic, Paperclip, X } from "lucide-vue-next";
+import { addFiles, formatSize, type Rejection } from "./attachments";
 import { transcribe } from "../../api/speech";
 import { insertText, useVoiceInput } from "./voice";
 
@@ -52,7 +52,7 @@ onMounted(resolveControlsHost);
 watch(() => props.controlsTarget, resolveControlsHost, { flush: "post" });
 
 const files = ref<AttachedFile[]>([]);
-const fileError = ref("");
+const rejected = ref<Rejection[]>([]);
 const fileInput = ref<HTMLInputElement | null>(null);
 const dragging = ref(false);
 
@@ -61,8 +61,14 @@ const canSend = computed(() => text.value.trim().length > 0 || files.value.lengt
 async function attach(list: Iterable<File>): Promise<void> {
   const result = await addFiles(files.value, list);
   files.value = result.files;
-  fileError.value = result.errors.join(" ");
+  rejected.value = result.rejected;
 }
+
+// One file gets its name in the title; several files are listed with their reasons.
+const rejectedTitle = computed(() => {
+  const [first] = rejected.value;
+  return rejected.value.length === 1 && first?.name ? `Не удалось приложить ${first.name}` : "Не все файлы приложены";
+});
 
 function onFileChosen(event: Event): void {
   const input = event.target as HTMLInputElement;
@@ -169,7 +175,7 @@ function send(): void {
   emit("send", { text: content, effort: effort.value, files: files.value });
   text.value = "";
   files.value = [];
-  fileError.value = "";
+  rejected.value = [];
   void nextTick(resize);
 }
 </script>
@@ -185,6 +191,24 @@ function send(): void {
     @drop.prevent="onDrop"
   >
     <div class="input-container">
+      <!-- The live region stays in the page, so screen readers announce the notice when it appears. -->
+      <div role="status" aria-live="polite">
+        <div v-if="rejected.length" class="notice" data-testid="composer-file-error">
+          <CircleAlert :size="16" class="notice__icon" aria-hidden="true" />
+          <div class="notice__body">
+            <p class="notice__title">{{ rejectedTitle }}</p>
+            <p v-if="rejected.length === 1 && rejected[0]?.name" class="notice__text">{{ rejected[0]?.reason }}</p>
+            <ul v-else class="notice__list">
+              <li v-for="(item, index) in rejected" :key="index">
+                <span v-if="item.name" class="notice__name">{{ item.name }}:</span> {{ item.reason }}
+              </li>
+            </ul>
+          </div>
+          <button type="button" class="notice__close" aria-label="Скрыть сообщение" @click="rejected = []">
+            <X :size="14" aria-hidden="true" />
+          </button>
+        </div>
+      </div>
       <ul v-if="files.length" class="files" aria-label="Приложенные файлы" data-testid="composer-files">
         <li v-for="(file, index) in files" :key="`${index}:${file.name}`" class="file">
           <span class="file__name" :title="file.name">{{ file.name }}</span>
@@ -243,7 +267,7 @@ function send(): void {
             class="voice"
             :disabled="busy || disabled"
             aria-label="Приложить текстовый файл"
-            title="Приложить текстовый файл"
+            title="Приложить текстовый файл до 1 МБ"
             data-testid="composer-attach"
             @click="fileInput?.click()"
           >
@@ -282,10 +306,6 @@ function send(): void {
           </template>
         </div>
       </div>
-      <p v-if="fileError" class="voice-error" role="alert" data-testid="composer-file-error">
-        {{ fileError }}
-        <button type="button" class="voice-error__close" aria-label="Скрыть" @click="fileError = ''">×</button>
-      </p>
       <p v-if="voiceError" class="voice-error" role="alert" data-testid="voice-error">
         {{ voiceError }}
         <button type="button" class="voice-error__close" aria-label="Скрыть" @click="voiceError = ''">×</button>
@@ -321,6 +341,85 @@ function send(): void {
 .composer--drop {
   outline: 2px dashed var(--link);
   outline-offset: -4px;
+}
+
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 8px;
+  padding: 8px 6px 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+  color: var(--text);
+  font-size: 0.8rem;
+  line-height: 1.4;
+  animation: notice-in 160ms ease-out;
+}
+
+.notice__icon {
+  flex: none;
+  margin-top: 1px;
+  color: var(--danger);
+}
+
+.notice__body {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.notice__title {
+  margin: 0;
+  font-weight: 600;
+}
+
+.notice__text,
+.notice__list {
+  margin: 2px 0 0;
+  color: var(--text-muted);
+}
+
+.notice__list {
+  padding-left: 0;
+  list-style: none;
+}
+
+.notice__name {
+  color: var(--text);
+}
+
+.notice__list li + li {
+  margin-top: 2px;
+}
+
+.notice__close {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin: -4px 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.notice__close:hover {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--text);
+}
+
+@keyframes notice-in {
+  from { opacity: 0; transform: translateY(-2px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .notice { animation: none; }
 }
 
 .files {

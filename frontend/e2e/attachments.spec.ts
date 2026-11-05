@@ -68,3 +68,31 @@ test("text files are attached, sent with the message and shown as chips", async 
   await expect(page.getByText("<attachment", { exact: false })).toHaveCount(0);
   await expectNoHorizontalOverflow(page);
 });
+
+test("refused files show an inline notice with the reason, inside the composer", async ({ page }, testInfo) => {
+  await openApp(page, testInfo);
+  await ensureLeftPanelOpen(page);
+  await page.locator('[data-node-key="n:s1"]').click();
+  await expect(page.getByTestId("composer-input")).toBeVisible();
+
+  await page.getByTestId("composer-file-input").setInputFiles([
+    { name: "photo.png", mimeType: "image/png", buffer: Buffer.from([0x89, 0x50, 0x00, 0x47]) },
+    { name: longName, mimeType: "text/plain", buffer: Buffer.alloc(3 * 1024 * 1024, 0x61) },
+    { name: "notes.md", mimeType: "text/markdown", buffer: Buffer.from("# ok") },
+  ]);
+  const notice = page.getByTestId("composer-file-error");
+  await expect(notice).toBeVisible();
+  await expect(notice.locator("li")).toHaveText([
+    "photo.png: Это не текстовый файл. Сейчас можно приложить только текст: код, Markdown, логи, CSV.",
+    `${longName}: Размер 3 МБ, а можно до 1 МБ. Разделите файл на части.`,
+  ]);
+  await expect(page.getByTestId("composer-files").locator(".file")).toHaveCount(1);
+  const composer = await page.getByTestId("composer").boundingBox();
+  const box = await notice.boundingBox();
+  expect(box && composer && box.x >= composer.x && box.x + box.width <= composer.x + composer.width + 1).toBe(true);
+  await expectNoHorizontalOverflow(page);
+  await page.getByTestId("composer").screenshot({ path: testInfo.outputPath("notice.png") });
+
+  await page.getByRole("button", { name: "Скрыть сообщение" }).click();
+  await expect(notice).toHaveCount(0);
+});
