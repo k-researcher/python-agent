@@ -74,4 +74,20 @@ describe("ReasoningBlock", () => {
       mount(ReasoningBlock, { props: { text: "abcde" } }).get('[data-testid="reasoning-toggle"]').text(),
     ).toContain("5 символов");
   });
+
+  it("shows tokens and speed next to the characters, with ≈ for an estimate", () => {
+    const live = mount(ReasoningBlock, {
+      props: { text: "x".repeat(1240), streaming: true, stats: { tokens: 410, exact: false, seconds: 20 } },
+    });
+    const toggle = live.get('[data-testid="reasoning-toggle"]');
+    expect(toggle.text().replace(/\s+/g, " ")).toContain("1 240 символов · ≈410 токенов · 21 ток/с");
+    expect(toggle.attributes("title")).toContain("оценка");
+
+    const done = mount(ReasoningBlock, {
+      props: { text: "x".repeat(21), streaming: false, stats: { tokens: 21, exact: true, seconds: 0.1 } },
+    });
+    const label = done.get('[data-testid="reasoning-toggle"]');
+    expect(label.text()).toBe("▸Рассуждения · 21 символ · 21 токен");
+    expect(label.attributes("title")).toBeUndefined();
+  });
 });

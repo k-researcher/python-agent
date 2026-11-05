@@ -5,7 +5,13 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
-from agent.llm import LLMResponse, error_for, stream_error_info, token_count
+from agent.llm import (
+    LLMResponse,
+    error_for,
+    reasoning_token_count,
+    stream_error_info,
+    token_count,
+)
 from agent.llm_errors import LLMErrorKind, ProviderErrorInfo
 from agent.reasoning_tags import Part, ReasoningTagSplitter
 from agent.response_validation import calls_validated, envelope, finish, invalid, usable
@@ -313,4 +319,5 @@ class ChatStreamAccumulator:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             reasoning=reasoning,
+            reasoning_tokens=reasoning_token_count(usage),
         )

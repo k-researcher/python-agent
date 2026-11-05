@@ -150,6 +150,7 @@ export const useAppStore = defineStore("app", () => {
       reasoning_effort: input.reasoning_effort,
       title: input.title,
       auto_start: input.auto_start,
+      ...(input.attachments?.length ? { attachments: input.attachments } : {}),
     });
     if (expectedGeneration === generation) await loadSessions();
     return session;

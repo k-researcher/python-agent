@@ -3,13 +3,23 @@
 
 export type ChatRole = "user" | "assistant";
 
+/** Reasoning tokens (exact from the provider, else an estimate) and the reasoning time. */
+export interface ReasoningStats {
+  tokens: number | null;
+  exact: boolean;
+  seconds: number | null;
+}
+
 /** One chat message as rendered by MessageItem. */
 export interface ChatMessage {
   id: string;
   role: ChatRole;
+  // User message with files: only the typed text; the files are listed in ``attachments``.
   content: string;
+  attachments?: { name: string; size: number }[];
   reasoning_content: string | null;
   reasoning_effort: string | null;
+  reasoning_stats?: ReasoningStats | null;
   created_at: string;
   kind: ChatRole;
 }
@@ -65,12 +75,20 @@ export type TimelineItem =
   | { kind: "assistant"; message: ChatMessage }
   | { kind: "tool"; call: ToolCallView }
   | { kind: "summary"; message: ChatMessage }
-  | { kind: "streaming"; content: string; reasoning: string };
+  | { kind: "streaming"; content: string; reasoning: string; stats?: ReasoningStats };
 
 /** Payload of the Composer `send` event. */
+/** A text file attached in the composer. */
+export interface AttachedFile {
+  name: string;
+  text: string;
+  size: number;
+}
+
 export interface SendPayload {
   text: string;
   effort: string;
+  files: AttachedFile[];
 }
 
 /** Payload of the ToolCallCard / ApprovalInline `reject` event. */

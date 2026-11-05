@@ -59,7 +59,16 @@ def lower_effort(model: ResolvedModel, effort: str | None) -> str | None:
     return allowed[-1] if allowed else None
 
 
+def _raise(model: ResolvedModel, level: str, steps: int) -> str:
+    """Return the allowed level ``steps`` positions above ``level``, at most the highest."""
+    allowed = [effort for effort in EFFORT_ORDER if effort in model.reasoning.allowed_efforts]
+    return allowed[min(allowed.index(level) + steps, len(allowed) - 1)]
+
+
 def _auto(model: ResolvedModel, mode: str, task_chars: int, recent_errors: int) -> tuple[str, str]:
+    default = model.reasoning.default_effort
+    if default is not None and default != "none":
+        return _auto_from_default(model, default, task_chars, recent_errors)
     level = "low" if tool_profile(mode) == "ask" else "medium"
     reason = f"mode {mode}"
     if task_chars >= LONG_TASK_CHARS:
@@ -72,6 +81,26 @@ def _auto(model: ResolvedModel, mode: str, task_chars: int, recent_errors: int) 
     return _nearest(model, level) or level, reason
 
 
+def _auto_from_default(
+    model: ResolvedModel, default: str, task_chars: int, recent_errors: int
+) -> tuple[str, str]:
+    """Start from the level that the model declares as its default and raise it step by step.
+
+    A model default is a measured choice for that model, so a long task or a failed step
+    only moves to the next allowed level instead of a fixed high one.
+    """
+    if recent_errors >= 2:
+        return _raise(model, default, len(EFFORT_ORDER)), "two failed steps in a row"
+    steps = int(task_chars >= LONG_TASK_CHARS) + int(recent_errors == 1)
+    if recent_errors == 1:
+        reason = "one failed step"
+    elif steps:
+        reason = "long task"
+    else:
+        reason = "model default"
+    return _raise(model, default, steps), reason
+
+
 def decide(
     model: ResolvedModel,
     *,
@@ -80,11 +109,15 @@ def decide(
     mode: str,
     task_chars: int = 0,
     recent_errors: int = 0,
+    turn_effort: str | None = None,
 ) -> ReasoningDecision:
     """Message override, then the session level, then the model default.
 
-    "auto" selects a level from the mode, the task size and recent tool errors. The same
-    interface will later take a decision from the decision layer (Jev).
+    "auto" starts from the model default or, without one, from the mode; a long task and
+    recent tool errors raise the level. Within one
+    turn it does not go below ``turn_effort``, the highest level already sent in the turn:
+    each change of the level makes the provider read the prompt prefix again without the
+    cache. The same interface will later take a decision from the decision layer (Jev).
     """
     if not model.reasoning.supported:
         return ReasoningDecision(None, None, "none", "model has no reasoning control")
@@ -92,6 +125,12 @@ def decide(
     source: Source = "message" if message_effort else "session" if session_effort else "model"
     if requested == AUTO:
         effective, reason = _auto(model, mode, task_chars, recent_errors)
+        if (
+            turn_effort in model.reasoning.allowed_efforts
+            and turn_effort in EFFORT_ORDER
+            and EFFORT_ORDER.index(turn_effort) > EFFORT_ORDER.index(effective)
+        ):
+            effective, reason = turn_effort, "level kept for this turn"
         return ReasoningDecision(AUTO, effective, "auto", reason)
     if requested and requested in model.reasoning.allowed_efforts:
         return ReasoningDecision(requested, requested, source, f"{source} setting")

@@ -97,7 +97,7 @@ describe("SessionView", () => {
     expect(wrapper.text()).toContain("готово");
     expect(wrapper.get('[data-testid="session-model-unavailable"]').text()).toContain("История сохранена");
     expect(wrapper.get('[data-testid="composer-send"]').attributes("disabled")).toBeDefined();
-    wrapper.findComponent({ name: "Composer" }).vm.$emit("send", { text: "draft", effort: "auto" });
+    wrapper.findComponent({ name: "Composer" }).vm.$emit("send", { text: "draft", effort: "auto", files: [] });
     await flushPromises();
     expect(send).not.toHaveBeenCalled();
   });
@@ -261,7 +261,7 @@ describe("SessionView", () => {
     await wrapper.get('[data-testid="composer-input"]').trigger("keydown", { key: "Enter" });
     await flushPromises();
 
-    expect(sendSpy).toHaveBeenCalledWith("продолжим", undefined);
+    expect(sendSpy).toHaveBeenCalledWith("продолжим", undefined, []);
   });
 
   it("calls stop when the Composer emits stop", async () => {
@@ -366,7 +366,7 @@ describe("SessionView", () => {
     await wrapper.get('[data-testid="composer-input"]').trigger("keydown", { key: "Enter" });
     await flushPromises();
 
-    expect(sendSpy).toHaveBeenCalledWith("не потерять текст", undefined);
+    expect(sendSpy).toHaveBeenCalledWith("не потерять текст", undefined, []);
     expect(wrapper.get('[data-testid="send-error"]').text()).toContain("send failed");
     // The lost text is restored into the composer.
     expect(

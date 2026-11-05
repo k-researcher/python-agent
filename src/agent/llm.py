@@ -154,6 +154,8 @@ class LLMResponse:
     prompt_tokens: int | None
     completion_tokens: int | None
     reasoning: str | None = None
+    # Reasoning part of completion_tokens when the provider reports it.
+    reasoning_tokens: int | None = None
     # Diagnostic fragments only; never eligible for tool execution.
     interrupted_tool_calls: list[dict[str, Any]] | None = None
 
@@ -922,8 +924,15 @@ class LLMClient:
             prompt_tokens=token_count(usage, "prompt_tokens"),
             completion_tokens=token_count(usage, "completion_tokens"),
             reasoning=reasoning if isinstance(reasoning, str) else None,
+            reasoning_tokens=reasoning_token_count(usage),
             interrupted_tool_calls=message.get("tool_calls") if reason == "length" else None,
         )
+
+
+def reasoning_token_count(usage: Any) -> int | None:
+    """Return the reported reasoning tokens from ``completion_tokens_details``, if any."""
+    details = usage.get("completion_tokens_details") if isinstance(usage, dict) else None
+    return token_count(details, "reasoning_tokens")
 
 
 def token_count(usage: Any, name: str) -> int | None:

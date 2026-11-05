@@ -4,8 +4,9 @@ import pytest
 
 from agent.context import ContextManager
 from agent.model_config import ReasoningSpec, ResolvedModel
-from agent.models import Message
+from agent.models import Message, Session
 from agent.reasoning import AUTO, decide, validate_effort, wire_parameters
+from agent.runtime import AgentSupervisor
 
 
 def model(
@@ -44,21 +45,100 @@ def test_message_beats_session_beats_model() -> None:
     assert (chosen.effective, chosen.source) == ("medium", "model")
 
 
-def test_auto_uses_mode_size_and_errors() -> None:
-    assert decide(FULL, message_effort=AUTO, session_effort=None, mode="ask").effective == "low"
-    assert decide(FULL, message_effort=AUTO, session_effort=None, mode="dev").effective == "medium"
-    long_task = decide(FULL, message_effort=AUTO, session_effort=None, mode="dev", task_chars=9000)
-    assert long_task.effective == "high"
-    one_error = decide(FULL, message_effort=AUTO, session_effort=None, mode="dev", recent_errors=1)
-    assert one_error.effective == "high"
-    two_errors = decide(FULL, message_effort=AUTO, session_effort=None, mode="ask", recent_errors=2)
-    assert two_errors.effective == "max"
+LEVELS = ["none", "minimal", "low", "medium", "high", "max"]
+MEASURED = model(["none", "minimal", "low", "high", "max"], "minimal")
+
+
+@pytest.mark.parametrize(
+    "plain", [model(["none", "low", "medium", "high", "max"], None), model(LEVELS, "none")]
+)
+def test_auto_without_a_model_default_uses_mode_size_and_errors(plain: ResolvedModel) -> None:
+    def auto(mode: str, task_chars: int = 0, recent_errors: int = 0) -> str | None:
+        chosen = decide(
+            plain,
+            message_effort=AUTO,
+            session_effort=None,
+            mode=mode,
+            task_chars=task_chars,
+            recent_errors=recent_errors,
+        )
+        return chosen.effective
+
+    assert auto("ask") == "low"
+    assert auto("dev") == "medium"
+    assert auto("dev", task_chars=9000) == "high"
+    assert auto("dev", recent_errors=1) == "high"
+    assert auto("ask", recent_errors=2) == "max"
+
+
+def test_auto_starts_from_the_model_default_and_raises_it_step_by_step() -> None:
+    def auto(mode: str, task_chars: int = 0, recent_errors: int = 0) -> tuple[str | None, str]:
+        chosen = decide(
+            MEASURED,
+            message_effort=AUTO,
+            session_effort=None,
+            mode=mode,
+            task_chars=task_chars,
+            recent_errors=recent_errors,
+        )
+        return chosen.effective, chosen.reason
+
+    assert auto("ask") == ("minimal", "model default")
+    assert auto("dev") == ("minimal", "model default")
+    assert auto("dev", task_chars=9000) == ("low", "long task")
+    assert auto("dev", recent_errors=1) == ("low", "one failed step")
+    assert auto("dev", task_chars=9000, recent_errors=1) == ("high", "one failed step")
+    assert auto("ask", recent_errors=2) == ("max", "two failed steps in a row")
 
 
 def test_auto_picks_the_nearest_allowed_level() -> None:
     chosen = decide(ON_OFF, message_effort=AUTO, session_effort=None, mode="ask")
     assert chosen.effective in ON_OFF.reasoning.allowed_efforts
     assert chosen.source == "auto"
+
+
+def test_auto_does_not_go_back_down_within_a_turn() -> None:
+    kept = decide(FULL, message_effort=AUTO, session_effort=None, mode="dev", turn_effort="high")
+    assert (kept.effective, kept.source) == ("high", "auto")
+    raised = decide(
+        FULL,
+        message_effort=AUTO,
+        session_effort=None,
+        mode="dev",
+        recent_errors=2,
+        turn_effort="high",
+    )
+    assert raised.effective == "max"
+    lower = decide(FULL, message_effort=AUTO, session_effort=None, mode="dev", turn_effort="low")
+    assert lower.effective == "medium"
+    unknown = decide(
+        FULL, message_effort=AUTO, session_effort=None, mode="dev", turn_effort="xhigh"
+    )
+    assert unknown.effective == "medium"
+    fixed = decide(FULL, message_effort="low", session_effort=None, mode="dev", turn_effort="max")
+    assert fixed.effective == "low"
+
+
+def turn_message(role: str, effort: str | None = None, **fields: object) -> Message:
+    return Message(role=role, kind="normal", skipped=False, reasoning_effort=effort, **fields)
+
+
+def test_a_successful_step_keeps_the_raised_auto_level_until_the_next_message() -> None:
+    call = [{"id": "c", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]
+    session = Session(mode="dev", configuration={})
+    session.messages = [
+        turn_message("user", AUTO, content="first task"),
+        turn_message("assistant", "max", content="done"),
+        turn_message("user", AUTO, content="second task"),
+        turn_message("assistant", "medium", tool_calls=call),
+        turn_message("tool", content='{"success": false}', tool_call_id="c"),
+        turn_message("assistant", "high", tool_calls=call),
+        turn_message("tool", content='{"success": true}', tool_call_id="c"),
+    ]
+    assert AgentSupervisor._reasoning_for(session, FULL).effective == "high"
+
+    session.messages = [*session.messages, turn_message("user", AUTO, content="third task")]
+    assert AgentSupervisor._reasoning_for(session, FULL).effective == "medium"
 
 
 def test_validate_effort() -> None:

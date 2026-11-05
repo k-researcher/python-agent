@@ -238,6 +238,11 @@ class Message(Base):
     reasoning_content: Mapped[str | None] = mapped_column(Text, nullable=True)
     # User message: the requested level ("auto" or an effort). Assistant: the level sent.
     reasoning_effort: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # User message with files: the end of the typed text and the file names and sizes; the file
+    # texts themselves are in the content (see agent.attachments).
+    attachments: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Assistant message with reasoning: {"tokens", "exact", "seconds"} (see ReasoningStats).
+    reasoning_stats: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     # Summary checkpoint only: the last covered source message ID (inclusive), the hash of
     # the covered source, the checkpoint format version and the model profile (None: local).
     covers_until: Mapped[int | None] = mapped_column(Integer, nullable=True)

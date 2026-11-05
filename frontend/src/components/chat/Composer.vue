@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from "vue";
-import type { SendPayload } from "./types";
+import type { AttachedFile, SendPayload } from "./types";
 import { reasoningLabel } from "./reasoning";
 import { draftGeneration, readDraft, writeDraft } from "../../draftStorage";
-import { Mic } from "lucide-vue-next";
+import { CircleAlert, Mic, Paperclip, X } from "lucide-vue-next";
+import { addFiles, formatSize, type Rejection } from "./attachments";
 import { transcribe } from "../../api/speech";
 import { insertText, useVoiceInput } from "./voice";
 
@@ -50,7 +51,54 @@ function resolveControlsHost(): void {
 onMounted(resolveControlsHost);
 watch(() => props.controlsTarget, resolveControlsHost, { flush: "post" });
 
-const canSend = computed(() => text.value.trim().length > 0);
+const files = ref<AttachedFile[]>([]);
+const rejected = ref<Rejection[]>([]);
+const fileInput = ref<HTMLInputElement | null>(null);
+const dragging = ref(false);
+
+const canSend = computed(() => text.value.trim().length > 0 || files.value.length > 0);
+
+async function attach(list: Iterable<File>): Promise<void> {
+  const result = await addFiles(files.value, list);
+  files.value = result.files;
+  rejected.value = result.rejected;
+}
+
+// One file gets its name in the title; several files are listed with their reasons.
+const rejectedTitle = computed(() => {
+  const [first] = rejected.value;
+  return rejected.value.length === 1 && first?.name ? `Не удалось приложить ${first.name}` : "Не все файлы приложены";
+});
+
+function onFileChosen(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  void attach(Array.from(input.files ?? []));
+  input.value = "";
+}
+
+function onPaste(event: ClipboardEvent): void {
+  const pasted = Array.from(event.clipboardData?.files ?? []);
+  if (!pasted.length) return;
+  event.preventDefault();
+  void attach(pasted);
+}
+
+function onDrop(event: DragEvent): void {
+  dragging.value = false;
+  if (props.busy || props.disabled) return;
+  void attach(Array.from(event.dataTransfer?.files ?? []));
+}
+
+function removeFile(index: number): void {
+  files.value = files.value.filter((_, position) => position !== index);
+}
+
+/** Put the files back after a failed send; the text comes back through the draft. */
+function restoreFiles(restored: AttachedFile[]): void {
+  files.value = restored;
+}
+
+defineExpose({ restoreFiles });
 
 watch(
   () => props.draftKey,
@@ -123,16 +171,59 @@ const recordTime = computed(() => {
 
 function send(): void {
   const content = text.value.trim();
-  if (!content || props.busy || props.disabled) return;
-  emit("send", { text: content, effort: effort.value });
+  if ((!content && !files.value.length) || props.busy || props.disabled) return;
+  emit("send", { text: content, effort: effort.value, files: files.value });
   text.value = "";
+  files.value = [];
+  rejected.value = [];
   void nextTick(resize);
 }
 </script>
 
 <template>
-  <div class="composer" :aria-busy="busy" data-testid="composer">
+  <div
+    class="composer"
+    :class="{ 'composer--drop': dragging }"
+    :aria-busy="busy"
+    data-testid="composer"
+    @dragover.prevent="dragging = !busy && !disabled"
+    @dragleave="dragging = false"
+    @drop.prevent="onDrop"
+  >
     <div class="input-container">
+      <!-- The live region stays in the page, so screen readers announce the notice when it appears. -->
+      <div role="status" aria-live="polite">
+        <div v-if="rejected.length" class="notice" data-testid="composer-file-error">
+          <CircleAlert :size="16" class="notice__icon" aria-hidden="true" />
+          <div class="notice__body">
+            <p class="notice__title">{{ rejectedTitle }}</p>
+            <p v-if="rejected.length === 1 && rejected[0]?.name" class="notice__text">{{ rejected[0]?.reason }}</p>
+            <ul v-else class="notice__list">
+              <li v-for="(item, index) in rejected" :key="index">
+                <span v-if="item.name" class="notice__name">{{ item.name }}:</span> {{ item.reason }}
+              </li>
+            </ul>
+          </div>
+          <button type="button" class="notice__close" aria-label="Скрыть сообщение" @click="rejected = []">
+            <X :size="14" aria-hidden="true" />
+          </button>
+        </div>
+      </div>
+      <ul v-if="files.length" class="files" aria-label="Приложенные файлы" data-testid="composer-files">
+        <li v-for="(file, index) in files" :key="`${index}:${file.name}`" class="file">
+          <span class="file__name" :title="file.name">{{ file.name }}</span>
+          <span class="file__size">{{ formatSize(file.size) }}</span>
+          <button
+            type="button"
+            class="file__remove"
+            :aria-label="`Убрать файл ${file.name}`"
+            :disabled="busy"
+            @click="removeFile(index)"
+          >
+            <X :size="12" aria-hidden="true" />
+          </button>
+        </li>
+      </ul>
       <div class="input-row">
         <textarea
           ref="textarea"
@@ -143,6 +234,7 @@ function send(): void {
           data-testid="composer-input"
           @input="resize"
           @keydown="onKeydown"
+          @paste="onPaste"
         />
         <div class="actions">
           <template v-if="voiceState === 'recording' || voiceState === 'transcribing'">
@@ -162,6 +254,25 @@ function send(): void {
             </button>
           </template>
           <template v-else>
+          <input
+            ref="fileInput"
+            type="file"
+            multiple
+            hidden
+            data-testid="composer-file-input"
+            @change="onFileChosen"
+          />
+          <button
+            type="button"
+            class="voice"
+            :disabled="busy || disabled"
+            aria-label="Приложить текстовый файл"
+            title="Приложить текстовый файл до 1 МБ"
+            data-testid="composer-attach"
+            @click="fileInput?.click()"
+          >
+            <Paperclip :size="16" aria-hidden="true" />
+          </button>
           <button
             type="button"
             class="voice"
@@ -225,6 +336,138 @@ function send(): void {
 
 .input-container {
   width: 100%;
+}
+
+.composer--drop {
+  outline: 2px dashed var(--link);
+  outline-offset: -4px;
+}
+
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 8px;
+  padding: 8px 6px 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+  color: var(--text);
+  font-size: 0.8rem;
+  line-height: 1.4;
+  animation: notice-in 160ms ease-out;
+}
+
+.notice__icon {
+  flex: none;
+  margin-top: 1px;
+  color: var(--danger);
+}
+
+.notice__body {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.notice__title {
+  margin: 0;
+  font-weight: 600;
+}
+
+.notice__text,
+.notice__list {
+  margin: 2px 0 0;
+  color: var(--text-muted);
+}
+
+.notice__list {
+  padding-left: 0;
+  list-style: none;
+}
+
+.notice__name {
+  color: var(--text);
+}
+
+.notice__list li + li {
+  margin-top: 2px;
+}
+
+.notice__close {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin: -4px 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.notice__close:hover {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--text);
+}
+
+@keyframes notice-in {
+  from { opacity: 0; transform: translateY(-2px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .notice { animation: none; }
+}
+
+.files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 6px;
+  padding: 0;
+  list-style: none;
+}
+
+.file {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 0 4px 0 8px;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  font-size: 0.75rem;
+}
+
+.file__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file__size {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+button.file__remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
 }
 
 .input-row {

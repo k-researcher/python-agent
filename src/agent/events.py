@@ -191,6 +191,9 @@ class StreamPublisher:
 
     The publisher joins fragments for up to 50 ms or 8 KiB. It does not write rows to the
     events table: a client that misses deltas reads the saved message after the step.
+    Each delta carries ``fragments``: the fragments of its kind received so far. An
+    OpenAI-compatible stream usually sends one token per fragment, so the UI shows the
+    number as an estimate of the tokens.
     """
 
     FLUSH_SECONDS = 0.05
@@ -212,6 +215,20 @@ class StreamPublisher:
         self._pending: dict[str, list[str]] = {}
         self._size = 0
         self._last_flush = asyncio.get_running_loop().time()
+        self._fragments: dict[str, int] = {}
+        self._reasoning_span: tuple[float, float] | None = None
+
+    @property
+    def reasoning_fragments(self) -> int:
+        return self._fragments.get("reasoning", 0)
+
+    @property
+    def reasoning_seconds(self) -> float | None:
+        """Time from the first to the last reasoning fragment."""
+        if self._reasoning_span is None:
+            return None
+        first, last = self._reasoning_span
+        return round(last - first, 2)
 
     def close(self) -> None:
         self.closed = True
@@ -230,7 +247,11 @@ class StreamPublisher:
             return
         self._pending.setdefault(kind, []).append(text)
         self._size += len(text)
+        self._fragments[kind] = self._fragments.get(kind, 0) + 1
         now = asyncio.get_running_loop().time()
+        if kind == "reasoning":
+            first = self._reasoning_span[0] if self._reasoning_span else now
+            self._reasoning_span = (first, now)
         if self._size >= self.FLUSH_BYTES or now - self._last_flush >= self.FLUSH_SECONDS:
             await self.flush()
 
@@ -252,6 +273,7 @@ class StreamPublisher:
                         **self.identity,
                         "seq": self._seq,
                         "delta": "".join(parts),
+                        "fragments": self._fragments.get(kind, 0),
                     },
                 }
             )

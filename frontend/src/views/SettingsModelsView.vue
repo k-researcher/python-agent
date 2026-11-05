@@ -523,15 +523,15 @@ onMounted(() => { void load(); void scan(); });
             или Ollama и нажмите «Искать снова».
           </p>
           <ul v-else-if="localServers" class="local__list">
-            <li v-for="server in localServers" :key="server.base_url" class="found__row" :data-local="server.base_url">
+            <li v-for="server in localServers" :key="server.base_url" class="local__row" :data-local="server.base_url">
               <span>{{ SERVER_NAMES[server.server] }}</span>
               <span class="mono muted small">{{ server.base_url }}</span>
               <span class="muted small">моделей: {{ server.models }}</span>
-              <span v-if="server.provider" class="muted small found__state">Подключён как {{ server.provider }}</span>
+              <span v-if="server.provider" class="muted small local__action">Подключён как {{ server.provider }}</span>
               <button
                 v-else
                 type="button"
-                class="ghost found__state"
+                class="ghost local__action"
                 :disabled="!!busy"
                 data-testid="local-connect"
                 @click="connectLocal(server)"
@@ -595,6 +595,7 @@ onMounted(() => { void load(); void scan(); });
               <strong>{{ item.id }}</strong>
               <span class="mono muted">{{ item.base_url }}</span>
               <span class="muted small">{{ keyStatus(item) }} · {{ originLabel(item.origin, item.has_base) }}</span>
+              <button v-if="item.has_base && item.origin === 'ui'" type="button" class="link small card__link" :disabled="!!busy" data-testid="provider-reset" @click="resetProvider(item.id)">Сбросить изменения</button>
               <span v-if="item.key_source" class="muted small" data-testid="provider-key-origin">
                 Источник ключа: {{ item.key_source === 'ui' ? 'сохранён в приложении' : item.key_source === 'env' ? 'окружение' : 'без ключа' }}
               </span>
@@ -618,10 +619,9 @@ onMounted(() => { void load(); void scan(); });
                 @click="addresses[item.id] = item.base_url"
               >Изменить адрес</button>
               <button type="button" class="ghost" :disabled="!!busy" data-testid="provider-edit-key" @click="editKey(item)">Изменить ключ</button>
-              <button type="button" class="ghost" :disabled="!!busy" data-testid="provider-toggle" @click="toggleProvider(item)">
+              <button type="button" class="ghost toggle" :disabled="!!busy" data-testid="provider-toggle" @click="toggleProvider(item)">
                 {{ item.disabled ? "Включить" : "Отключить" }}
               </button>
-              <button v-if="item.has_base && item.origin === 'ui'" type="button" class="ghost" :disabled="!!busy" data-testid="provider-reset" @click="resetProvider(item.id)">Сбросить изменения</button>
               <button
                 type="button"
                 class="ghost danger"
@@ -736,6 +736,7 @@ onMounted(() => { void load(); void scan(); });
               <span class="muted small">
                 <span class="mono">{{ item.model }}</span> · {{ item.provider }} · {{ originLabel(item.origin, item.has_base) }}
               </span>
+              <button v-if="item.has_base && item.origin === 'ui'" type="button" class="link small card__link" :disabled="!!busy" data-testid="model-reset" @click="resetModel(item.id)">Сбросить изменения</button>
               <span v-if="item.provider_disabled" class="small muted" data-testid="model-provider-off">Сервер отключён</span>
               <span class="small muted" data-testid="model-price">{{ priceLabel(item) }}</span>
               <span v-if="!item.pricing && costLimit" class="small bad" data-testid="model-price-warning">
@@ -766,14 +767,13 @@ onMounted(() => { void load(); void scan(); });
               >Проверить ответ</button>
               <button
                 type="button"
-                class="ghost"
+                class="ghost toggle"
                 :disabled="!!busy"
                 data-testid="model-toggle"
                 @click="toggleModel(item)"
               >
                 {{ item.disabled ? "Включить" : "Отключить" }}
               </button>
-              <button v-if="item.has_base && item.origin === 'ui'" type="button" class="ghost" :disabled="!!busy" data-testid="model-reset" @click="resetModel(item.id)">Сбросить изменения</button>
               <button
                 type="button"
                 class="ghost danger"
@@ -977,9 +977,17 @@ h2 {
 }
 
 /* Dim the details of a switched off item, but keep its buttons readable. */
-.card--off .card__main,
+.card--off .card__main > :not(.card__link),
 .card--off .limits {
   opacity: 0.6;
+}
+
+/* An optional action sits under the label it belongs to, so every card has the same buttons. */
+.card__link {
+  align-self: flex-start;
+  min-height: 0;
+  height: auto;
+  padding: 0;
 }
 
 .card__row {
@@ -998,10 +1006,19 @@ h2 {
   overflow-wrap: anywhere;
 }
 
+/* Buttons keep to the right edge; a wrapped group stays there too. */
 .card__actions {
   display: flex;
   flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
+  margin-left: auto;
+}
+
+/* "Включить" and "Отключить" take the same width, so the next buttons do not move. */
+.toggle {
+  min-width: 7.2em;
+  justify-content: center;
 }
 
 .small {
@@ -1170,6 +1187,40 @@ input.mono {
 }
 
 /* A found model: details on the left, actions in one group on the right. */
+.local {
+  container-type: inline-size;
+}
+
+.local__row {
+  display: grid;
+  grid-template-columns: 8.5rem minmax(0, 1fr) 7rem auto;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 4px 0;
+  overflow-wrap: anywhere;
+}
+
+.local__action {
+  justify-self: end;
+}
+
+/* Narrow card: name and action on the first line, address and count under them. */
+@container (max-width: 520px) {
+  .local__row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .local__row > :nth-child(2),
+  .local__row > :nth-child(3) {
+    grid-column: 1;
+  }
+
+  .local__action {
+    grid-column: 2;
+    grid-row: 1;
+  }
+}
+
 .found__item {
   display: flex;
   flex-wrap: wrap;

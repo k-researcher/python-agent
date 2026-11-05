@@ -69,7 +69,7 @@ from agent.models import (
 )
 from agent.modes import ROLE_PROFILES
 from agent.queue import RedisTaskQueue
-from agent.reasoning import ReasoningDecision, decide, lower_effort
+from agent.reasoning import EFFORT_ORDER, ReasoningDecision, decide, lower_effort
 from agent.response_validation import arguments_object
 from agent.run_finish import finish_run
 from agent.sandbox import policy_from_settings
@@ -148,6 +148,24 @@ CUT_OFF_NOTICE = (
     "использован, инструменты из него не запускались. Сделай шаг меньше: запиши большой файл "
     "по частям (write_file, затем edit_file) или раздели правку на несколько вызовов."
 )
+
+
+def _reasoning_stats(
+    response: LLMResponse, publisher: StreamPublisher | None
+) -> dict[str, Any] | None:
+    """Return the reasoning tokens and duration to store with a reply that has reasoning.
+
+    The provider count is exact; without it the number of stream fragments is an estimate.
+    """
+    if not response.reasoning:
+        return None
+    fragments = publisher.reasoning_fragments if publisher is not None else 0
+    seconds = publisher.reasoning_seconds if publisher is not None else None
+    exact = bool(response.reasoning_tokens)
+    tokens = response.reasoning_tokens if exact else fragments or None
+    if tokens is None and seconds is None:
+        return None
+    return {"tokens": tokens, "exact": exact, "seconds": seconds}
 
 
 def _cut_in_reasoning(response: LLMResponse) -> bool:
@@ -1147,6 +1165,7 @@ class AgentSupervisor:
                         content=response.content,
                         token_count=response.completion_tokens or None,
                         reasoning_content=response.reasoning,
+                        reasoning_stats=_reasoning_stats(response, outcome.publisher),
                         reasoning_effort=reasoning_effort,
                     )
                 )
@@ -1184,6 +1203,7 @@ class AgentSupervisor:
                         tool_calls=[_history_safe_call(c) for c in normalized_calls] or None,
                         token_count=response.completion_tokens or None,
                         reasoning_content=response.reasoning,
+                        reasoning_stats=_reasoning_stats(response, outcome.publisher),
                         reasoning_effort=reasoning_effort,
                     )
                 )
@@ -1225,6 +1245,7 @@ class AgentSupervisor:
                         tool_calls=[_history_safe_call(c) for c in normalized_calls] or None,
                         token_count=response.completion_tokens or None,
                         reasoning_content=response.reasoning,
+                        reasoning_stats=_reasoning_stats(response, outcome.publisher),
                         reasoning_effort=reasoning_effort,
                     )
                 )
@@ -1439,6 +1460,7 @@ class AgentSupervisor:
                     tool_calls=[_history_safe_call(call) for call in normalized_calls] or None,
                     token_count=response.completion_tokens or None,
                     reasoning_content=response.reasoning,
+                    reasoning_stats=_reasoning_stats(response, outcome.publisher),
                     reasoning_effort=reasoning_effort,
                 )
 
@@ -1923,6 +1945,16 @@ class AgentSupervisor:
             if message.kind == "normal" and not message.skipped
         ]
         users = [message for message in messages if message.role == "user"]
+        turn: list[Message] = []
+        for message in reversed(messages):
+            if message.role == "user":
+                break
+            turn.append(message)
+        sent = [
+            message.reasoning_effort
+            for message in turn
+            if message.role == "assistant" and message.reasoning_effort in EFFORT_ORDER
+        ]
         recent_errors = 0
         for message in reversed(messages):
             if message.role != "tool":
@@ -1940,6 +1972,7 @@ class AgentSupervisor:
             mode=session.mode,
             task_chars=len(users[0].content or "") if users else 0,
             recent_errors=recent_errors,
+            turn_effort=max(sent, key=EFFORT_ORDER.index) if sent else None,
         )
 
     def context_for(self, model: ResolvedModel | None = None) -> ContextManager:

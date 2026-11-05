@@ -3,24 +3,22 @@
 // shows an animated "Думаю…" hint and can be expanded to follow the live text.
 
 import { computed, ref, watch } from "vue";
+import { reasoningStatsParts } from "./reasoning";
+import type { ReasoningStats } from "./types";
 
-const props = withDefaults(defineProps<{ text?: string; streaming?: boolean }>(), {
-  text: "",
-  streaming: false,
-});
+const props = withDefaults(
+  defineProps<{ text?: string; streaming?: boolean; stats?: ReasoningStats | null }>(),
+  { text: "", streaming: false, stats: null },
+);
 
 const expanded = ref(false);
 const body = ref<HTMLElement | null>(null);
 // The live text follows the end until the user scrolls up, and again after they scroll back down.
 const followEnd = ref(true);
 
-const charCount = computed(() => props.text.length);
+const countLabel = computed<string>(() => reasoningStatsParts(props.text.length, props.stats).join(" · "));
 
-const countLabel = computed<string>(() => {
-  const count = charCount.value;
-  const suffix = count === 1 ? "символ" : count >= 2 && count <= 4 ? "символа" : "символов";
-  return `${count} ${suffix}`;
-});
+const estimated = computed(() => props.stats?.tokens != null && !props.stats.exact);
 
 function toggle(): void {
   expanded.value = !expanded.value;
@@ -46,6 +44,7 @@ watch(
       type="button"
       class="reasoning-toggle"
       :aria-expanded="expanded"
+      :title="estimated ? '≈ — оценка по фрагментам потока: точное число модель не сообщила' : undefined"
       data-testid="reasoning-toggle"
       @click="toggle"
     >

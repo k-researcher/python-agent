@@ -4,6 +4,7 @@ import { api } from "../api/client";
 import {
   isStreamDeltaEvent,
   type Approval,
+  type AttachmentInput,
   type ContextStats,
   type Message,
   type OutboundAudit,
@@ -19,6 +20,10 @@ import {
 interface StreamingState {
   content: string;
   reasoning: string;
+  // Reasoning fragments so far and the arrival times of the first and the last of them.
+  reasoningFragments?: number;
+  reasoningStartedAt?: number;
+  reasoningAt?: number;
 }
 
 function parseToolResult(content: string | null): ToolResult | null {
@@ -237,11 +242,15 @@ export const useSessionStore = defineStore("session", () => {
     await reloadAll();
   }
 
-  async function send(content: string, reasoningEffort?: string): Promise<void> {
+  async function send(
+    content: string,
+    reasoningEffort?: string,
+    attachments: AttachmentInput[] = [],
+  ): Promise<void> {
     const id = sessionId.value;
     const gen = generation;
     if (id == null) throw new Error("Нет открытой сессии");
-    const created = await api.sendMessage(id, content, reasoningEffort);
+    const created = await api.sendMessage(id, content, reasoningEffort, attachments);
     if (!isCurrent(id, gen)) return;
     resetStream();
     // A `message.created` WS event may already have reloaded the list (including the
@@ -337,6 +346,10 @@ export const useSessionStore = defineStore("session", () => {
     } else if (seq == null || seq > reasoningSeq) {
       if (seq != null) reasoningSeq = seq;
       current.reasoning += delta;
+      if (typeof payload.fragments === "number") current.reasoningFragments = payload.fragments;
+      const now = Date.now();
+      current.reasoningStartedAt ??= now;
+      current.reasoningAt = now;
     }
     streaming.value = current;
   }
@@ -434,7 +447,10 @@ export const useSessionStore = defineStore("session", () => {
     }
     const stream = streaming.value;
     if (stream && (stream.content !== "" || stream.reasoning !== "")) {
-      items.push({ kind: "streaming", content: stream.content, reasoning: stream.reasoning });
+      const started = stream.reasoningStartedAt;
+      const seconds = started != null && stream.reasoningAt != null ? (stream.reasoningAt - started) / 1000 : null;
+      const stats = { tokens: stream.reasoningFragments ?? null, exact: false, seconds };
+      items.push({ kind: "streaming", content: stream.content, reasoning: stream.reasoning, stats });
     }
     return items;
   });

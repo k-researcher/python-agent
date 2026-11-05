@@ -11,6 +11,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agent.attachments import check_files, clean_name, compose
 from agent.config import Settings
 from agent.context_summary import language_rule
 from agent.engine_access import require_operator, require_personal_project
@@ -20,7 +21,7 @@ from agent.model_overrides import lock_model_settings
 from agent.model_registry import effective_registry, select_model
 from agent.models import Project, Session, SessionStatus
 from agent.reasoning import validate_effort
-from agent.schemas import SessionBudgetRequest
+from agent.schemas import AttachmentIn, SessionBudgetRequest
 from agent.session_budget import BudgetLimits
 from agent.session_budget_store import (
     budget_limits,
@@ -54,8 +55,11 @@ async def create_session_record(
     created_at: datetime | None = None,
     run_generation: int = 0,
     commit: bool = True,
+    attachments: list[AttachmentIn] | None = None,
 ) -> Session:
     configuration = dict(configuration or {})
+    files = attachments or []
+    window: int | None = None
     engine_state = None
     selected_profile = None
     if engine_profile is not None:
@@ -82,6 +86,9 @@ async def create_session_record(
         model = select_model(await effective_registry(db, settings), llm_profile, role=mode)
         selected_profile = model.id
         validate_effort(model, configuration.get("reasoning_effort"))
+        window = model.context_window
+    check_files(files, window)
+    content, record = compose(prompt, files)
     prompt_file = settings.prompts_dir / f"{mode}.md"
     if not prompt_file.is_file():
         raise ValueError(f"Prompt is missing for mode {mode}")
@@ -113,7 +120,7 @@ async def create_session_record(
         llm_profile=selected_profile,
         engine_profile=engine_profile,
         engine_state=engine_state,
-        title=title or prompt.strip().replace("\n", " ")[:120],
+        title=title or _title(prompt, files),
         status=SessionStatus.pending.value,
         configuration=configuration,
         budget_state=budget_state,
@@ -123,11 +130,17 @@ async def create_session_record(
     await db.flush()
     # Explicit parents: the system prompt is the root, the task is its child.
     await append_message(db, session.id, role="system", content=system_prompt)
-    await append_message(db, session.id, role="user", content=prompt)
+    await append_message(db, session.id, role="user", content=content, attachments=record)
     if commit:
         await db.commit()
         await db.refresh(session)
     return session
+
+
+def _title(prompt: str, files: list[AttachmentIn]) -> str:
+    """Title from the typed text; without text, from the names of the attached files."""
+    text = prompt.strip() or ", ".join(clean_name(item.name) for item in files)
+    return text.replace("\n", " ")[:120]
 
 
 async def _derive_budget(

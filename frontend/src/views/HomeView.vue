@@ -7,6 +7,7 @@ import Composer from "../components/chat/Composer.vue";
 import AgentSettings from "../components/chat/AgentSettings.vue";
 import EmptyState from "../components/chat/EmptyState.vue";
 import type { SendPayload } from "../components/chat/types";
+import { toUpload } from "../components/chat/attachments";
 import { toModelOptions } from "../uiAdapters";
 import { MODE_LABELS, SESSION_MODES, modeLabel } from "../modes";
 import type { SessionMode } from "../modes";
@@ -15,6 +16,7 @@ const appStore = useAppStore();
 const router = useRouter();
 
 const promptDraftKey = ref("draft:new-session");
+const composer = ref<InstanceType<typeof Composer> | null>(null);
 let draftCounter = 0;
 
 const selectedProfileId = computed({
@@ -122,6 +124,7 @@ async function onCreateSession(payload: SendPayload): Promise<void> {
       engine_profile: engineProfile.value ?? undefined,
       reasoning_effort: !engineProfile.value && payload.effort !== "auto" ? payload.effort : undefined,
       auto_start: true,
+      attachments: toUpload(payload.files),
     });
     if (generation !== lifecycleGeneration) return;
     clearDraft();
@@ -131,6 +134,7 @@ async function onCreateSession(payload: SendPayload): Promise<void> {
     error.value = cause instanceof Error ? cause.message : String(cause);
     // Restore the lost text into the composer via a fresh draft key (remount).
     pickRestoredDraftKey(pendingText);
+    composer.value?.restoreFiles(payload.files);
   } finally {
     if (generation === lifecycleGeneration) isCreating.value = false;
   }
@@ -164,6 +168,7 @@ async function onCreateSession(payload: SendPayload): Promise<void> {
     </p>
 
     <Composer
+      ref="composer"
       :busy="isCreating"
       :disabled="!modelAvailable"
       :stoppable="false"
