@@ -20,6 +20,10 @@ import {
 interface StreamingState {
   content: string;
   reasoning: string;
+  // Reasoning fragments so far and the arrival times of the first and the last of them.
+  reasoningFragments?: number;
+  reasoningStartedAt?: number;
+  reasoningAt?: number;
 }
 
 function parseToolResult(content: string | null): ToolResult | null {
@@ -342,6 +346,10 @@ export const useSessionStore = defineStore("session", () => {
     } else if (seq == null || seq > reasoningSeq) {
       if (seq != null) reasoningSeq = seq;
       current.reasoning += delta;
+      if (typeof payload.fragments === "number") current.reasoningFragments = payload.fragments;
+      const now = Date.now();
+      current.reasoningStartedAt ??= now;
+      current.reasoningAt = now;
     }
     streaming.value = current;
   }
@@ -439,7 +447,10 @@ export const useSessionStore = defineStore("session", () => {
     }
     const stream = streaming.value;
     if (stream && (stream.content !== "" || stream.reasoning !== "")) {
-      items.push({ kind: "streaming", content: stream.content, reasoning: stream.reasoning });
+      const started = stream.reasoningStartedAt;
+      const seconds = started != null && stream.reasoningAt != null ? (stream.reasoningAt - started) / 1000 : null;
+      const stats = { tokens: stream.reasoningFragments ?? null, exact: false, seconds };
+      items.push({ kind: "streaming", content: stream.content, reasoning: stream.reasoning, stats });
     }
     return items;
   });

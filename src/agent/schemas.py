@@ -89,6 +89,14 @@ class MessageAttachments(BaseModel):
     files: list[AttachmentFile]
 
 
+class ReasoningStats(BaseModel):
+    # Reasoning tokens: the provider count when "exact", else the number of stream fragments.
+    tokens: int | None
+    exact: bool
+    # Time from the first to the last reasoning fragment; None without a stream.
+    seconds: float | None
+
+
 class SessionCreate(BaseModel):
     project_id: str
     prompt: str = Field(max_length=2_000_000)
@@ -196,6 +204,7 @@ class MessageRead(BaseModel):
     summary_version: int | None
     summary_model: str | None
     attachments: MessageAttachments | None = None
+    reasoning_stats: ReasoningStats | None = None
     created_at: UtcDatetime
 
 

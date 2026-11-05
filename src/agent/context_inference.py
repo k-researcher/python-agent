@@ -716,4 +716,5 @@ def validated_response(response: LLMResponse) -> LLMResponse:
     )
     if response.interrupted_tool_calls is not None:
         result.interrupted_tool_calls = response.interrupted_tool_calls
+    result.reasoning_tokens = response.reasoning_tokens
     return result

@@ -306,6 +306,27 @@ describe("session store applyEvent", () => {
     expect(store.streaming?.reasoning).toBe("r1r2");
   });
 
+  it("counts reasoning fragments and the reasoning time of the live stream", () => {
+    vi.useFakeTimers();
+    try {
+      const store = useSessionStore();
+      store.sessionId = "s1";
+      const reasoning = (seq: number, text: string, fragments: number): ServerEvent => {
+        const event = delta("reasoning.delta", "st1", seq, text);
+        return { ...event, payload: { ...(event.payload as object), fragments } } as ServerEvent;
+      };
+      vi.setSystemTime(10_000);
+      store.applyEvent(reasoning(1, "Счи", 2));
+      vi.setSystemTime(14_000);
+      store.applyEvent(reasoning(2, "таю", 40));
+      store.applyEvent(delta("message.delta", "st1", 3, "ответ"));
+      const live = store.timeline.find((item) => item.kind === "streaming");
+      expect(live).toMatchObject({ reasoning: "Считаю", stats: { tokens: 40, exact: false, seconds: 4 } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("starts a new stream on a different stream_id and drops stale seq from the old one", () => {
     const store = useSessionStore();
     store.sessionId = "s1";

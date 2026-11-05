@@ -784,7 +784,12 @@ async def test_publishers_capture_run_and_monotonic_stream_identity():
                 await first.flush()
                 await first.reset()
                 delta, reset = queue.get_nowait(), queue.get_nowait()
-                assert delta["payload"] == {**first.identity, "seq": 1, "delta": "accepted"}
+                assert delta["payload"] == {
+                    **first.identity,
+                    "seq": 1,
+                    "delta": "accepted",
+                    "fragments": 1,
+                }
                 assert reset["payload"] == {**first.identity, "seq": 2}
                 assert first.generation == 7 and run.number == 2
                 await first.add("content", "late")

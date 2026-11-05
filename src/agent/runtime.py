@@ -150,6 +150,24 @@ CUT_OFF_NOTICE = (
 )
 
 
+def _reasoning_stats(
+    response: LLMResponse, publisher: StreamPublisher | None
+) -> dict[str, Any] | None:
+    """Return the reasoning tokens and duration to store with a reply that has reasoning.
+
+    The provider count is exact; without it the number of stream fragments is an estimate.
+    """
+    if not response.reasoning:
+        return None
+    fragments = publisher.reasoning_fragments if publisher is not None else 0
+    seconds = publisher.reasoning_seconds if publisher is not None else None
+    exact = bool(response.reasoning_tokens)
+    tokens = response.reasoning_tokens if exact else fragments or None
+    if tokens is None and seconds is None:
+        return None
+    return {"tokens": tokens, "exact": exact, "seconds": seconds}
+
+
 def _cut_in_reasoning(response: LLMResponse) -> bool:
     """Tell whether the output limit cut the reply while the model was still reasoning."""
     return (
@@ -1147,6 +1165,7 @@ class AgentSupervisor:
                         content=response.content,
                         token_count=response.completion_tokens or None,
                         reasoning_content=response.reasoning,
+                        reasoning_stats=_reasoning_stats(response, outcome.publisher),
                         reasoning_effort=reasoning_effort,
                     )
                 )
@@ -1184,6 +1203,7 @@ class AgentSupervisor:
                         tool_calls=[_history_safe_call(c) for c in normalized_calls] or None,
                         token_count=response.completion_tokens or None,
                         reasoning_content=response.reasoning,
+                        reasoning_stats=_reasoning_stats(response, outcome.publisher),
                         reasoning_effort=reasoning_effort,
                     )
                 )
@@ -1225,6 +1245,7 @@ class AgentSupervisor:
                         tool_calls=[_history_safe_call(c) for c in normalized_calls] or None,
                         token_count=response.completion_tokens or None,
                         reasoning_content=response.reasoning,
+                        reasoning_stats=_reasoning_stats(response, outcome.publisher),
                         reasoning_effort=reasoning_effort,
                     )
                 )
@@ -1439,6 +1460,7 @@ class AgentSupervisor:
                     tool_calls=[_history_safe_call(call) for call in normalized_calls] or None,
                     token_count=response.completion_tokens or None,
                     reasoning_content=response.reasoning,
+                    reasoning_stats=_reasoning_stats(response, outcome.publisher),
                     reasoning_effort=reasoning_effort,
                 )
 

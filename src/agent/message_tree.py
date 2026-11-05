@@ -441,6 +441,7 @@ async def fork(
             reasoning_content=row.reasoning_content,
             reasoning_effort=row.reasoning_effort,
             attachments=row.attachments,
+            reasoning_stats=row.reasoning_stats,
         )
         db.add(clone)
         await db.flush()

@@ -39,6 +39,7 @@ const effortLabel = computed(() => {
       <ReasoningBlock
         v-if="message.reasoning_content"
         :text="message.reasoning_content"
+        :stats="message.reasoning_stats"
         :streaming="false"
       />
       <div v-if="!isUser" class="meta" data-testid="message-meta">

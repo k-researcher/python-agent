@@ -130,6 +130,7 @@ export interface Message {
   kind: string;
   reasoning_content: string | null;
   reasoning_effort: string | null;
+  reasoning_stats?: ReasoningStats | null;
   // User message with files: the end of the typed text and the file names and sizes.
   attachments?: MessageAttachments | null;
   created_at: string;
@@ -191,11 +192,26 @@ export interface PersistentServerEvent {
  * An ephemeral stream fragment: not stored in the events table. `seq` grows inside a
  * single `stream_id`; a client drops repeats and reorders.
  */
+/** Reasoning tokens (exact from the provider, else an estimate) and the reasoning time. */
+export interface ReasoningStats {
+  tokens: number | null;
+  exact: boolean;
+  seconds: number | null;
+}
+
 export interface StreamDeltaEvent {
   type: "message.delta" | "reasoning.delta" | "stream.reset";
   session_id: string;
   ephemeral: true;
-  payload: { generation?: number; stream_no?: number; stream_id: string; seq?: number; delta?: string };
+  // ``fragments``: the fragments of this kind in the stream so far, an estimate of the tokens.
+  payload: {
+    generation?: number;
+    stream_no?: number;
+    stream_id: string;
+    seq?: number;
+    delta?: string;
+    fragments?: number;
+  };
 }
 
 export type ServerEvent = PersistentServerEvent | StreamDeltaEvent;
@@ -236,7 +252,7 @@ export type TimelineItem =
   | { kind: "assistant"; message: Message }
   | { kind: "tool"; call: ToolCallView }
   | { kind: "summary"; message: Message }
-  | { kind: "streaming"; content: string; reasoning: string };
+  | { kind: "streaming"; content: string; reasoning: string; stats?: ReasoningStats };
 export interface MonitorRow {
   session_id: string;
   parent_id: string | null;

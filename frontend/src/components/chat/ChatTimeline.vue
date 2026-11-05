@@ -117,7 +117,7 @@ function isSummaryOpen(index: number): boolean {
         </div>
 
         <div v-else-if="item.kind === 'streaming'" class="feed-item streaming" data-testid="streaming-item">
-          <ReasoningBlock v-if="item.reasoning" :text="item.reasoning" :streaming="true" />
+          <ReasoningBlock v-if="item.reasoning" :text="item.reasoning" :stats="item.stats" :streaming="true" />
           <MarkdownView v-if="item.content" :source="item.content" />
           <span v-else-if="!item.reasoning" class="streaming-cursor" aria-hidden="true">…</span>
         </div>

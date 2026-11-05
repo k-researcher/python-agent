@@ -137,6 +137,7 @@ export function toChatMessage(message: ApiMessage): ChatMessage {
     ...(record ? { attachments: record.files.map(({ name, size }) => ({ name, size })) } : {}),
     reasoning_content: message.reasoning_content,
     reasoning_effort: message.reasoning_effort,
+    reasoning_stats: message.reasoning_stats ?? null,
     created_at: message.created_at,
     kind: toChatRole(message.kind),
   };
@@ -196,7 +197,7 @@ export function toChatTimelineItems(items: ApiTimelineItem[]): ChatTimelineItem[
       case "summary":
         return { kind: "summary", message: toChatMessage(item.message) };
       case "streaming":
-        return { kind: "streaming", content: item.content, reasoning: item.reasoning };
+        return { kind: "streaming", content: item.content, reasoning: item.reasoning, stats: item.stats };
     }
   });
 }
