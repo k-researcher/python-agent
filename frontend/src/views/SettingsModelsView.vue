@@ -487,6 +487,7 @@ onMounted(() => { void load(); void scan(); });
       <nav class="settings__nav" aria-label="Разделы настроек">
         <RouterLink :to="{ name: 'settings-models' }" aria-current="page">Модели</RouterLink>
         <RouterLink :to="{ name: 'settings-speech' }" data-testid="settings-speech-link">Голос</RouterLink>
+        <RouterLink :to="{ name: 'settings-skills' }" data-testid="settings-skills-link">Навыки</RouterLink>
       </nav>
     </header>
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -122,3 +123,43 @@ async def test_read_skill_does_not_mask_runtime_error(monkeypatch: pytest.Monkey
     with pytest.raises(RuntimeError, match="Unexpected system failure") as caught:
         await tool.execute(context(Path(".")), {"name": "test_skill"})
     assert type(caught.value) is RuntimeError
+
+
+def _skill_with_files(tmp_path: Path) -> SkillSet:
+    project = tmp_path / "project"
+    skill_dir = project / ".agent" / "skills" / "pdf"
+    (skill_dir / "docs").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: pdf\ndescription: PDF\n---\nRead docs/a.md")
+    (skill_dir / "docs" / "a.md").write_text("Page rules", encoding="utf-8")
+    (skill_dir / "binary.bin").write_bytes(b"\xff\xfe")
+    (tmp_path / "secret.txt").write_text("secret", encoding="utf-8")
+    os.symlink(tmp_path / "secret.txt", skill_dir / "link.txt")
+    return load_skill_set(project, None)
+
+
+async def test_read_skill_lists_files_and_reads_one(tmp_path: Path) -> None:
+    tool = ReadSkillTool(_skill_with_files(tmp_path))
+
+    main = await tool.execute(context(tmp_path), {"name": "pdf"})
+    # Links and SKILL.md itself are not in the list.
+    assert main["files"] == ["binary.bin", "docs/a.md"]
+    extra = await tool.execute(context(tmp_path), {"name": "pdf", "file": "docs/a.md"})
+    assert extra == {"name": "pdf", "file": "docs/a.md", "content": "Page rules"}
+
+
+@pytest.mark.parametrize(
+    ("file", "message"),
+    [
+        ("link.txt", "has no file"),
+        ("../../../../secret.txt", "has no file"),
+        ("missing.md", "has no file"),
+        ("binary.bin", "not UTF-8"),
+    ],
+)
+async def test_read_skill_file_stays_inside_the_skill(
+    tmp_path: Path, file: str, message: str
+) -> None:
+    tool = ReadSkillTool(_skill_with_files(tmp_path))
+
+    with pytest.raises(ToolError, match=message):
+        await tool.execute(context(tmp_path), {"name": "pdf", "file": file})

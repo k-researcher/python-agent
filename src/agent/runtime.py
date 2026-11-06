@@ -102,7 +102,7 @@ from agent.session_inbox import (
     retryable,
 )
 from agent.session_service import create_session_record
-from agent.skill_prompt import load_skill_set
+from agent.skill_library import project_skill_set
 from agent.source_execution import capture_source_revision, validate_source_execution
 from agent.source_lifecycle import source_registry
 from agent.tool_batch import BatchCall, BatchResult, is_parallel_safe, run_batch
@@ -1000,13 +1000,12 @@ class AgentSupervisor:
                     self._engine_tasks.discard(task)
                 return
             project = await db.scalar(select(Project).join(Session).where(Session.id == session_id))
+            if project is None:
+                return
+            skills = await project_skill_set(db, self.settings, project)
         registry = self.registry
-        if project is not None:
-            skills = load_skill_set(Path(project.root_path), None)
-            if skills.skills:
-                registry = registry.with_tools((ReadSkillTool(skills),))
-        if project is None:
-            return
+        if skills.skills:
+            registry = registry.with_tools((ReadSkillTool(skills),))
         async with source_registry(
             self.settings, session_id, Path(project.root_path).resolve(strict=True), registry
         ) as registry:

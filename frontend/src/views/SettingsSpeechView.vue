@@ -131,6 +131,7 @@ onMounted(load);
       <nav class="settings__nav" aria-label="Разделы настроек">
         <RouterLink :to="{ name: 'settings-models' }">Модели</RouterLink>
         <RouterLink :to="{ name: 'settings-speech' }" aria-current="page">Голос</RouterLink>
+        <RouterLink :to="{ name: 'settings-skills' }">Навыки</RouterLink>
       </nav>
     </header>
 

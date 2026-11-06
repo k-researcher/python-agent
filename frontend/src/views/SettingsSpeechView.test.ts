@@ -31,6 +31,7 @@ async function mountView(profiles: SpeechProfile[]) {
       { path: "/", name: "home", component: { template: "<div/>" } },
       { path: "/settings/models", name: "settings-models", component: { template: "<div/>" } },
       { path: "/settings/speech", name: "settings-speech", component: SettingsSpeechView },
+      { path: "/settings/skills", name: "settings-skills", component: { template: "<div/>" } },
     ],
   });
   await router.push("/settings/speech");

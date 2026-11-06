@@ -131,6 +131,38 @@ class Project(Base):
     sessions: Mapped[list[Session]] = relationship(back_populates="project")
 
 
+class SharedSkillDefault(Base):
+    """Whether a shared skill is on in projects that have no own choice for it."""
+
+    __tablename__ = "shared_skill_defaults"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ProjectSkillSetting(Base):
+    """The choice of one project to use a shared or a project skill."""
+
+    __tablename__ = "project_skill_settings"
+    __table_args__ = (
+        PrimaryKeyConstraint("project_id", "scope", "name", name="pk_project_skill_settings"),
+        CheckConstraint("scope IN ('shared', 'project')", name="ck_project_skill_settings_scope"),
+    )
+
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE", name="fk_project_skill_settings_project_id")
+    )
+    scope: Mapped[str] = mapped_column(String(10))
+    name: Mapped[str] = mapped_column(String(64))
+    enabled: Mapped[bool] = mapped_column(Boolean)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class Session(Base):
     __tablename__ = "sessions"
     __table_args__ = (

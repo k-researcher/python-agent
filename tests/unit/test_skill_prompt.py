@@ -99,7 +99,8 @@ def test_error_in_shared_keeps_project(tmp_path: Path) -> None:
 
     result = load_skill_set(project_root, shared)
 
-    assert [s.name for s in result.skills] == ["good-proj"]
+    # A broken skill hides only itself, not the other skills of its directory.
+    assert [s.name for s in result.skills] == ["good-proj", "good-shared"]
     assert len(result.errors) == 1
 
 

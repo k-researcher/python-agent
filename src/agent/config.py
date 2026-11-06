@@ -162,6 +162,9 @@ class Settings(BaseSettings):
     models_file: str | None = None
 
     data_dir: Path = PROJECT_ROOT / "data"
+    # Skills for every project; unset = <data_dir>/skills. Project skills live in
+    # <project>/.agent/skills.
+    skills_dir: Path | None = None
     prompts_dir: Path = PROJECT_ROOT / "prompts"
     # Language of answers, summaries and, where the model allows, reasoning ("ru" by default).
     # An empty value removes the language rule from the prompts.
@@ -177,6 +180,10 @@ class Settings(BaseSettings):
 
     def prepare_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def shared_skills_dir(self) -> Path:
+        return self.skills_dir if self.skills_dir is not None else self.data_dir / "skills"
 
     @property
     def binds_loopback(self) -> bool:

@@ -7,15 +7,17 @@ text. The module is standalone and does not depend on the runtime.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
-_MAX_SKILL_BYTES = 256 * 1024
+MAX_SKILL_BYTES = 256 * 1024
+MAX_LISTED_FILES = 200
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
-_SKILL_MD = "SKILL.md"
+SKILL_MD = "SKILL.md"
 
 
 class SkillError(ValueError):
@@ -32,52 +34,61 @@ class Skill:
     tools: tuple[str, ...]
     root: Path
     body: str
+    # Other files of the skill, relative to its root, read when the skill is loaded.
+    files: tuple[str, ...] = ()
 
 
 def _read_skill_md(directory: Path) -> str:
     """Read and validate the SKILL.md file in a skill directory."""
-    skill_file = directory / _SKILL_MD
+    skill_file = directory / SKILL_MD
     if skill_file.is_symlink():
-        raise SkillError(f"{_SKILL_MD} is a symbolic link in {directory}")
+        raise SkillError(f"{SKILL_MD} is a symbolic link in {directory}")
     if not skill_file.exists():
-        raise SkillError(f"No {_SKILL_MD} file in {directory}")
+        raise SkillError(f"No {SKILL_MD} file in {directory}")
     if not skill_file.is_file():
-        raise SkillError(f"{_SKILL_MD} is not a regular file in {directory}")
+        raise SkillError(f"{SKILL_MD} is not a regular file in {directory}")
     size = skill_file.stat().st_size
-    if size > _MAX_SKILL_BYTES:
-        raise SkillError(f"{_SKILL_MD} is larger than {_MAX_SKILL_BYTES} bytes in {directory}")
+    if size > MAX_SKILL_BYTES:
+        raise SkillError(f"{SKILL_MD} is larger than {MAX_SKILL_BYTES} bytes in {directory}")
     try:
         return skill_file.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
-        raise SkillError(f"{_SKILL_MD} is not UTF-8 text in {directory}") from exc
+        raise SkillError(f"{SKILL_MD} is not UTF-8 text in {directory}") from exc
 
 
-def _parse_header(content: str, directory: Path) -> tuple[dict[str, object], str]:
-    """Split the YAML header from the instruction body."""
+def parse_skill_text(content: str, directory: Path) -> tuple[dict[str, object], str]:
+    """Split the YAML header from the instruction body; ``directory`` names the source."""
     lines = content.split("\n")
     if not lines or lines[0].strip() != "---":
-        raise SkillError(f"{_SKILL_MD} in {directory} has no YAML header start")
+        raise SkillError(f"{SKILL_MD} in {directory} has no YAML header start")
     end_index = -1
     for index in range(1, len(lines)):
         if lines[index].strip() == "---":
             end_index = index
             break
     if end_index == -1:
-        raise SkillError(f"{_SKILL_MD} in {directory} has no closing header delimiter")
+        raise SkillError(f"{SKILL_MD} in {directory} has no closing header delimiter")
     header_text = "\n".join(lines[1:end_index]).strip()
     if not header_text:
-        raise SkillError(f"{_SKILL_MD} in {directory} has an empty YAML header")
+        raise SkillError(f"{SKILL_MD} in {directory} has an empty YAML header")
     try:
         data = yaml.safe_load(header_text)
     except yaml.YAMLError as exc:
-        raise SkillError(f"Invalid YAML header in {_SKILL_MD} in {directory}: {exc}") from exc
+        raise SkillError(f"Invalid YAML header in {SKILL_MD} in {directory}: {exc}") from exc
     if not isinstance(data, dict):
-        raise SkillError(f"YAML header in {_SKILL_MD} in {directory} is not a mapping")
+        raise SkillError(f"YAML header in {SKILL_MD} in {directory} is not a mapping")
     body = "\n".join(lines[end_index + 1 :]).strip()
     return data, body
 
 
-def _validate_header(
+def validate_name(name: str) -> str:
+    """Return the name when it is a valid skill name: lowercase letters, digits and hyphens."""
+    if not _NAME_RE.fullmatch(name):
+        raise SkillError(f"Invalid skill name: {name!r}")
+    return name
+
+
+def validate_header(
     data: dict[str, object], directory: Path
 ) -> tuple[str, str, str, tuple[str, ...]]:
     """Validate header fields and return normalized values."""
@@ -107,8 +118,8 @@ def load_skill(directory: Path) -> Skill:
     """Load a skill from its directory."""
     root = directory.resolve()
     content = _read_skill_md(directory)
-    data, body = _parse_header(content, directory)
-    name, description, version, tools = _validate_header(data, directory)
+    data, body = parse_skill_text(content, directory)
+    name, description, version, tools = validate_header(data, directory)
     return Skill(
         name=name,
         description=description,
@@ -116,26 +127,63 @@ def load_skill(directory: Path) -> Skill:
         tools=tools,
         root=root,
         body=body,
+        files=_list_files(root),
     )
 
 
-def discover_skills(root: Path) -> list[Skill]:
-    """Discover all skills in first-level subdirectories of root."""
+def _list_files(root: Path) -> tuple[str, ...]:
+    """List the files of a skill except SKILL.md, without hidden files and links."""
+    found: list[str] = []
+    for current, directories, files in os.walk(root, followlinks=False):
+        directories[:] = sorted(d for d in directories if not d.startswith("."))
+        for name in sorted(files):
+            path = Path(current) / name
+            relative = path.relative_to(root).as_posix()
+            if name.startswith(".") or relative == SKILL_MD or path.is_symlink():
+                continue
+            found.append(relative)
+            if len(found) >= MAX_LISTED_FILES:
+                return tuple(found)
+    return tuple(found)
+
+
+def scan_skills(root: Path) -> tuple[list[Skill], list[str]]:
+    """Load every skill in first-level subdirectories of root.
+
+    A broken skill does not hide the other skills: its error is returned instead.
+    Hidden directories are skipped, because an import prepares a skill there.
+    """
     if not root.is_dir():
-        raise SkillError(f"Skill root is not a directory: {root}")
+        return [], [f"Skill root is not a directory: {root}"]
     skills: list[Skill] = []
+    errors: list[str] = []
     seen: set[str] = set()
     for entry in sorted(root.iterdir(), key=lambda p: p.name):
-        if not entry.is_dir() or entry.is_symlink():
+        if entry.name.startswith(".") or not entry.is_dir() or entry.is_symlink():
             continue
-        if not (entry / _SKILL_MD).is_file():
+        if not (entry / SKILL_MD).is_file():
             continue
-        skill = load_skill(entry)
+        try:
+            skill = load_skill(entry)
+        except SkillError as exc:
+            errors.append(str(exc))
+            continue
         if skill.name in seen:
-            raise SkillError(f"Duplicate skill name: {skill.name}")
+            errors.append(f"Duplicate skill name: {skill.name}")
+            continue
         seen.add(skill.name)
         skills.append(skill)
     skills.sort(key=lambda s: s.name)
+    return skills, errors
+
+
+def discover_skills(root: Path) -> list[Skill]:
+    """Discover all skills in first-level subdirectories of root; raise on the first error."""
+    if not root.is_dir():
+        raise SkillError(f"Skill root is not a directory: {root}")
+    skills, errors = scan_skills(root)
+    if errors:
+        raise SkillError(errors[0])
     return skills
 
 
