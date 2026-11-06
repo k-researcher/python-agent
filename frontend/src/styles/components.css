@@ -336,9 +336,9 @@
 .ui-input {
   width: 100%;
   min-height: var(--control-height);
-  padding: 7px 10px;
+  padding: 7px 12px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   background: var(--bg);
   color: var(--text);
   font: inherit;
@@ -348,6 +348,32 @@
 textarea.ui-input {
   line-height: 1.45;
   resize: vertical;
+}
+
+/* A list draws its own chevron, so it looks the same in every browser and theme. */
+select.ui-input {
+  padding-right: 34px;
+  appearance: none;
+  background-image: var(--select-chevron);
+  background-position: right 12px center;
+  background-size: 12px 12px;
+  background-repeat: no-repeat;
+  cursor: pointer;
+}
+
+select.ui-input:disabled {
+  cursor: default;
+}
+
+/* A number field has no spin buttons: the value is typed. */
+input.ui-input[type="number"] {
+  appearance: textfield;
+}
+
+input.ui-input[type="number"]::-webkit-inner-spin-button,
+input.ui-input[type="number"]::-webkit-outer-spin-button {
+  margin: 0;
+  appearance: none;
 }
 
 .ui-input:focus-visible {

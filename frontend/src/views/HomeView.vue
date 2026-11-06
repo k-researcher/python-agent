@@ -223,7 +223,7 @@ async function onCreateSession(payload: SendPayload): Promise<void> {
   margin: 8px 16px;
   padding: 8px 12px;
   border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   background: color-mix(in srgb, var(--danger) 8%, transparent);
   color: var(--danger);
   font-size: 13px;
