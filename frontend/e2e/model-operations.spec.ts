@@ -69,13 +69,13 @@ test("model settings keep checks explicit and separate key edit, disable, delete
   await provider.getByTestId("provider-toggle").click();
   await expect(page.getByTestId("models-empty")).toBeVisible();
   await expect(page.getByTestId("model-provider-off")).toHaveText("Сервер отключён");
-  // Removal asks first and names the models that go with the connection.
-  page.once("dialog", (dialog) => {
-    expect(dialog.type()).toBe("confirm");
-    expect(dialog.message()).toContain("Удалить подключение");
-    void dialog.accept();
-  });
+  // Removal asks first in a dialog; the focus starts on the safe choice.
   await provider.getByTestId("provider-remove").click();
+  const confirmation = page.getByRole("alertdialog");
+  await expect(confirmation).toContainText("Удалить подключение «gateway»?");
+  await expect(confirmation.getByRole("button", { name: "Отмена" })).toBeFocused();
+  await confirmation.getByTestId("remove-confirm").click();
+  await expect(confirmation).toHaveCount(0);
   await expect(provider).toHaveCount(0);
   await expect(page.getByTestId("deleted-settings")).toBeVisible();
   await expect(page.locator('[data-remove-hint-provider="gateway"]')).toContainText("config/models.yaml");

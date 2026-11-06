@@ -345,7 +345,7 @@ function onOpenChild(id: string): void {
       {{ openError }}
       <button
         type="button"
-        class="open-retry"
+        class="open-retry ui-btn ui-btn--small ui-btn--outlined ui-btn--danger"
         data-testid="open-retry"
         @click="handleRouteChange(props.id)"
       >
@@ -460,18 +460,7 @@ function onOpenChild(id: string): void {
 }
 
 .open-retry {
-  padding: 3px 10px;
-  border: 1px solid currentColor;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--danger);
-  font-size: 12px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.open-retry:hover {
-  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  margin-left: 8px;
 }
 
 .session-loading,

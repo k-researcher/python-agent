@@ -5,7 +5,7 @@
 
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { ArrowLeft, CircleAlert, FileUp, Pencil, Plus, Trash2, X } from "lucide-vue-next";
+import { CircleAlert, FileUp, Pencil, Plus, Trash2, X } from "lucide-vue-next";
 import { api } from "../api/client";
 import type { Project } from "../api/types";
 import {
@@ -18,6 +18,7 @@ import {
   type SkillScope,
 } from "../api/skills";
 import SettingsDialog from "../components/settings/SettingsDialog.vue";
+import SettingsHeader from "../components/settings/SettingsHeader.vue";
 import ToggleSwitch from "../components/settings/ToggleSwitch.vue";
 import { useAppStore } from "../stores/app";
 
@@ -312,43 +313,27 @@ async function importFile(event: Event): Promise<void> {
   }
 }
 
-function back(): void {
-  if (window.history.length > 1) router.back();
-  else void router.push({ name: "home" });
-}
-
 onMounted(load);
 </script>
 
 <template>
-  <section class="settings" data-testid="skills-settings">
-    <header class="settings__header">
-      <button type="button" class="ghost" data-testid="settings-back" @click="back">
-        <ArrowLeft :size="16" aria-hidden="true" />
-        <span>Назад</span>
-      </button>
-      <h1>Навыки</h1>
-      <nav class="settings__nav" aria-label="Разделы настроек">
-        <RouterLink :to="{ name: 'settings-models' }">Модели</RouterLink>
-        <RouterLink :to="{ name: 'settings-speech' }">Голос</RouterLink>
-        <RouterLink :to="{ name: 'settings-skills' }" aria-current="page">Навыки</RouterLink>
-      </nav>
-    </header>
+  <section class="ui-page" data-testid="skills-settings">
+    <SettingsHeader title="Навыки" />
 
-    <p class="intro">
+    <p class="ui-hint">
       Навык — это инструкция для определённой задачи. Агент видит описание навыка и открывает его, когда задача
       подходит. Общие навыки работают во всех проектах, навыки проекта — только в своём.
     </p>
 
-    <p v-if="loadError" class="notice notice--error" role="alert">
+    <p v-if="loadError" class="ui-notice ui-notice--error" role="alert">
       <CircleAlert :size="16" aria-hidden="true" />
-      <span>{{ loadError }}</span>
-      <button type="button" class="link" @click="load">Повторить</button>
+      <span class="ui-notice__text">{{ loadError }}</span>
+      <button type="button" class="ui-link" @click="load">Повторить</button>
     </p>
 
     <template v-if="catalog">
       <div class="toolbar">
-        <div class="segmented" role="tablist" aria-label="Какие навыки показать" @keydown="tabKey">
+        <div class="ui-tabs" role="tablist" aria-label="Какие навыки показать" @keydown="tabKey">
           <button
             id="skills-tab-shared"
             type="button"
@@ -374,14 +359,20 @@ onMounted(load);
             Проект <span class="count">{{ own.length }}</span>
           </button>
         </div>
-        <div class="toolbar__actions">
-          <button type="button" class="tonal" :disabled="importing" data-testid="skills-import" @click="chooseFile">
+        <div class="ui-section__actions">
+          <button
+            type="button"
+            class="ui-btn ui-btn--tonal"
+            :disabled="importing"
+            data-testid="skills-import"
+            @click="chooseFile"
+          >
             <FileUp :size="16" aria-hidden="true" />
             <span>{{ importing ? "Устанавливаю…" : "Импорт" }}</span>
           </button>
           <button
             type="button"
-            class="primary"
+            class="ui-btn ui-btn--filled"
             :disabled="tab === 'project' && !project"
             data-testid="skills-create"
             @click="openCreate"
@@ -392,7 +383,7 @@ onMounted(load);
           <input
             ref="fileInput"
             type="file"
-            class="visually-hidden"
+            class="sr-only"
             accept=".md,.zip,.skill"
             tabindex="-1"
             aria-hidden="true"
@@ -403,60 +394,75 @@ onMounted(load);
       </div>
 
       <div aria-live="polite" role="status" class="live">
-        <p v-if="status" class="notice notice--ok" data-testid="skills-status">
-          <span>{{ status }}</span>
-          <button type="button" class="icon" aria-label="Скрыть сообщение" @click="status = ''">
+        <p v-if="status" class="ui-notice ui-notice--success" data-testid="skills-status">
+          <span class="ui-notice__text">{{ status }}</span>
+          <button type="button" class="ui-btn ui-btn--icon" aria-label="Скрыть сообщение" @click="status = ''">
             <X :size="15" aria-hidden="true" />
           </button>
         </p>
       </div>
-      <p v-if="actionError" class="notice notice--error" role="alert" data-testid="skills-error">
+      <p v-if="actionError" class="ui-notice ui-notice--error" role="alert" data-testid="skills-error">
         <CircleAlert :size="16" aria-hidden="true" />
-        <span>{{ actionError }}</span>
-        <button type="button" class="icon" aria-label="Скрыть сообщение" @click="actionError = ''">
+        <span class="ui-notice__text">{{ actionError }}</span>
+        <button type="button" class="ui-btn ui-btn--icon" aria-label="Скрыть сообщение" @click="actionError = ''">
           <X :size="15" aria-hidden="true" />
         </button>
       </p>
-      <details v-if="brokenCount" class="notice notice--warning" data-testid="skills-broken">
+      <details v-if="brokenCount" class="ui-notice ui-notice--warning broken" data-testid="skills-broken">
         <summary>
           {{ brokenCount }} {{ plural(brokenCount, "навык не загружен", "навыка не загружены", "навыков не загружены") }}:
           исправьте SKILL.md
         </summary>
         <ul>
           <li v-for="(item, index) in catalog.errors" :key="index">
-            <span class="badge">{{ item.scope === "shared" ? "Общий" : "Проект" }}</span>
-            <span class="mono small">{{ item.message }}</span>
+            <span class="ui-badge">{{ item.scope === "shared" ? "Общий" : "Проект" }}</span>
+            <span class="mono ui-small">{{ item.message }}</span>
           </li>
         </ul>
       </details>
 
       <div id="skills-panel" role="tabpanel" :aria-labelledby="`skills-tab-${tab}`">
-        <template v-if="tab === 'shared'">
-          <p class="hint">
+        <section v-if="tab === 'shared'" class="ui-section" aria-labelledby="skills-shared-title">
+          <h2 id="skills-shared-title" class="ui-section__title">Общие навыки</h2>
+          <p class="ui-hint">
             Выключатель задаёт, работает ли навык во всех проектах. В отдельном проекте его можно включить или
             выключить на вкладке «Проект».
-            <span class="mono small path" :title="catalog.shared_dir">Папка: {{ catalog.shared_dir }}</span>
+            <span class="mono path" :title="catalog.shared_dir">Папка: {{ catalog.shared_dir }}</span>
           </p>
-          <div v-if="!shared.length" class="empty" data-testid="skills-empty-shared">
+          <div v-if="!shared.length" class="ui-empty" data-testid="skills-empty-shared">
             <p>Общих навыков пока нет.</p>
-            <p class="muted">Создайте навык или импортируйте файл SKILL.md или zip-архив с папкой навыка.</p>
+            <p class="empty__more">Создайте навык или импортируйте файл SKILL.md или zip-архив с папкой навыка.</p>
           </div>
           <ul v-else class="list" aria-label="Общие навыки">
-            <li v-for="item in shared" :key="keyOf(item)" class="row" :data-skill="item.name">
-              <div class="row__main">
-                <strong class="mono">{{ item.name }}</strong>
-                <span class="row__description">{{ item.description }}</span>
-                <span class="muted small">
+            <li v-for="item in shared" :key="keyOf(item)" class="ui-card ui-card__row" :data-skill="item.name">
+              <div class="ui-card__main">
+                <strong class="ui-card__title mono">{{ item.name }}</strong>
+                <span class="description">{{ item.description }}</span>
+                <span class="ui-card__meta">
                   {{ sharedDefault(item) ? "Во всех проектах" : "Выключен по умолчанию" }}
                   <template v-if="item.files"> · {{ filesText(item.files) }}</template>
                   <template v-if="item.version"> · версия {{ item.version }}</template>
                 </span>
               </div>
-              <div class="row__actions">
-                <button type="button" class="icon" :aria-label="`Изменить навык ${item.name}`" :title="`Изменить`" data-testid="skill-edit" @click="openEdit(item)">
+              <div class="ui-card__actions">
+                <button
+                  type="button"
+                  class="ui-btn ui-btn--icon"
+                  :aria-label="`Изменить навык ${item.name}`"
+                  title="Изменить"
+                  data-testid="skill-edit"
+                  @click="openEdit(item)"
+                >
                   <Pencil :size="16" aria-hidden="true" />
                 </button>
-                <button type="button" class="icon icon--danger" :aria-label="`Удалить навык ${item.name}`" :title="`Удалить`" data-testid="skill-delete" @click="askDelete(item)">
+                <button
+                  type="button"
+                  class="ui-btn ui-btn--icon ui-btn--danger"
+                  :aria-label="`Удалить навык ${item.name}`"
+                  title="Удалить"
+                  data-testid="skill-delete"
+                  @click="askDelete(item)"
+                >
                   <Trash2 :size="16" aria-hidden="true" />
                 </button>
                 <ToggleSwitch
@@ -469,93 +475,118 @@ onMounted(load);
               </div>
             </li>
           </ul>
-        </template>
+        </section>
 
         <template v-else>
-          <div v-if="!projects.length" class="empty" data-testid="skills-no-projects">
+          <div v-if="!projects.length" class="ui-empty section-gap" data-testid="skills-no-projects">
             <p>Проектов пока нет.</p>
-            <p class="muted">Навыки проекта появятся, когда вы добавите проект.</p>
+            <p class="empty__more">Навыки проекта появятся, когда вы добавите проект.</p>
           </div>
           <template v-else>
-            <label class="project-picker">
-              <span>Проект</span>
-              <select v-model="projectId" data-testid="skills-project">
+            <label class="ui-field project-picker">
+              <span class="ui-field__label">Проект</span>
+              <select v-model="projectId" class="ui-input" data-testid="skills-project">
                 <option v-for="item in projects" :key="item.id" :value="item.id">{{ item.name }}</option>
               </select>
             </label>
 
-            <h2 class="group-title">Навыки проекта</h2>
-            <p class="hint">
-              Работают только в этом проекте. Навык проекта заменяет общий навык с тем же именем.
-              <span v-if="catalog.project_dir" class="mono small path" :title="catalog.project_dir">
-                Папка: {{ catalog.project_dir }}
-              </span>
-            </p>
-            <div v-if="!own.length" class="empty" data-testid="skills-empty-project">
-              <p>У проекта нет своих навыков.</p>
-            </div>
-            <ul v-else class="list" aria-label="Навыки проекта">
-              <li v-for="item in own" :key="keyOf(item)" class="row" :class="{ 'row--off': !item.enabled }" :data-skill="item.name">
-                <div class="row__main">
-                  <strong class="mono">{{ item.name }}</strong>
-                  <span class="row__description">{{ item.description }}</span>
-                  <span class="muted small">
-                    {{ item.enabled ? "Включён" : "Выключен" }}
-                    <template v-if="item.files"> · {{ filesText(item.files) }}</template>
-                    <template v-if="item.version"> · версия {{ item.version }}</template>
-                  </span>
-                </div>
-                <div class="row__actions">
-                  <button type="button" class="icon" :aria-label="`Изменить навык ${item.name}`" title="Изменить" data-testid="skill-edit" @click="openEdit(item)">
-                    <Pencil :size="16" aria-hidden="true" />
-                  </button>
-                  <button type="button" class="icon icon--danger" :aria-label="`Удалить навык ${item.name}`" title="Удалить" data-testid="skill-delete" @click="askDelete(item)">
-                    <Trash2 :size="16" aria-hidden="true" />
-                  </button>
-                  <ToggleSwitch
-                    :model-value="item.enabled"
-                    :label="`Навык ${item.name} в этом проекте`"
-                    :disabled="pending === keyOf(item)"
-                    data-testid="skill-switch"
-                    @update:model-value="setInProject(item, $event)"
-                  />
-                </div>
-              </li>
-            </ul>
+            <section class="ui-section" aria-labelledby="skills-own-title">
+              <h2 id="skills-own-title" class="ui-section__title">Навыки проекта</h2>
+              <p class="ui-hint">
+                Работают только в этом проекте. Навык проекта заменяет общий навык с тем же именем.
+                <span v-if="catalog.project_dir" class="mono path" :title="catalog.project_dir">
+                  Папка: {{ catalog.project_dir }}
+                </span>
+              </p>
+              <div v-if="!own.length" class="ui-empty" data-testid="skills-empty-project">
+                <p>У проекта нет своих навыков.</p>
+              </div>
+              <ul v-else class="list" aria-label="Навыки проекта">
+                <li
+                  v-for="item in own"
+                  :key="keyOf(item)"
+                  class="ui-card ui-card__row"
+                  :class="{ 'ui-card--off': !item.enabled }"
+                  :data-skill="item.name"
+                >
+                  <div class="ui-card__main">
+                    <strong class="ui-card__title mono">{{ item.name }}</strong>
+                    <span class="description">{{ item.description }}</span>
+                    <span class="ui-card__meta">
+                      {{ item.enabled ? "Включён" : "Выключен" }}
+                      <template v-if="item.files"> · {{ filesText(item.files) }}</template>
+                      <template v-if="item.version"> · версия {{ item.version }}</template>
+                    </span>
+                  </div>
+                  <div class="ui-card__actions">
+                    <button
+                      type="button"
+                      class="ui-btn ui-btn--icon"
+                      :aria-label="`Изменить навык ${item.name}`"
+                      title="Изменить"
+                      data-testid="skill-edit"
+                      @click="openEdit(item)"
+                    >
+                      <Pencil :size="16" aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      class="ui-btn ui-btn--icon ui-btn--danger"
+                      :aria-label="`Удалить навык ${item.name}`"
+                      title="Удалить"
+                      data-testid="skill-delete"
+                      @click="askDelete(item)"
+                    >
+                      <Trash2 :size="16" aria-hidden="true" />
+                    </button>
+                    <ToggleSwitch
+                      :model-value="item.enabled"
+                      :label="`Навык ${item.name} в этом проекте`"
+                      :disabled="pending === keyOf(item)"
+                      data-testid="skill-switch"
+                      @update:model-value="setInProject(item, $event)"
+                    />
+                  </div>
+                </li>
+              </ul>
+            </section>
 
-            <h2 class="group-title">Общие навыки в этом проекте</h2>
-            <div v-if="!shared.length" class="empty">
-              <p class="muted">Общих навыков пока нет.</p>
-            </div>
-            <ul v-else class="list" aria-label="Общие навыки в этом проекте">
-              <li
-                v-for="item in shared"
-                :key="keyOf(item)"
-                class="row"
-                :class="{ 'row--off': !item.enabled || item.replaced }"
-                :data-skill="item.name"
-              >
-                <div class="row__main">
-                  <strong class="mono">{{ item.name }}</strong>
-                  <span class="row__description">{{ item.description }}</span>
-                  <span class="muted small" data-testid="skill-note">{{ sharedNote(item) }}</span>
-                </div>
-                <div class="row__actions">
-                  <ToggleSwitch
-                    :model-value="item.enabled"
-                    :label="`Общий навык ${item.name} в этом проекте`"
-                    :disabled="pending === keyOf(item)"
-                    data-testid="skill-switch"
-                    @update:model-value="setInProject(item, $event)"
-                  />
-                </div>
-              </li>
-            </ul>
+            <section class="ui-section" aria-labelledby="skills-inherited-title">
+              <h2 id="skills-inherited-title" class="ui-section__title">Общие навыки в этом проекте</h2>
+              <p class="ui-hint">Выключатель меняет выбор только для этого проекта.</p>
+              <div v-if="!shared.length" class="ui-empty">
+                <p>Общих навыков пока нет.</p>
+              </div>
+              <ul v-else class="list" aria-label="Общие навыки в этом проекте">
+                <li
+                  v-for="item in shared"
+                  :key="keyOf(item)"
+                  class="ui-card ui-card__row"
+                  :class="{ 'ui-card--off': !item.enabled || item.replaced }"
+                  :data-skill="item.name"
+                >
+                  <div class="ui-card__main">
+                    <strong class="ui-card__title mono">{{ item.name }}</strong>
+                    <span class="description">{{ item.description }}</span>
+                    <span class="ui-card__meta" data-testid="skill-note">{{ sharedNote(item) }}</span>
+                  </div>
+                  <div class="ui-card__actions">
+                    <ToggleSwitch
+                      :model-value="item.enabled"
+                      :label="`Общий навык ${item.name} в этом проекте`"
+                      :disabled="pending === keyOf(item)"
+                      data-testid="skill-switch"
+                      @update:model-value="setInProject(item, $event)"
+                    />
+                  </div>
+                </li>
+              </ul>
+            </section>
           </template>
         </template>
       </div>
     </template>
-    <p v-else-if="!loadError" class="muted">Загрузка…</p>
+    <p v-else-if="!loadError" class="ui-hint">Загрузка…</p>
 
     <SettingsDialog
       :open="editor.open"
@@ -563,23 +594,23 @@ onMounted(load);
       wide
       @close="closeEditor"
     >
-      <form id="skill-form" class="form" novalidate data-testid="skill-form" @submit.prevent="save">
+      <form id="skill-form" class="ui-form" novalidate data-testid="skill-form" @submit.prevent="save">
         <fieldset v-if="editor.mode === 'create'" class="where">
-          <legend>Где хранить</legend>
-          <label class="choice">
+          <legend class="ui-field__label">Где хранить</legend>
+          <label class="ui-choice">
             <input v-model="editor.scope" type="radio" value="shared" />
             <span>Общий — для всех проектов</span>
           </label>
-          <label class="choice" :class="{ 'choice--off': !project }">
+          <label class="ui-choice" :class="{ 'choice--off': !project }">
             <input v-model="editor.scope" type="radio" value="project" :disabled="!project" />
             <span>Только проект{{ project ? ` «${project.name}»` : "" }}</span>
           </label>
         </fieldset>
-        <label class="field">
-          <span>Имя</span>
+        <label class="ui-field">
+          <span class="ui-field__label">Имя</span>
           <input
             v-model.trim="editor.name"
-            class="mono"
+            class="ui-input mono"
             :disabled="editor.mode === 'edit'"
             :aria-invalid="!!nameError"
             aria-describedby="skill-name-help"
@@ -589,48 +620,53 @@ onMounted(load);
             data-testid="skill-name"
             @blur="editor.touched = true"
           />
-          <small id="skill-name-help" :class="{ 'field__error': nameError }">
+          <small id="skill-name-help" class="ui-field__help" :class="{ 'ui-field__help--error': nameError }">
             {{ nameError || (editor.mode === "edit" ? "Имя навыка не меняется." : "Строчные латинские буквы, цифры и дефис.") }}
           </small>
         </label>
-        <label class="field">
-          <span>Когда применять</span>
+        <label class="ui-field">
+          <span class="ui-field__label">Когда применять</span>
           <textarea
             v-model="editor.description"
+            class="ui-input"
             rows="3"
             :aria-invalid="!!descriptionError"
             aria-describedby="skill-description-help"
             :data-autofocus="editor.mode === 'edit' ? '' : undefined"
             data-testid="skill-description"
           />
-          <small id="skill-description-help" class="field__help" :class="{ 'field__error': descriptionError }">
+          <small
+            id="skill-description-help"
+            class="ui-field__help"
+            :class="{ 'ui-field__help--error': descriptionError }"
+          >
             <span>{{ descriptionError || "Агент видит только это описание и по нему решает, открыть ли навык." }}</span>
             <span class="counter">{{ editor.description.length }} / {{ MAX_DESCRIPTION }}</span>
           </small>
         </label>
-        <label class="field">
-          <span>Инструкции</span>
+        <label class="ui-field">
+          <span class="ui-field__label">Инструкции</span>
           <textarea
             v-model="editor.instructions"
-            class="mono instructions"
+            class="ui-input mono instructions"
             rows="14"
             :disabled="editor.loading"
             :placeholder="editor.loading ? 'Загрузка…' : 'Шаги, правила и примеры в Markdown'"
             data-testid="skill-instructions"
           />
-          <small>Агент читает инструкции целиком, когда открывает навык.</small>
+          <small class="ui-field__help">Агент читает инструкции целиком, когда открывает навык.</small>
         </label>
-        <p v-if="editor.files.length" class="muted small" data-testid="skill-files">
-          Другие файлы навыка: <span class="mono">{{ editor.files.join(", ") }}</span>
+        <p v-if="editor.files.length" class="ui-field__help" data-testid="skill-files">
+          <span>Другие файлы навыка: <span class="mono">{{ editor.files.join(", ") }}</span></span>
         </p>
-        <p v-if="editor.error" class="notice notice--error" role="alert" data-testid="skill-form-error">
+        <p v-if="editor.error" class="ui-notice ui-notice--error" role="alert" data-testid="skill-form-error">
           <CircleAlert :size="16" aria-hidden="true" />
-          <span>{{ editor.error }}</span>
+          <span class="ui-notice__text">{{ editor.error }}</span>
         </p>
       </form>
       <template #actions>
-        <button type="button" class="text" :disabled="editor.saving" @click="closeEditor">Отмена</button>
-        <button type="submit" form="skill-form" class="primary" :disabled="!canSave" data-testid="skill-save">
+        <button type="button" class="ui-btn ui-btn--text" :disabled="editor.saving" @click="closeEditor">Отмена</button>
+        <button type="submit" form="skill-form" class="ui-btn ui-btn--filled" :disabled="!canSave" data-testid="skill-save">
           {{ editor.saving ? "Сохраняю…" : editor.mode === "create" ? "Создать" : "Сохранить" }}
         </button>
       </template>
@@ -643,15 +679,27 @@ onMounted(load);
       @close="confirm.busy || (confirm.open = false)"
     >
       <p class="confirm-text">{{ deleteText }}</p>
-      <p v-if="confirm.error" class="notice notice--error" role="alert" data-testid="skill-delete-error">
+      <p v-if="confirm.error" class="ui-notice ui-notice--error" role="alert" data-testid="skill-delete-error">
         <CircleAlert :size="16" aria-hidden="true" />
-        <span>{{ confirm.error }}</span>
+        <span class="ui-notice__text">{{ confirm.error }}</span>
       </p>
       <template #actions>
-        <button type="button" class="text" data-autofocus :disabled="confirm.busy" @click="confirm.open = false">
+        <button
+          type="button"
+          class="ui-btn ui-btn--text"
+          data-autofocus
+          :disabled="confirm.busy"
+          @click="confirm.open = false"
+        >
           Отмена
         </button>
-        <button type="button" class="danger-fill" :disabled="confirm.busy" data-testid="skill-delete-confirm" @click="remove">
+        <button
+          type="button"
+          class="ui-btn ui-btn--filled ui-btn--danger"
+          :disabled="confirm.busy"
+          data-testid="skill-delete-confirm"
+          @click="remove"
+        >
           {{ confirm.busy ? "Удаляю…" : "Удалить" }}
         </button>
       </template>
@@ -660,97 +708,13 @@ onMounted(load);
 </template>
 
 <style scoped>
-.settings {
-  max-width: 860px;
-  margin: 0 auto;
-  padding: 16px 20px 48px;
-  overflow-y: auto;
-  height: 100%;
-  box-sizing: border-box;
-}
-
-.settings__header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.settings__nav {
-  display: flex;
-  gap: 4px;
-  margin-left: auto;
-}
-
-.settings__nav a {
-  padding: 4px 10px;
-  border-radius: var(--radius-sm);
-  color: var(--text-muted);
-  font-size: 13px;
-  text-decoration: none;
-}
-
-.settings__nav a[aria-current="page"] {
-  background: var(--bg-subtle);
-  color: var(--text);
-}
-
-h1 {
-  margin: 0;
-  font-size: 20px;
-}
-
-.intro {
-  margin: 0 0 16px;
-  color: var(--text-muted);
-  font-size: 14px;
-  line-height: 1.5;
-}
-
 .toolbar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-}
-
-.toolbar__actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-/* Segmented control: one rounded track, the selected segment raised on it. */
-.segmented {
-  display: inline-flex;
-  padding: 3px;
-  border-radius: 10px;
-  background: var(--bg-subtle);
-}
-
-.segmented button {
-  min-height: 36px;
-  padding: 0 16px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 14px;
-  cursor: pointer;
-}
-
-.segmented button[aria-selected="true"] {
-  background: var(--surface);
-  color: var(--text);
-  font-weight: 600;
-  box-shadow: 0 1px 2px rgba(43, 33, 24, 0.12);
-}
-
-.segmented button:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
+  margin-top: 8px;
 }
 
 .count {
@@ -764,78 +728,27 @@ h1 {
   display: none;
 }
 
-.hint {
-  margin: 16px 0 8px;
-  color: var(--text-muted);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
 .path {
   display: block;
   margin-top: 2px;
   overflow: hidden;
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.group-title {
-  margin: 24px 0 0;
-  font-size: 15px;
-}
-
-.project-picker {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 16px;
-  font-size: 13px;
-  color: var(--text-muted);
-}
-
-.project-picker select {
-  min-height: 36px;
-  min-width: 200px;
-}
-
-/* An inset grouped list: rows share one rounded container, separated by hairlines. */
 .list {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
-  overflow: hidden;
-}
-
-.row {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px 16px;
-  padding: 12px 8px 12px 16px;
-}
-
-.row + .row {
-  border-top: 1px solid var(--border);
-}
-
-.row--off .row__main {
-  opacity: 0.6;
-}
-
-.row__main {
-  display: flex;
-  flex: 1 1 320px;
   flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-  overflow-wrap: anywhere;
+  gap: 8px;
 }
 
-.row__description {
+/* The gap between cards comes from the list, not from the card rule. */
+.list > .ui-card + .ui-card {
+  margin-top: 0;
+}
+
+.description {
   display: -webkit-box;
   overflow: hidden;
   -webkit-box-orient: vertical;
@@ -844,223 +757,51 @@ h1 {
   font-size: 14px;
 }
 
-.row__actions {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  margin-left: auto;
-}
-
-.empty {
-  padding: 20px 16px;
-  border: 1px dashed var(--border);
-  border-radius: var(--radius);
-  text-align: center;
-}
-
-.empty p {
-  margin: 0;
-}
-
-.empty p + p {
+.empty__more {
   margin-top: 4px;
   font-size: 13px;
 }
 
-.small {
-  font-size: 12px;
+.section-gap {
+  margin-top: 28px;
 }
 
-.mono {
-  font-family: var(--font-mono);
+.project-picker {
+  max-width: 320px;
+  margin-top: 20px;
 }
 
-.badge {
-  display: inline-block;
-  margin-right: 6px;
-  padding: 0 6px;
-  border-radius: 999px;
-  background: var(--bg-subtle);
-  color: var(--text-muted);
-  font-size: 11px;
-}
-
-button.ghost,
-button.primary,
-button.tonal,
-button.text,
-button.danger-fill {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  min-height: 36px;
-  padding: 0 16px;
-  border: 1px solid transparent;
-  border-radius: 18px;
-  background: transparent;
-  color: var(--text);
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-}
-
-button.ghost {
-  padding: 0 10px;
-  border-color: var(--border);
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-  font-weight: 400;
-}
-
-button.primary {
-  background: var(--accent);
-  color: var(--accent-contrast);
-}
-
-button.tonal {
-  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
-  color: var(--text);
-}
-
-button.text {
-  color: var(--accent);
-}
-
-button.text:not(:disabled):hover,
-button.tonal:not(:disabled):hover {
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-}
-
-button.danger-fill {
-  background: var(--danger);
-  color: #fff;
-}
-
-button.icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 40px;
-  height: 40px;
-  padding: 0;
-  border: 0;
-  border-radius: 50%;
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-}
-
-button.icon:not(:disabled):hover {
-  background: var(--bg-subtle);
-  color: var(--text);
-}
-
-button.icon--danger:not(:disabled):hover {
-  background: color-mix(in srgb, var(--danger) 10%, transparent);
-  color: var(--danger);
-}
-
-button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-button:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-button.link {
-  border: 0;
-  background: none;
-  color: var(--link);
-  text-decoration: underline;
-  cursor: pointer;
-}
-
-.notice {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 12px 0 0;
-  padding: 8px 8px 8px 12px;
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-}
-
-.notice > span {
-  flex: 1;
-}
-
-.notice button.icon {
-  width: 32px;
-  height: 32px;
-  color: inherit;
-}
-
-.notice--error {
-  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
-  background: color-mix(in srgb, var(--danger) 8%, transparent);
-  color: var(--danger);
-}
-
-.notice--ok {
-  border: 1px solid color-mix(in srgb, var(--success) 40%, transparent);
-  background: color-mix(in srgb, var(--success) 8%, transparent);
-  color: var(--success);
-  animation: notice-in 0.18s ease-out;
-}
-
-.notice--warning {
+.broken {
   display: block;
-  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
-  background: color-mix(in srgb, var(--warning) 8%, transparent);
-  color: var(--warning);
 }
 
-.notice--warning summary {
+.broken summary {
   cursor: pointer;
 }
 
-.notice--warning ul {
-  margin: 8px 0 0;
-  padding-left: 18px;
-  color: var(--text);
-}
-
-.form {
+.broken ul {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 4px;
+  margin-top: 8px;
+  color: var(--text);
+}
+
+.broken .ui-badge {
+  margin-right: 6px;
 }
 
 .where {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px 20px;
+  gap: 4px 20px;
   margin: 0;
   padding: 0;
   border: 0;
 }
 
 .where legend {
-  margin-bottom: 6px;
-  color: var(--text-muted);
-  font-size: 13px;
-}
-
-.choice {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 32px;
-  font-size: 14px;
-  cursor: pointer;
-}
-
-.choice input {
-  accent-color: var(--accent);
+  margin-bottom: 4px;
 }
 
 .choice--off {
@@ -1068,120 +809,31 @@ button.link {
   cursor: default;
 }
 
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 13px;
-  color: var(--text-muted);
-}
-
-.field > span {
-  color: var(--text);
-  font-weight: 500;
-}
-
-.field small {
-  font-size: 12px;
-}
-
-.field__help {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-}
-
 .counter {
   flex: none;
   font-variant-numeric: tabular-nums;
 }
 
-.field__error {
-  color: var(--danger);
-}
-
-input:not([type="radio"]),
-select,
-textarea {
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-  color: var(--text);
-  font: inherit;
-  font-size: 14px;
-}
-
-input[aria-invalid="true"],
-textarea[aria-invalid="true"] {
-  border-color: var(--danger);
-}
-
-input:focus-visible,
-select:focus-visible,
-textarea:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -1px;
-}
-
-input:disabled {
-  color: var(--text-muted);
-}
-
-textarea {
-  resize: vertical;
-  line-height: 1.45;
-}
-
 textarea.instructions {
   min-height: 220px;
-  font-family: var(--font-mono);
   font-size: 13px;
 }
 
 .confirm-text {
-  margin: 0;
   line-height: 1.5;
 }
 
-.visually-hidden {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-}
-
-@keyframes notice-in {
-  from {
-    opacity: 0;
-    transform: translateY(-4px);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .notice--ok {
-    animation: none;
-  }
-}
-
 @media (max-width: 599px) {
-  .settings {
-    padding: 12px 16px 40px;
-  }
-
-  .toolbar__actions {
+  .toolbar .ui-section__actions {
     width: 100%;
   }
 
-  .toolbar__actions button {
+  .toolbar .ui-section__actions .ui-btn {
     flex: 1;
   }
 
   .project-picker {
-    flex-direction: column;
-    align-items: stretch;
+    max-width: none;
   }
 }
 </style>

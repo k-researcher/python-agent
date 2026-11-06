@@ -36,7 +36,8 @@ test.describe("sidebar footer and project form containment", () => {
 
     const footerButtons = sidebarFooter.locator("button");
     const buttonCount = await footerButtons.count();
-    expect(buttonCount, "footer should contain both actions").toBe(2);
+    expect(buttonCount, "footer should contain skills, settings and sign out").toBe(3);
+    await expect(footerButtons).toHaveText(["Навыки", "Настройки", "Выйти"]);
     for (let index = 0; index < buttonCount; index++) {
       const buttonBox = await footerButtons.nth(index).boundingBox();
       expect(

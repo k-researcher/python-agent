@@ -6,6 +6,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   Archive,
+  BookOpen,
   ChevronRight,
   Folder,
   LogOut,
@@ -42,7 +43,7 @@ const emit = defineEmits<{
   selectSession: [id: string];
   createProject: [{ name: string; rootPath: string }];
   newSession: [];
-  openSettings: [];
+  openSettings: [section?: "skills"];
   signOut: [];
   closeCreateForm: [];
   openCreateForm: [];
@@ -385,21 +386,21 @@ function isSelected(item: VisNode): boolean {
         />
         <div class="create-project__actions">
           <button
-            type="submit"
-            class="btn btn--primary"
-            data-create-submit
-            :disabled="isCreatingProject"
-          >
-            {{ isCreatingProject ? "Создание..." : "Создать" }}
-          </button>
-          <button
             type="button"
-            class="btn"
+            class="ui-btn ui-btn--text"
             data-create-cancel
             :disabled="isCreatingProject"
             @click="closeCreateForm"
           >
             Отмена
+          </button>
+          <button
+            type="submit"
+            class="ui-btn ui-btn--filled"
+            data-create-submit
+            :disabled="isCreatingProject"
+          >
+            {{ isCreatingProject ? "Создаю…" : "Создать" }}
           </button>
         </div>
       </form>
@@ -465,14 +466,19 @@ function isSelected(item: VisNode): boolean {
         />
         <div class="create-project__actions">
           <button
+            type="button"
+            class="ui-btn ui-btn--text"
+            :disabled="isDeletingProject"
+            @click="cancelDeleteProject"
+          >Отмена</button>
+          <button
             type="submit"
-            class="btn btn--danger"
+            class="ui-btn ui-btn--filled ui-btn--danger"
             data-delete-project-submit
             :disabled="typedName !== projectToDelete.name || isDeletingProject"
           >
-            {{ isDeletingProject ? "Удаление..." : "Удалить проект" }}
+            {{ isDeletingProject ? "Удаляю…" : "Удалить проект" }}
           </button>
-          <button type="button" class="btn" :disabled="isDeletingProject" @click="cancelDeleteProject">Отмена</button>
         </div>
       </form>
       <p v-if="projects.length === 0" class="muted left-sidebar__hint">Нет проектов</p>
@@ -579,6 +585,10 @@ function isSelected(item: VisNode): boolean {
     </section>
 
     <footer class="left-sidebar__footer">
+      <button type="button" class="footer-btn" data-skills @click="emit('openSettings', 'skills')">
+        <BookOpen :size="15" aria-hidden="true" />
+        <span>Навыки</span>
+      </button>
       <button type="button" class="footer-btn" data-settings @click="emit('openSettings')">
         <Settings :size="15" aria-hidden="true" />
         <span>Настройки</span>
@@ -819,6 +829,7 @@ function isSelected(item: VisNode): boolean {
 .create-project__actions {
   display: flex;
   flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
   margin-top: 4px;
 }
@@ -837,26 +848,6 @@ function isSelected(item: VisNode): boolean {
 .create-project__input:focus {
   outline: 2px solid var(--accent);
   outline-offset: -1px;
-}
-
-.btn {
-  padding: 4px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--text);
-}
-
-.btn--primary {
-  background: var(--accent);
-  color: var(--accent-contrast);
-  border-color: var(--accent);
-}
-
-.btn--danger {
-  border-color: var(--danger);
-  background: var(--danger);
-  color: #fff;
 }
 
 .delete-project__text {
@@ -965,7 +956,6 @@ function isSelected(item: VisNode): boolean {
   white-space: nowrap;
 }
 
-.btn:disabled,
 .create-project__input:disabled {
   opacity: 0.6;
   cursor: not-allowed;

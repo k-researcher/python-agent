@@ -27,6 +27,10 @@
 
   --radius: 10px;
   --radius-sm: 6px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+  /* One height for buttons and one-line fields. */
+  --control-height: 36px;
   --shadow: 0 1px 2px rgba(43, 33, 24, 0.06), 0 8px 24px rgba(43, 33, 24, 0.08);
 
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,

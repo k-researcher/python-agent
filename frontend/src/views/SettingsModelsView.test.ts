@@ -97,11 +97,7 @@ async function mountView() {
   return wrapper;
 }
 
-const confirm = vi.fn((_question?: string) => true);
-
 beforeEach(() => {
-  confirm.mockReset().mockReturnValue(true);
-  Object.defineProperty(window, "confirm", { value: confirm, configurable: true });
   setActivePinia(createPinia());
   for (const call of Object.values(calls)) call.mockReset();
   calls.get.mockResolvedValue(baseView());
@@ -128,7 +124,7 @@ describe("SettingsModelsView", () => {
     calls.get.mockResolvedValue(view);
     const wrapper = await mountView();
     const card = wrapper.get('[data-provider="gateway"]');
-    expect(card.get('[data-testid="provider-remove"]').text()).toBe("Удалить");
+    expect(card.get('[data-testid="provider-remove"]').attributes("aria-label")).toBe("Удалить подключение gateway");
     expect(card.get('[data-testid="provider-reset"]').text()).toBe("Сбросить изменения");
     expect(card.find('[data-testid="provider-edit-key"]').exists()).toBe(true);
   });
@@ -289,7 +285,7 @@ describe("SettingsModelsView", () => {
     const wrapper = await mountView();
     const remove = wrapper.get('[data-model="main"] [data-testid="model-remove"]');
     expect(remove.attributes("disabled")).toBeUndefined();
-    expect(remove.classes()).toContain("danger");
+    expect(remove.classes()).toContain("ui-btn--danger");
   });
 
   it("changes the main and the service model", async () => {
@@ -492,7 +488,10 @@ describe("SettingsModelsView", () => {
     calls.removeProvider.mockResolvedValue(removed);
     const wrapper = await mountView();
     await wrapper.get('[data-provider="gateway"] [data-testid="provider-remove"]').trigger("click");
+    expect(calls.removeProvider).not.toHaveBeenCalled();
+    await wrapper.get('[data-testid="remove-confirm"]').trigger("click");
     await flushPromises();
+    expect(wrapper.find('[data-testid="remove-confirm"]').exists()).toBe(false);
     expect(calls.removeProvider).toHaveBeenCalledExactlyOnceWith("gateway", { checksum: "version-1" });
     expect(calls.resetProvider).not.toHaveBeenCalled();
     expect(wrapper.find('[data-provider="gateway"]').exists()).toBe(false);
@@ -501,25 +500,29 @@ describe("SettingsModelsView", () => {
   it("asks before removing a connection with its models and keeps it when cancelled", async () => {
     const wrapper = await mountView();
     const models = baseView().models.filter((model) => model.provider === "gateway").length;
-    confirm.mockReturnValue(false);
     await wrapper.get('[data-provider="gateway"] [data-testid="provider-remove"]').trigger("click");
+    const dialog = wrapper.get('[role="alertdialog"]');
+    expect(dialog.text()).toContain("Удалить подключение «gateway»?");
+    expect(dialog.text()).toContain(`Вместе с ним удалятся его модели: ${models}.`);
+    await dialog.findAll("button").find((button) => button.text() === "Отмена")!.trigger("click");
     await flushPromises();
-    expect(confirm).toHaveBeenCalledWith(
-      `Удалить подключение «gateway»? Вместе с ним удалятся его модели: ${models}.`,
-    );
+    expect(wrapper.find('[data-testid="remove-confirm"]').exists()).toBe(false);
     expect(calls.removeProvider).not.toHaveBeenCalled();
     expect(wrapper.find('[data-provider="gateway"]').exists()).toBe(true);
   });
 
   it("asks before removing a model", async () => {
     const wrapper = await mountView();
-    confirm.mockReturnValue(false);
     const button = wrapper.findAll('[data-testid="model-remove"]').find((item) => item.attributes("disabled") === undefined);
     expect(button).toBeDefined();
     await button!.trigger("click");
     await flushPromises();
-    expect(confirm.mock.calls[0][0]).toMatch(/^Удалить модель «.+»\?$/);
+    expect(wrapper.get('[role="alertdialog"]').text()).toMatch(/Удалить модель «.+»\?/);
     expect(calls.removeModel).not.toHaveBeenCalled();
+    calls.removeModel.mockResolvedValue(baseView());
+    await wrapper.get('[data-testid="remove-confirm"]').trigger("click");
+    await flushPromises();
+    expect(calls.removeModel).toHaveBeenCalledOnce();
   });
 
   it("edits named role mappings and excludes models of disabled providers", async () => {
@@ -584,7 +587,7 @@ describe("SettingsModelsView", () => {
     await wrapper.get('[data-provider="gateway"] [data-testid="provider-toggle"]').trigger("click");
     await flushPromises();
     finish(baseView()); await flushPromises();
-    expect(wrapper.get('[data-provider="gateway"] [data-testid="provider-toggle"]').text()).toBe("Включить");
+    expect(wrapper.get('[data-provider="gateway"] [data-testid="provider-toggle"]').attributes("aria-checked")).toBe("false");
     expect(wrapper.find('[data-testid="models-empty"]').exists()).toBe(true);
   });
 });

@@ -253,10 +253,10 @@ function onNewSession(): void {
   void router.push({ name: "home" });
 }
 
-function onOpenSettings(): void {
+function onOpenSettings(section?: "skills"): void {
   sessionStore.close();
   if (window.innerWidth <= 760) leftOpen.value = false;
-  void router.push({ name: "settings-models" });
+  void router.push({ name: section === "skills" ? "settings-skills" : "settings-models" });
 }
 
 function endAuthSession(): void {

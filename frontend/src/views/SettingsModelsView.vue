@@ -3,8 +3,7 @@
 // model for each role. Changes are stored on the server on top of the models file.
 
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { ArrowLeft, Plus, Search } from "lucide-vue-next";
-import { useRouter } from "vue-router";
+import { CircleAlert, Info, Plus, Search, Trash2, TriangleAlert, X } from "lucide-vue-next";
 import { ApiError } from "../api/client";
 import {
   modelSettings,
@@ -32,10 +31,12 @@ import {
   rolesOf,
   suggestModel,
 } from "../components/settings/modelForms";
+import SettingsDialog from "../components/settings/SettingsDialog.vue";
+import SettingsHeader from "../components/settings/SettingsHeader.vue";
+import ToggleSwitch from "../components/settings/ToggleSwitch.vue";
 import { useAppStore } from "../stores/app";
 import { SESSION_MODES, modeLabel } from "../modes";
 
-const router = useRouter();
 const appStore = useAppStore();
 
 const view = ref<ModelsView | null>(null);
@@ -137,6 +138,16 @@ const presetKey = ref(PROVIDER_PRESETS[0].key);
 const preset = computed(() => PROVIDER_PRESETS.find((item) => item.key === presetKey.value) ?? PROVIDER_PRESETS[0]);
 const form = reactive({ id: PROVIDER_PRESETS[0].id, baseUrl: PROVIDER_PRESETS[0].baseUrl, apiKey: "" });
 const showForm = ref(false);
+
+function openForm(): void {
+  choosePreset(presetKey.value);
+  actionError.value = "";
+  showForm.value = true;
+}
+
+function closeForm(): void {
+  if (busy.value !== "provider:new") showForm.value = false;
+}
 
 // Provider address being edited, by provider ID.
 const addresses = reactive<Record<string, string>>({});
@@ -418,24 +429,47 @@ function toggleModel(item: ModelView): Promise<boolean> {
   return apply(`model:${item.id}`, () => modelSettings.putModel(item.id, { disabled: !item.disabled }, saveOptions()));
 }
 
-async function removeProvider(item: ProviderView): Promise<boolean> {
+// A removal waits for the confirmation dialog; the dialog stays open while it runs or fails.
+interface Removal { title: string; text: string; action: () => Promise<boolean> }
+const removal = ref<Removal | null>(null);
+const dialogOpen = computed(() => showForm.value || !!removal.value);
+
+function removeProvider(item: ProviderView): void {
   const linked = (view.value?.models ?? []).filter((model) => model.provider === item.id).length;
-  const question = linked
-    ? `Удалить подключение «${item.id}»? Вместе с ним удалятся его модели: ${linked}.`
-    : `Удалить подключение «${item.id}»?`;
-  if (!window.confirm(question)) return false;
-  const saved = await apply(`provider:${item.id}`, () => modelSettings.removeProvider(item.id, saveOptions()));
-  if (saved) {
-    delete discoveries[item.id];
-    delete keys[item.id];
-    delete addresses[item.id];
-  }
-  return saved;
+  actionError.value = "";
+  removal.value = {
+    title: `Удалить подключение «${item.id}»?`,
+    text: linked
+      ? `Вместе с ним удалятся его модели: ${linked}. Сам сервер моделей не меняется.`
+      : "Сам сервер моделей не меняется.",
+    action: async () => {
+      const saved = await apply(`provider:${item.id}`, () => modelSettings.removeProvider(item.id, saveOptions()));
+      if (saved) {
+        delete discoveries[item.id];
+        delete keys[item.id];
+        delete addresses[item.id];
+      }
+      return saved;
+    },
+  };
 }
 
-function removeModel(item: ModelView): Promise<boolean> {
-  if (!window.confirm(`Удалить модель «${item.id}»?`)) return Promise.resolve(false);
-  return apply(`model:${item.id}`, () => modelSettings.removeModel(item.id, saveOptions()));
+function removeModel(item: ModelView): void {
+  actionError.value = "";
+  removal.value = {
+    title: `Удалить модель «${item.id}»?`,
+    text: "Модель пропадёт из списка моделей агента. Сервер и файлы модели не меняются.",
+    action: () => apply(`model:${item.id}`, () => modelSettings.removeModel(item.id, saveOptions())),
+  };
+}
+
+async function confirmRemoval(): Promise<void> {
+  const current = removal.value;
+  if (current && (await current.action())) removal.value = null;
+}
+
+function closeRemoval(): void {
+  if (!busy.value) removal.value = null;
 }
 
 function setDefault(value: string): Promise<boolean> {
@@ -450,11 +484,6 @@ function toggleFallback(id: string): Promise<boolean> {
   const current = view.value?.routing.fallback ?? [];
   const fallback = current.includes(id) ? current.filter((item) => item !== id) : [...current, id];
   return apply("routing", () => modelSettings.putRouting({ fallback }, saveOptions()));
-}
-
-function back(): void {
-  if (window.history.length > 1) router.back();
-  else void router.push({ name: "home" });
 }
 
 function setRole(role: string, value: string): Promise<boolean> {
@@ -477,290 +506,305 @@ onMounted(() => { void load(); void scan(); });
 </script>
 
 <template>
-  <section class="settings" data-testid="models-settings">
-    <header class="settings__header">
-      <button type="button" class="ghost" data-testid="settings-back" @click="back">
-        <ArrowLeft :size="16" aria-hidden="true" />
-        <span>Назад</span>
-      </button>
-      <h1>Модели</h1>
-      <nav class="settings__nav" aria-label="Разделы настроек">
-        <RouterLink :to="{ name: 'settings-models' }" aria-current="page">Модели</RouterLink>
-        <RouterLink :to="{ name: 'settings-speech' }" data-testid="settings-speech-link">Голос</RouterLink>
-        <RouterLink :to="{ name: 'settings-skills' }" data-testid="settings-skills-link">Навыки</RouterLink>
-      </nav>
-    </header>
+  <section class="ui-page" data-testid="models-settings">
+    <SettingsHeader title="Модели" />
 
-    <p v-if="loadError" class="notice notice--error" role="alert">
-      {{ loadError }}
-      <button type="button" class="link" @click="load">Повторить</button>
+    <p v-if="loadError" class="ui-notice ui-notice--error" role="alert">
+      <CircleAlert :size="16" aria-hidden="true" />
+      <span class="ui-notice__text">{{ loadError }}</span>
+      <button type="button" class="ui-link" @click="load">Повторить</button>
     </p>
-    <p v-if="actionError" class="notice notice--error" role="alert" data-testid="settings-error">{{ actionError }}</p>
-    <ul v-if="view?.warnings.length" class="notice notice--warning">
-      <li v-for="warning in view.warnings" :key="warning">{{ warning }}</li>
-    </ul>
+    <p v-if="actionError && !dialogOpen" class="ui-notice ui-notice--error" role="alert" data-testid="settings-error">
+      <CircleAlert :size="16" aria-hidden="true" />
+      <span class="ui-notice__text">{{ actionError }}</span>
+      <button type="button" class="ui-btn ui-btn--icon" aria-label="Скрыть сообщение" @click="actionError = ''">
+        <X :size="15" aria-hidden="true" />
+      </button>
+    </p>
+    <div v-if="view?.warnings.length" class="ui-notice ui-notice--warning">
+      <TriangleAlert :size="16" aria-hidden="true" />
+      <ul class="ui-notice__text">
+        <li v-for="warning in view.warnings" :key="warning">{{ warning }}</li>
+      </ul>
+    </div>
 
     <template v-if="view">
-      <section class="block" aria-labelledby="providers-title">
-        <div class="block__head">
-          <h2 id="providers-title">Подключения</h2>
-          <button type="button" class="ghost" data-testid="provider-add-open" @click="showForm = !showForm">
-            <Plus :size="15" aria-hidden="true" />
-            <span>Подключить сервер</span>
-          </button>
+      <section class="ui-section" aria-labelledby="providers-title">
+        <div class="ui-section__head">
+          <h2 id="providers-title" class="ui-section__title">Подключения</h2>
+          <div class="ui-section__actions">
+            <button type="button" class="ui-btn ui-btn--filled" data-testid="provider-add-open" @click="openForm">
+              <Plus :size="16" aria-hidden="true" />
+              <span>Подключить сервер</span>
+            </button>
+          </div>
         </div>
-        <p class="hint">Сервер с OpenAI-совместимым API: облачный шлюз или локальный, например LM Studio.</p>
+        <p class="ui-hint">Сервер с OpenAI-совместимым API: облачный шлюз или локальный, например LM Studio.</p>
 
-        <div class="card local" data-testid="local-servers">
-          <div class="card__row">
-            <strong>На этом компьютере</strong>
-            <button type="button" class="ghost" :disabled="scanning" data-testid="local-scan" @click="scan">
-              <Search :size="15" aria-hidden="true" />
+        <div class="ui-card local" data-testid="local-servers">
+          <div class="ui-card__row">
+            <strong class="ui-card__title">На этом компьютере</strong>
+            <button type="button" class="ui-btn ui-btn--text" :disabled="scanning" data-testid="local-scan" @click="scan">
+              <Search :size="16" aria-hidden="true" />
               <span>{{ scanning ? "Ищу…" : "Искать снова" }}</span>
             </button>
           </div>
-          <p v-if="localServers && !localServers.length" class="muted small">
+          <p v-if="localServers && !localServers.length" class="ui-card__meta local__empty">
             Запущенных серверов моделей не найдено. Запустите сервер в LM Studio (<code>lms server start</code>)
             или Ollama и нажмите «Искать снова».
           </p>
           <ul v-else-if="localServers" class="local__list">
             <li v-for="server in localServers" :key="server.base_url" class="local__row" :data-local="server.base_url">
               <span>{{ SERVER_NAMES[server.server] }}</span>
-              <span class="mono muted small">{{ server.base_url }}</span>
-              <span class="muted small">моделей: {{ server.models }}</span>
-              <span v-if="server.provider" class="muted small local__action">Подключён как {{ server.provider }}</span>
+              <span class="mono ui-card__meta">{{ server.base_url }}</span>
+              <span class="ui-card__meta">моделей: {{ server.models }}</span>
+              <span v-if="server.provider" class="ui-card__meta local__action">Подключён как {{ server.provider }}</span>
               <button
                 v-else
                 type="button"
-                class="ghost local__action"
+                class="ui-btn ui-btn--tonal local__action"
                 :disabled="!!busy"
                 data-testid="local-connect"
                 @click="connectLocal(server)"
               >
-                <Plus :size="14" aria-hidden="true" />
+                <Plus :size="16" aria-hidden="true" />
                 <span>Подключить</span>
               </button>
             </li>
           </ul>
         </div>
 
-        <form v-if="showForm" class="card form" data-testid="provider-form" @submit.prevent="addProvider">
-          <div class="presets" role="radiogroup" aria-label="Тип сервера">
-            <button
-              v-for="item in PROVIDER_PRESETS"
-              :key="item.key"
-              type="button"
-              role="radio"
-              :aria-checked="presetKey === item.key"
-              class="preset"
-              :data-preset="item.key"
-              @click="choosePreset(item.key)"
-            >{{ item.label }}</button>
-          </div>
-          <label>
-            <span>Имя</span>
-            <input v-model.trim="form.id" data-testid="provider-id" autocomplete="off" />
-          </label>
-          <label>
-            <span>Адрес API</span>
-            <input v-model.trim="form.baseUrl" class="mono" data-testid="provider-url" autocomplete="off" />
-          </label>
-          <label v-if="preset.needsKey">
-            <span>Ключ API</span>
-            <input v-model="form.apiKey" type="password" data-testid="provider-key" autocomplete="off" />
-          </label>
-          <p v-if="preset.key === 'lmstudio'" class="hint">
-            Запустите сервер в LM Studio (вкладка Developer или <code>lms server start</code>). Порт сервера
-            виден там же, по умолчанию 1234. Длина контекста модели при загрузке должна быть не меньше той,
-            что указана здесь.
-          </p>
-          <p v-if="formError" class="field-error" data-testid="provider-form-error">{{ formError }}</p>
-          <div class="actions">
-            <button type="submit" class="primary" :disabled="!!formError || busy === 'provider:new'">
-              Подключить и найти модели
-            </button>
-            <button type="button" class="ghost" @click="showForm = false">Отмена</button>
-          </div>
-        </form>
-
         <article
           v-for="item in view.providers"
           :key="item.id"
-          class="card"
-          :class="{ 'card--off': item.disabled }"
+          class="ui-card"
+          :class="{ 'ui-card--off': item.disabled }"
           data-testid="provider-card"
           :data-provider="item.id"
         >
-          <div class="card__row">
-            <div class="card__main">
-              <strong>{{ item.id }}</strong>
-              <span class="mono muted">{{ item.base_url }}</span>
-              <span class="muted small">{{ keyStatus(item) }} · {{ originLabel(item.origin, item.has_base) }}</span>
-              <button v-if="item.has_base && item.origin === 'ui'" type="button" class="link small card__link" :disabled="!!busy" data-testid="provider-reset" @click="resetProvider(item.id)">Сбросить изменения</button>
-              <span v-if="item.key_source" class="muted small" data-testid="provider-key-origin">
+          <div class="ui-card__row">
+            <div class="ui-card__main">
+              <strong class="ui-card__title">{{ item.id }}</strong>
+              <span class="mono ui-card__meta">{{ item.base_url }}</span>
+              <span class="ui-card__meta">{{ keyStatus(item) }} · {{ originLabel(item.origin, item.has_base) }}</span>
+              <span v-if="item.key_source" class="ui-card__meta" data-testid="provider-key-origin">
                 Источник ключа: {{ item.key_source === 'ui' ? 'сохранён в приложении' : item.key_source === 'env' ? 'окружение' : 'без ключа' }}
               </span>
+              <button
+                v-if="item.has_base && item.origin === 'ui'"
+                type="button"
+                class="ui-link ui-small card__link"
+                :disabled="!!busy"
+                data-testid="provider-reset"
+                @click="resetProvider(item.id)"
+              >Сбросить изменения</button>
             </div>
-            <div class="card__actions">
+            <div class="ui-card__actions">
               <button
                 type="button"
-                class="ghost"
+                class="ui-btn ui-btn--outlined"
                 :disabled="item.disabled || discoveries[item.id]?.loading"
                 data-testid="provider-discover"
                 @click="discover(item)"
               >
-                <Search :size="15" aria-hidden="true" />
+                <Search :size="16" aria-hidden="true" />
                 <span>{{ discoveries[item.id]?.loading ? "Ищу…" : "Найти модели" }}</span>
               </button>
               <button
                 type="button"
-                class="ghost"
+                class="ui-btn ui-btn--text"
                 :disabled="!!busy"
                 data-testid="provider-edit-url"
                 @click="addresses[item.id] = item.base_url"
-              >Изменить адрес</button>
-              <button type="button" class="ghost" :disabled="!!busy" data-testid="provider-edit-key" @click="editKey(item)">Изменить ключ</button>
-              <button type="button" class="ghost toggle" :disabled="!!busy" data-testid="provider-toggle" @click="toggleProvider(item)">
-                {{ item.disabled ? "Включить" : "Отключить" }}
-              </button>
+              >Адрес</button>
               <button
                 type="button"
-                class="ghost danger"
+                class="ui-btn ui-btn--text"
+                :disabled="!!busy"
+                data-testid="provider-edit-key"
+                @click="editKey(item)"
+              >Ключ</button>
+              <button
+                type="button"
+                class="ui-btn ui-btn--icon ui-btn--danger"
+                :aria-label="`Удалить подключение ${item.id}`"
+                title="Удалить"
                 :disabled="!!busy"
                 data-testid="provider-remove"
                 @click="removeProvider(item)"
-              >Удалить</button>
+              >
+                <Trash2 :size="16" aria-hidden="true" />
+              </button>
+              <ToggleSwitch
+                :model-value="!item.disabled"
+                :label="`Подключение ${item.id} включено`"
+                :disabled="!!busy"
+                data-testid="provider-toggle"
+                @update:model-value="toggleProvider(item)"
+              />
             </div>
           </div>
 
           <form
             v-if="addresses[item.id] !== undefined"
-            class="address"
+            class="inline-form"
             data-testid="provider-url-form"
             @submit.prevent="saveAddress(item)"
           >
-            <input v-model.trim="addresses[item.id]" class="mono" aria-label="Адрес API" data-testid="provider-url-edit" />
-            <button type="submit" class="primary" :disabled="!!addressError(addresses[item.id]) || !!busy">Сохранить</button>
-            <button type="button" class="ghost" @click="delete addresses[item.id]">Отмена</button>
-            <span v-if="addressError(addresses[item.id])" class="field-error">{{ addressError(addresses[item.id]) }}</span>
+            <label class="ui-field inline-form__wide">
+              <span class="ui-field__label">Адрес API</span>
+              <input
+                v-model.trim="addresses[item.id]"
+                class="ui-input mono"
+                autocomplete="off"
+                spellcheck="false"
+                :aria-invalid="!!addressError(addresses[item.id])"
+                data-testid="provider-url-edit"
+              />
+              <small v-if="addressError(addresses[item.id])" class="ui-field__help ui-field__help--error">
+                {{ addressError(addresses[item.id]) }}
+              </small>
+            </label>
+            <div class="inline-form__actions">
+              <button type="button" class="ui-btn ui-btn--text" @click="delete addresses[item.id]">Отмена</button>
+              <button type="submit" class="ui-btn ui-btn--filled" :disabled="!!addressError(addresses[item.id]) || !!busy">
+                Сохранить
+              </button>
+            </div>
           </form>
 
-          <form v-if="keys[item.id]" class="key-editor" data-testid="provider-key-form" @submit.prevent="saveKey(item)">
-            <label>
-              <span>Источник ключа</span>
-              <select v-model="keys[item.id].source" data-testid="provider-key-source">
+          <form v-if="keys[item.id]" class="inline-form" data-testid="provider-key-form" @submit.prevent="saveKey(item)">
+            <label class="ui-field">
+              <span class="ui-field__label">Источник ключа</span>
+              <select v-model="keys[item.id].source" class="ui-input" data-testid="provider-key-source">
                 <option value="ui">Сохранить в приложении</option>
                 <option value="env">Из окружения</option>
                 <option value="none">Без ключа</option>
               </select>
             </label>
-            <label v-if="keys[item.id].source === 'ui'">
-              <span>Новый ключ</span>
-              <input v-model="keys[item.id].value" type="password" autocomplete="new-password" data-testid="provider-key-value" />
-              <span v-if="item.key_source === 'ui' && item.api_key_set" class="hint">Оставьте пустым, чтобы сохранить текущий ключ.</span>
+            <label v-if="keys[item.id].source === 'ui'" class="ui-field inline-form__wide">
+              <span class="ui-field__label">Новый ключ</span>
+              <input
+                v-model="keys[item.id].value"
+                class="ui-input"
+                type="password"
+                autocomplete="new-password"
+                data-testid="provider-key-value"
+              />
+              <small v-if="item.key_source === 'ui' && item.api_key_set" class="ui-field__help">
+                Оставьте пустым, чтобы сохранить текущий ключ.
+              </small>
             </label>
-            <label v-if="keys[item.id].source === 'env'">
-              <span>Переменная окружения</span>
-              <input v-model.trim="keys[item.id].env" autocomplete="off" data-testid="provider-key-env" />
+            <label v-if="keys[item.id].source === 'env'" class="ui-field inline-form__wide">
+              <span class="ui-field__label">Переменная окружения</span>
+              <input v-model.trim="keys[item.id].env" class="ui-input mono" autocomplete="off" data-testid="provider-key-env" />
             </label>
-            <p v-if="keys[item.id].source === 'none'" class="hint">Сохранённый ключ будет очищен. Ключ из окружения использоваться не будет.</p>
-            <p v-if="keyError(item)" class="field-error">{{ keyError(item) }}</p>
-            <div class="actions">
-              <button type="submit" class="primary" :disabled="!!busy || !!keyError(item)">Сохранить ключ</button>
-              <button type="button" class="ghost" @click="delete keys[item.id]">Отмена</button>
+            <p v-if="keys[item.id].source === 'none'" class="ui-field__help inline-form__wide">
+              Сохранённый ключ будет очищен. Ключ из окружения использоваться не будет.
+            </p>
+            <p v-if="keyError(item)" class="ui-field__help ui-field__help--error inline-form__wide">{{ keyError(item) }}</p>
+            <div class="inline-form__actions">
+              <button type="button" class="ui-btn ui-btn--text" @click="delete keys[item.id]">Отмена</button>
+              <button type="submit" class="ui-btn ui-btn--filled" :disabled="!!busy || !!keyError(item)">Сохранить ключ</button>
             </div>
           </form>
 
           <div v-if="discoveries[item.id] && !discoveries[item.id].loading" class="found" data-testid="found-models">
-            <p v-if="discoveries[item.id].message" class="muted small">{{ discoveries[item.id].message }}</p>
-            <template v-else>
-              <ul>
-                <li v-for="found in discoveries[item.id].found" :key="found.id" class="found__item" :data-found="found.id">
-                  <div class="found__info">
-                    <span class="mono found__name">{{ found.id }}</span>
-                    <span class="muted small">{{ describeFound(found) }}</span>
-                    <span v-if="found.state" class="muted small">
-                      {{ found.state === "loaded" ? "загружена в память" : "не загружена" }}
-                    </span>
-                    <span v-if="foundCheck(item, found) === 'checking'" class="muted small">Проверяю…</span>
-                    <span v-else-if="answered(foundCheck(item, found))" class="small ok" data-testid="found-check">
-                      {{ probeText(foundCheck(item, found) as ProbeResult) }}
-                    </span>
-                    <span v-else-if="failed(foundCheck(item, found))" class="small bad" data-testid="found-check">
-                      {{ probeText(foundCheck(item, found) as ProbeResult) }}
-                    </span>
-                  </div>
-                  <div v-if="addedAs(view.models, item.id, found.id)" class="found__actions muted small">
-                    Добавлена как {{ addedAs(view.models, item.id, found.id) }}
-                  </div>
-                  <div v-else-if="canChat(found)" class="found__actions">
-                    <button
-                      type="button"
-                      class="ghost"
-                      title="Пробный запрос генерации; может расходовать подписку"
-                      data-testid="found-probe"
-                      @click="checkFound(item, found)"
-                      :disabled="foundCheck(item, found) === 'checking'"
-                    >Проверить ответ</button>
-                    <button
-                      type="button"
-                      class="ghost"
-                      :disabled="!!busy"
-                      data-testid="found-add"
-                      @click="addModel(item, found)"
-                    >
-                      <Plus :size="14" aria-hidden="true" />
-                      <span>Добавить</span>
-                    </button>
-                  </div>
-                </li>
-              </ul>
-            </template>
+            <p v-if="discoveries[item.id].message" class="ui-card__meta">{{ discoveries[item.id].message }}</p>
+            <ul v-else>
+              <li v-for="found in discoveries[item.id].found" :key="found.id" class="found__item" :data-found="found.id">
+                <div class="found__info">
+                  <span class="mono found__name">{{ found.id }}</span>
+                  <span class="ui-card__meta">{{ describeFound(found) }}</span>
+                  <span v-if="found.state" class="ui-card__meta">
+                    {{ found.state === "loaded" ? "загружена в память" : "не загружена" }}
+                  </span>
+                  <span v-if="foundCheck(item, found) === 'checking'" class="ui-card__meta">Проверяю…</span>
+                  <span v-else-if="answered(foundCheck(item, found))" class="ui-small ui-ok" data-testid="found-check">
+                    {{ probeText(foundCheck(item, found) as ProbeResult) }}
+                  </span>
+                  <span v-else-if="failed(foundCheck(item, found))" class="ui-small ui-bad" data-testid="found-check">
+                    {{ probeText(foundCheck(item, found) as ProbeResult) }}
+                  </span>
+                </div>
+                <div v-if="addedAs(view.models, item.id, found.id)" class="found__actions ui-card__meta">
+                  Добавлена как {{ addedAs(view.models, item.id, found.id) }}
+                </div>
+                <div v-else-if="canChat(found)" class="found__actions">
+                  <button
+                    type="button"
+                    class="ui-btn ui-btn--text"
+                    title="Пробный запрос генерации; может расходовать подписку"
+                    data-testid="found-probe"
+                    :disabled="foundCheck(item, found) === 'checking'"
+                    @click="checkFound(item, found)"
+                  >Проверить ответ</button>
+                  <button
+                    type="button"
+                    class="ui-btn ui-btn--tonal"
+                    :disabled="!!busy"
+                    data-testid="found-add"
+                    @click="addModel(item, found)"
+                  >
+                    <Plus :size="16" aria-hidden="true" />
+                    <span>Добавить</span>
+                  </button>
+                </div>
+              </li>
+            </ul>
           </div>
         </article>
       </section>
 
-      <section class="block" aria-labelledby="models-title">
-        <h2 id="models-title">Модели агента</h2>
-        <p v-if="!view.models.length" class="muted">Моделей пока нет. Подключите сервер и найдите модели.</p>
+      <section class="ui-section" aria-labelledby="models-title">
+        <h2 id="models-title" class="ui-section__title">Модели агента</h2>
+        <p class="ui-hint">Модели, которые агент может выбрать для сессии. Выключенная модель не предлагается.</p>
+        <p v-if="!view.models.length" class="ui-empty">Моделей пока нет. Подключите сервер и найдите модели.</p>
         <article
           v-for="item in view.models"
           :key="item.id"
-          class="card"
-          :class="{ 'card--off': item.disabled || item.provider_disabled }"
+          class="ui-card"
+          :class="{ 'ui-card--off': item.disabled || item.provider_disabled }"
           data-testid="model-card"
           :data-model="item.id"
         >
-          <div class="card__row">
-            <div class="card__main">
-              <strong>{{ item.id }}</strong>
-              <span class="muted small">
+          <div class="ui-card__row">
+            <div class="ui-card__main">
+              <strong class="ui-card__title">{{ item.id }}</strong>
+              <span class="ui-card__meta">
                 <span class="mono">{{ item.model }}</span> · {{ item.provider }} · {{ originLabel(item.origin, item.has_base) }}
               </span>
-              <button v-if="item.has_base && item.origin === 'ui'" type="button" class="link small card__link" :disabled="!!busy" data-testid="model-reset" @click="resetModel(item.id)">Сбросить изменения</button>
-              <span v-if="item.provider_disabled" class="small muted" data-testid="model-provider-off">Сервер отключён</span>
-              <span class="small muted" data-testid="model-price">{{ priceLabel(item) }}</span>
-              <span v-if="!item.pricing && costLimit" class="small bad" data-testid="model-price-warning">
+              <span v-if="item.provider_disabled" class="ui-card__meta" data-testid="model-provider-off">Сервер отключён</span>
+              <span class="ui-card__meta" data-testid="model-price">{{ priceLabel(item) }}</span>
+              <span v-if="!item.pricing && costLimit" class="ui-small ui-bad" data-testid="model-price-warning">
                 У сессий есть лимит стоимости ${{ costLimit }}, поэтому модель без цены не запустится.
                 Выберите «Без оплаты» или укажите цену.
               </span>
-              <span v-if="rolesOf(view.routing, item.id).length" class="small" data-testid="model-roles">
+              <span v-if="rolesOf(view.routing, item.id).length" class="ui-small" data-testid="model-roles">
                 Роль: {{ rolesOf(view.routing, item.id).join(", ") }}
               </span>
-              <span v-if="modelChecks[item.id] === 'checking'" class="muted small">Проверяю…</span>
+              <span v-if="modelChecks[item.id] === 'checking'" class="ui-card__meta">Проверяю…</span>
               <span
                 v-else-if="modelChecks[item.id]"
-                class="small"
-                :class="answered(modelChecks[item.id]) ? 'ok' : 'bad'"
+                class="ui-small"
+                :class="answered(modelChecks[item.id]) ? 'ui-ok' : 'ui-bad'"
                 data-testid="model-check"
               >{{ probeText(modelChecks[item.id] as ProbeResult) }}{{
                 failed(modelChecks[item.id]) ? " · не предлагается для новых сессий" : ""
               }}</span>
+              <button
+                v-if="item.has_base && item.origin === 'ui'"
+                type="button"
+                class="ui-link ui-small card__link"
+                :disabled="!!busy"
+                data-testid="model-reset"
+                @click="resetModel(item.id)"
+              >Сбросить изменения</button>
             </div>
-            <div class="card__actions">
+            <div class="ui-card__actions">
               <button
                 type="button"
-                class="ghost"
+                class="ui-btn ui-btn--outlined"
                 :disabled="item.disabled || item.provider_disabled || modelChecks[item.id] === 'checking'"
                 title="Пробный запрос генерации; может расходовать подписку"
                 data-testid="model-probe"
@@ -768,70 +812,109 @@ onMounted(() => { void load(); void scan(); });
               >Проверить ответ</button>
               <button
                 type="button"
-                class="ghost toggle"
-                :disabled="!!busy"
-                data-testid="model-toggle"
-                @click="toggleModel(item)"
-              >
-                {{ item.disabled ? "Включить" : "Отключить" }}
-              </button>
-              <button
-                type="button"
-                class="ghost danger"
+                class="ui-btn ui-btn--icon ui-btn--danger"
+                :aria-label="`Удалить модель ${item.id}`"
+                title="Удалить"
                 :disabled="!!busy"
                 data-testid="model-remove"
                 @click="removeModel(item)"
-              >Удалить</button>
+              >
+                <Trash2 :size="16" aria-hidden="true" />
+              </button>
+              <ToggleSwitch
+                :model-value="!item.disabled"
+                :label="`Модель ${item.id} включена`"
+                :disabled="!!busy"
+                data-testid="model-toggle"
+                @update:model-value="toggleModel(item)"
+              />
             </div>
           </div>
           <div v-if="limits[item.id]" class="limits">
-            <label>
-              <span>Контекст, токенов</span>
-              <input v-model.number="limits[item.id].context_window" type="number" min="4096" step="1024" data-testid="model-context" />
+            <label class="ui-field">
+              <span class="ui-field__label">Контекст, токенов</span>
+              <input
+                v-model.number="limits[item.id].context_window"
+                class="ui-input"
+                type="number"
+                min="4096"
+                step="1024"
+                data-testid="model-context"
+              />
             </label>
-            <label>
-              <span>Максимум ответа</span>
-              <input v-model.number="limits[item.id].max_tokens" type="number" min="1" step="256" data-testid="model-max-tokens" />
+            <label class="ui-field">
+              <span class="ui-field__label">Максимум ответа</span>
+              <input
+                v-model.number="limits[item.id].max_tokens"
+                class="ui-input"
+                type="number"
+                min="1"
+                step="256"
+                data-testid="model-max-tokens"
+              />
             </label>
-            <label>
-              <span>Оплата</span>
-              <select v-model="limits[item.id].price" data-testid="model-price-mode">
+            <label class="ui-field">
+              <span class="ui-field__label">Оплата</span>
+              <select v-model="limits[item.id].price" class="ui-input" data-testid="model-price-mode">
                 <option v-if="!item.pricing" value="unset" disabled>Не указана</option>
                 <option value="free">Без оплаты</option>
                 <option value="paid">Платная</option>
               </select>
             </label>
             <template v-if="limits[item.id].price === 'paid'">
-              <label>
-                <span>Вход, $ за 1M</span>
-                <input v-model.number="limits[item.id].input" type="number" min="0" step="0.01" data-testid="model-price-input" />
+              <label class="ui-field">
+                <span class="ui-field__label">Вход, $ за 1M</span>
+                <input
+                  v-model.number="limits[item.id].input"
+                  class="ui-input"
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  data-testid="model-price-input"
+                />
               </label>
-              <label>
-                <span>Выход, $ за 1M</span>
-                <input v-model.number="limits[item.id].output" type="number" min="0" step="0.01" data-testid="model-price-output" />
+              <label class="ui-field">
+                <span class="ui-field__label">Выход, $ за 1M</span>
+                <input
+                  v-model.number="limits[item.id].output"
+                  class="ui-input"
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  data-testid="model-price-output"
+                />
               </label>
             </template>
             <button
               v-if="limitsChanged(item)"
               type="button"
-              class="primary"
+              class="ui-btn ui-btn--filled"
               :disabled="!!limitsError(item) || !!busy"
               data-testid="model-save"
               @click="saveLimits(item)"
             >Сохранить</button>
-            <span v-if="limitsChanged(item) && limitsError(item)" class="field-error">{{ limitsError(item) }}</span>
+            <span v-if="limitsChanged(item) && limitsError(item)" class="ui-field__help ui-field__help--error limits__error">
+              {{ limitsError(item) }}
+            </span>
           </div>
         </article>
       </section>
 
-      <p v-if="!activeModels.length" class="notice" data-testid="models-empty">Нет включённых моделей. Подключите сервер и добавьте модель или включите существующую.</p>
+      <p v-if="!activeModels.length" class="ui-notice" data-testid="models-empty">
+        <Info :size="16" aria-hidden="true" />
+        <span class="ui-notice__text">
+          Нет включённых моделей. Подключите сервер и добавьте модель или включите существующую.
+        </span>
+      </p>
 
-      <section v-if="activeModels.length" class="block" aria-labelledby="roles-title">
-        <h2 id="roles-title">Роли</h2>
-        <div class="card roles">
-          <label>
-            <span>Основная модель</span>
+      <section v-if="activeModels.length" class="ui-section" aria-labelledby="roles-title">
+        <h2 id="roles-title" class="ui-section__title">Роли</h2>
+        <p class="ui-hint">Какая модель отвечает в каждом режиме. Изменение сохраняется сразу.</p>
+        <div class="ui-card roles">
+          <label class="ui-field">
+            <span class="ui-field__label">Основная модель</span>
             <select
+              class="ui-input"
               :value="view.routing.default"
               :disabled="!!busy"
               data-testid="routing-default"
@@ -840,9 +923,10 @@ onMounted(() => { void load(); void scan(); });
               <option v-for="item in activeModels" :key="item.id" :value="item.id">{{ item.id }}</option>
             </select>
           </label>
-          <label>
-            <span>Служебная модель (названия, сжатие контекста)</span>
+          <label class="ui-field">
+            <span class="ui-field__label">Служебная модель (названия, сжатие контекста)</span>
             <select
+              class="ui-input"
               :value="view.routing.light ?? ''"
               :disabled="!!busy"
               data-testid="routing-light"
@@ -852,16 +936,22 @@ onMounted(() => { void load(); void scan(); });
               <option v-for="item in activeModels" :key="item.id" :value="item.id">{{ item.id }}</option>
             </select>
           </label>
-          <label v-for="role in roleNames" :key="role">
-            <span>{{ modeLabel(role) }}</span>
-            <select :value="view.routing.roles[role] ?? ''" :disabled="!!busy" :data-routing-role="role" @change="setRole(role, ($event.target as HTMLSelectElement).value)">
+          <label v-for="role in roleNames" :key="role" class="ui-field">
+            <span class="ui-field__label">{{ modeLabel(role) }}</span>
+            <select
+              class="ui-input"
+              :value="view.routing.roles[role] ?? ''"
+              :disabled="!!busy"
+              :data-routing-role="role"
+              @change="setRole(role, ($event.target as HTMLSelectElement).value)"
+            >
               <option value="">Как основная</option>
               <option v-for="item in activeModels" :key="item.id" :value="item.id">{{ item.id }}</option>
             </select>
           </label>
-          <fieldset>
-            <legend>Запасные модели при сбоях</legend>
-            <label v-for="item in activeModels" :key="item.id" class="check">
+          <fieldset class="fallback">
+            <legend class="ui-field__label">Запасные модели при сбоях</legend>
+            <label v-for="item in activeModels" :key="item.id" class="ui-choice">
               <input
                 type="checkbox"
                 :checked="view.routing.fallback.includes(item.id)"
@@ -875,323 +965,169 @@ onMounted(() => { void load(); void scan(); });
         </div>
       </section>
 
-      <section v-if="view.deleted?.providers.length || view.deleted?.models.length" class="block" data-testid="deleted-settings">
-        <h2>Удалённые настройки из файла</h2>
-        <div v-for="id in view.deleted?.providers" :key="`provider:${id}`" class="found__item">
-          <div class="found__info deleted__info">
-            <span class="found__name">Сервер {{ id }}</span>
-            <span class="muted small" :data-remove-hint-provider="id">
-              Чтобы убрать совсем, удалите блок <code>{{ id }}</code> из раздела <code>providers</code> в config/models.yaml.
-            </span>
+      <section
+        v-if="view.deleted?.providers.length || view.deleted?.models.length"
+        class="ui-section"
+        aria-labelledby="deleted-title"
+        data-testid="deleted-settings"
+      >
+        <h2 id="deleted-title" class="ui-section__title">Удалённые настройки из файла</h2>
+        <p class="ui-hint">Эти настройки заданы в файле моделей и скрыты здесь. Их можно вернуть.</p>
+        <div class="ui-card">
+          <div v-for="id in view.deleted?.providers" :key="`provider:${id}`" class="found__item">
+            <div class="found__info deleted__info">
+              <span class="found__name">Сервер {{ id }}</span>
+              <span class="ui-card__meta" :data-remove-hint-provider="id">
+                Чтобы убрать совсем, удалите блок <code>{{ id }}</code> из раздела <code>providers</code> в config/models.yaml.
+              </span>
+            </div>
+            <div class="found__actions">
+              <button
+                type="button"
+                class="ui-btn ui-btn--outlined"
+                :disabled="!!busy"
+                :data-restore-provider="id"
+                @click="resetProvider(id)"
+              >Восстановить</button>
+            </div>
           </div>
-          <div class="found__actions">
-            <button type="button" class="ghost" :disabled="!!busy" :data-restore-provider="id" @click="resetProvider(id)">Восстановить</button>
-          </div>
-        </div>
-        <div v-for="id in view.deleted?.models" :key="`model:${id}`" class="found__item">
-          <div class="found__info deleted__info">
-            <span class="found__name">Модель {{ id }}</span>
-            <span class="muted small" :data-remove-hint-model="id">
-              Чтобы убрать совсем, удалите блок <code>{{ id }}</code> из раздела <code>models</code> в config/models.yaml.
-            </span>
-          </div>
-          <div class="found__actions">
-            <button type="button" class="ghost" :disabled="!!busy" :data-restore-model="id" @click="resetModel(id)">Восстановить</button>
+          <div v-for="id in view.deleted?.models" :key="`model:${id}`" class="found__item">
+            <div class="found__info deleted__info">
+              <span class="found__name">Модель {{ id }}</span>
+              <span class="ui-card__meta" :data-remove-hint-model="id">
+                Чтобы убрать совсем, удалите блок <code>{{ id }}</code> из раздела <code>models</code> в config/models.yaml.
+              </span>
+            </div>
+            <div class="found__actions">
+              <button
+                type="button"
+                class="ui-btn ui-btn--outlined"
+                :disabled="!!busy"
+                :data-restore-model="id"
+                @click="resetModel(id)"
+              >Восстановить</button>
+            </div>
           </div>
         </div>
       </section>
     </template>
-    <p v-else-if="!loadError" class="muted">Загрузка…</p>
+    <p v-else-if="!loadError" class="ui-hint">Загрузка…</p>
+
+    <SettingsDialog :open="showForm" title="Подключить сервер" @close="closeForm">
+      <form id="provider-form" class="ui-form" novalidate data-testid="provider-form" @submit.prevent="addProvider">
+        <div class="ui-tabs presets" role="radiogroup" aria-label="Тип сервера">
+          <button
+            v-for="item in PROVIDER_PRESETS"
+            :key="item.key"
+            type="button"
+            role="radio"
+            :aria-checked="presetKey === item.key"
+            :data-preset="item.key"
+            @click="choosePreset(item.key)"
+          >{{ item.label }}</button>
+        </div>
+        <label class="ui-field">
+          <span class="ui-field__label">Имя</span>
+          <input v-model.trim="form.id" class="ui-input" data-autofocus data-testid="provider-id" autocomplete="off" />
+        </label>
+        <label class="ui-field">
+          <span class="ui-field__label">Адрес API</span>
+          <input
+            v-model.trim="form.baseUrl"
+            class="ui-input mono"
+            data-testid="provider-url"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </label>
+        <label v-if="preset.needsKey" class="ui-field">
+          <span class="ui-field__label">Ключ API</span>
+          <input v-model="form.apiKey" class="ui-input" type="password" data-testid="provider-key" autocomplete="off" />
+        </label>
+        <p v-if="preset.key === 'lmstudio'" class="ui-field__help">
+          <span>
+            Запустите сервер в LM Studio (вкладка Developer или <code>lms server start</code>). Порт сервера
+            виден там же, по умолчанию 1234. Длина контекста модели при загрузке должна быть не меньше той,
+            что указана здесь.
+          </span>
+        </p>
+        <p v-if="formError" class="ui-field__help ui-field__help--error" data-testid="provider-form-error">{{ formError }}</p>
+        <p v-if="actionError" class="ui-notice ui-notice--error" role="alert">
+          <CircleAlert :size="16" aria-hidden="true" />
+          <span class="ui-notice__text">{{ actionError }}</span>
+        </p>
+      </form>
+      <template #actions>
+        <button type="button" class="ui-btn ui-btn--text" :disabled="busy === 'provider:new'" @click="closeForm">
+          Отмена
+        </button>
+        <button
+          type="submit"
+          form="provider-form"
+          class="ui-btn ui-btn--filled"
+          :disabled="!!formError || busy === 'provider:new'"
+          data-testid="provider-save"
+        >
+          {{ busy === "provider:new" ? "Подключаю…" : "Подключить и найти модели" }}
+        </button>
+      </template>
+    </SettingsDialog>
+
+    <SettingsDialog :open="!!removal" :title="removal?.title ?? ''" alert @close="closeRemoval">
+      <p>{{ removal?.text }}</p>
+      <p v-if="actionError" class="ui-notice ui-notice--error" role="alert">
+        <CircleAlert :size="16" aria-hidden="true" />
+        <span class="ui-notice__text">{{ actionError }}</span>
+      </p>
+      <template #actions>
+        <button type="button" class="ui-btn ui-btn--text" data-autofocus :disabled="!!busy" @click="closeRemoval">
+          Отмена
+        </button>
+        <button
+          type="button"
+          class="ui-btn ui-btn--filled ui-btn--danger"
+          :disabled="!!busy"
+          data-testid="remove-confirm"
+          @click="confirmRemoval"
+        >{{ busy ? "Удаляю…" : "Удалить" }}</button>
+      </template>
+    </SettingsDialog>
   </section>
 </template>
 
 <style scoped>
-.settings {
-  max-width: 860px;
-  margin: 0 auto;
-  padding: 16px 20px 48px;
-  overflow-y: auto;
-  height: 100%;
-  box-sizing: border-box;
-}
-
-.settings__header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.settings__nav {
-  display: flex;
-  gap: 4px;
-  margin-left: auto;
-}
-
-.settings__nav a {
-  padding: 4px 10px;
-  border-radius: var(--radius-sm);
-  color: var(--text-muted);
-  font-size: 13px;
-  text-decoration: none;
-}
-
-.settings__nav a[aria-current="page"] {
-  background: var(--bg-subtle);
-  color: var(--text);
-}
-
-h1 {
-  margin: 0;
-  font-size: 20px;
-}
-
-h2 {
-  margin: 0;
-  font-size: 15px;
-}
-
-.block {
-  margin-top: 20px;
-}
-
-.block__head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.hint {
-  margin: 4px 0 10px;
-  color: var(--text-muted);
-  font-size: 13px;
-}
-
-.card {
+.ui-card {
   margin-top: 8px;
-  padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
 }
 
-/* Dim the details of a switched off item, but keep its buttons readable. */
-.card--off .card__main > :not(.card__link),
-.card--off .limits {
+/* A switched off card dims its details too, but keeps the buttons readable. */
+.ui-card--off .limits {
   opacity: 0.6;
+}
+
+.ui-card--off .ui-card__main > .card__link {
+  opacity: 1;
 }
 
 /* An optional action sits under the label it belongs to, so every card has the same buttons. */
 .card__link {
   align-self: flex-start;
-  min-height: 0;
-  height: auto;
-  padding: 0;
+  margin-top: 2px;
 }
 
-.card__row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px 12px;
-}
-
-.card__main {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-/* Buttons keep to the right edge; a wrapped group stays there too. */
-.card__actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-  margin-left: auto;
-}
-
-/* "Включить" and "Отключить" take the same width, so the next buttons do not move. */
-.toggle {
-  min-width: 7.2em;
-  justify-content: center;
-}
-
-.small {
-  font-size: 12px;
-}
-
-button.ghost,
-button.primary,
-.preset {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text);
-  font-size: 13px;
-  cursor: pointer;
-}
-
-button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-contrast);
-}
-
-button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-button.danger {
-  border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
-  color: var(--danger);
-}
-
-button.danger:not(:disabled):hover {
-  background: color-mix(in srgb, var(--danger) 10%, transparent);
-}
-
-button.link {
-  border: 0;
-  background: none;
-  color: var(--link);
-  text-decoration: underline;
-  cursor: pointer;
-}
-
-.preset[aria-checked="true"] {
-  border-color: var(--accent);
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-}
-
-.form,
-.key-editor,
-.roles {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.presets {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 13px;
-  color: var(--text-muted);
-}
-
-input,
-select {
-  padding: 6px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-  color: var(--text);
-  font: inherit;
-  font-size: 14px;
-}
-
-input.mono {
-  font-family: var(--font-mono);
-}
-
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.field-error {
-  margin: 0;
-  color: var(--danger);
-  font-size: 13px;
-}
-
-.notice {
-  margin: 8px 0;
-  padding: 8px 12px;
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-}
-
-.notice--error {
-  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
-  background: color-mix(in srgb, var(--danger) 8%, transparent);
-  color: var(--danger);
-}
-
-.notice--warning {
-  padding-left: 28px;
-  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
-  background: color-mix(in srgb, var(--warning) 8%, transparent);
-  color: var(--warning);
-}
-
-.ok {
-  color: var(--success);
-}
-
-.bad {
-  color: var(--danger);
-}
-
-.local {
-  margin-bottom: 4px;
-}
-
-.local__list {
-  margin: 8px 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.found {
-  margin-top: 10px;
-  padding-top: 8px;
-  border-top: 1px solid var(--border);
-}
-
-.found ul {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.found__row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 12px;
-  padding: 4px 0;
-  overflow-wrap: anywhere;
-}
-
-.found__state {
-  margin-left: auto;
-}
-
-/* A found model: details on the left, actions in one group on the right. */
 .local {
   container-type: inline-size;
 }
 
+.local__empty {
+  margin-top: 6px;
+}
+
+.local__list {
+  margin-top: 8px;
+}
+
+/* A found server: name, address and count in columns, the action at the end. */
 .local__row {
   display: grid;
   grid-template-columns: 8.5rem minmax(0, 1fr) 7rem auto;
@@ -1222,6 +1158,12 @@ input.mono {
   }
 }
 
+.found {
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
 .found__item {
   display: flex;
   flex-wrap: wrap;
@@ -1232,7 +1174,7 @@ input.mono {
 }
 
 .found__item + .found__item {
-  border-top: 1px dashed var(--border);
+  border-top: 1px solid var(--border);
 }
 
 .found__info {
@@ -1257,60 +1199,77 @@ input.mono {
 .found__actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   justify-content: flex-end;
   gap: 6px;
   margin-left: auto;
 }
 
-.address {
+/* An edit form inside a card: fields in a row, the buttons at the end. */
+.inline-form {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin-top: 10px;
+  align-items: flex-end;
+  gap: 12px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
 }
 
-.address input {
+.inline-form__wide {
   flex: 1 1 18rem;
   min-width: 0;
 }
 
-.key-editor { margin-top: 12px; }
+.inline-form__actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
 
 .limits {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
-  gap: 10px;
-  margin-top: 10px;
+  gap: 12px;
+  margin-top: 12px;
 }
 
-.limits input {
+.limits .ui-input {
   width: 9rem;
 }
 
-.limits input,
-.limits select {
-  box-sizing: border-box;
-  height: 34px;
+.limits__error {
+  align-self: center;
 }
 
-fieldset {
+.roles {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.roles .ui-input {
+  max-width: 420px;
+}
+
+.fallback {
+  display: flex;
+  flex-direction: column;
   margin: 0;
   padding: 0;
   border: 0;
 }
 
-legend {
+.fallback legend {
   margin-bottom: 4px;
-  font-size: 13px;
-  color: var(--text-muted);
 }
 
-.check {
-  flex-direction: row;
-  align-items: center;
-  gap: 8px;
-  color: var(--text);
+.presets {
+  align-self: flex-start;
+}
+
+code {
+  font-size: 0.92em;
 }
 </style>

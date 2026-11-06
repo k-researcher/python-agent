@@ -2,11 +2,11 @@
 // Speech recognition settings: local server profiles in the order they are tried.
 
 import { computed, onMounted, reactive, ref } from "vue";
-import { useRouter } from "vue-router";
-import { ArrowLeft, Plus } from "lucide-vue-next";
+import { CircleAlert, Plus, Trash2 } from "lucide-vue-next";
 import { speechSettings, type SpeechCheck, type SpeechProfile } from "../api/speech";
-
-const router = useRouter();
+import SettingsDialog from "../components/settings/SettingsDialog.vue";
+import SettingsHeader from "../components/settings/SettingsHeader.vue";
+import ToggleSwitch from "../components/settings/ToggleSwitch.vue";
 
 const profiles = ref<SpeechProfile[] | null>(null);
 const loadError = ref("");
@@ -106,356 +106,188 @@ async function check(item: SpeechProfile): Promise<void> {
   }
 }
 
-function remove(item: SpeechProfile): void {
-  if (!window.confirm(`Удалить профиль распознавания «${item.id}»?`)) return;
-  delete checks[item.id];
-  void run(() => speechSettings.removeProfile(item.id));
+function openForm(): void {
+  Object.assign(form, { id: profiles.value?.length ? "" : "local", baseUrl: "http://127.0.0.1:8178/v1", language: "", model: "" });
+  actionError.value = "";
+  showForm.value = true;
 }
 
-function back(): void {
-  if (window.history.length > 1) router.back();
-  else void router.push({ name: "home" });
+function closeForm(): void {
+  if (!busy.value) showForm.value = false;
+}
+
+const removing = ref<SpeechProfile | null>(null);
+
+async function remove(): Promise<void> {
+  const item = removing.value;
+  if (!item) return;
+  delete checks[item.id];
+  if (await run(() => speechSettings.removeProfile(item.id))) removing.value = null;
 }
 
 onMounted(load);
 </script>
 
 <template>
-  <section class="settings" data-testid="speech-settings">
-    <header class="settings__header">
-      <button type="button" class="ghost" data-testid="settings-back" @click="back">
-        <ArrowLeft :size="16" aria-hidden="true" />
-        <span>Назад</span>
-      </button>
-      <h1>Голос</h1>
-      <nav class="settings__nav" aria-label="Разделы настроек">
-        <RouterLink :to="{ name: 'settings-models' }">Модели</RouterLink>
-        <RouterLink :to="{ name: 'settings-speech' }" aria-current="page">Голос</RouterLink>
-        <RouterLink :to="{ name: 'settings-skills' }">Навыки</RouterLink>
-      </nav>
-    </header>
+  <section class="ui-page" data-testid="speech-settings">
+    <SettingsHeader title="Голос" />
 
-    <p v-if="loadError" class="notice notice--error" role="alert">
-      {{ loadError }}
-      <button type="button" class="link" @click="load">Повторить</button>
+    <p v-if="loadError" class="ui-notice ui-notice--error" role="alert">
+      <CircleAlert :size="16" aria-hidden="true" />
+      <span class="ui-notice__text">{{ loadError }}</span>
+      <button type="button" class="ui-link" @click="load">Повторить</button>
     </p>
-    <p v-if="actionError" class="notice notice--error" role="alert" data-testid="speech-error">{{ actionError }}</p>
+    <p v-if="actionError && !showForm && !removing" class="ui-notice ui-notice--error" role="alert" data-testid="speech-error">
+      <CircleAlert :size="16" aria-hidden="true" />
+      <span class="ui-notice__text">{{ actionError }}</span>
+    </p>
 
-    <template v-if="profiles">
-      <section class="block" aria-labelledby="speech-title">
-        <div class="block__head">
-          <h2 id="speech-title">Распознавание речи</h2>
-          <button type="button" class="ghost" data-testid="speech-add-open" @click="showForm = !showForm">
-            <Plus :size="15" aria-hidden="true" />
+    <section v-if="profiles" class="ui-section" aria-labelledby="speech-title">
+      <div class="ui-section__head">
+        <h2 id="speech-title" class="ui-section__title">Распознавание речи</h2>
+        <div class="ui-section__actions">
+          <button type="button" class="ui-btn ui-btn--filled" data-testid="speech-add-open" @click="openForm">
+            <Plus :size="16" aria-hidden="true" />
             <span>Добавить сервер</span>
           </button>
         </div>
-        <p class="hint">
-          Речь распознаёт сервер на этом компьютере, запись не уходит наружу и не сохраняется. Нужен
-          OpenAI-совместимый сервер распознавания. Первый включённый профиль основной; если он не отвечает,
-          используется следующий.
+      </div>
+      <p class="ui-hint">
+        Речь распознаёт сервер на этом компьютере, запись не уходит наружу и не сохраняется. Нужен
+        OpenAI-совместимый сервер распознавания. Первый включённый профиль основной; если он не отвечает,
+        используется следующий.
+      </p>
+
+      <p v-if="!profiles.length" class="ui-empty" data-testid="speech-empty">
+        Серверов распознавания нет. Добавьте локальный сервер, и в поле ввода заработает микрофон.
+      </p>
+
+      <article
+        v-for="item in profiles"
+        :key="item.id"
+        class="ui-card ui-card__row"
+        :class="{ 'ui-card--off': item.disabled }"
+        :data-profile="item.id"
+      >
+        <div class="ui-card__main">
+          <strong class="ui-card__title">{{ item.id }}</strong>
+          <span class="mono ui-card__meta">{{ item.base_url }}</span>
+          <span class="ui-card__meta">
+            {{ roleOf(item) }} · {{ languageLabel(item.language) }}{{ item.model ? ` · модель ${item.model}` : "" }}
+          </span>
+          <span
+            v-if="checks[item.id]"
+            class="ui-small"
+            :class="{
+              'ui-ok': checks[item.id] !== 'checking' && (checks[item.id] as SpeechCheck).ok,
+              'ui-bad': checks[item.id] !== 'checking' && !(checks[item.id] as SpeechCheck).ok,
+            }"
+            data-testid="speech-check"
+          >{{ checkText(checks[item.id]) }}</span>
+          <button
+            v-if="roleOf(item) !== 'Основной' && !item.disabled"
+            type="button"
+            class="ui-link ui-small primary-link"
+            :disabled="busy"
+            data-testid="speech-primary"
+            @click="run(() => speechSettings.makePrimary(item.id))"
+          >Сделать основным</button>
+        </div>
+        <div class="ui-card__actions">
+          <button
+            type="button"
+            class="ui-btn ui-btn--outlined"
+            :disabled="checks[item.id] === 'checking'"
+            data-testid="speech-test"
+            @click="check(item)"
+          >Проверить</button>
+          <button
+            type="button"
+            class="ui-btn ui-btn--icon ui-btn--danger"
+            :aria-label="`Удалить профиль ${item.id}`"
+            title="Удалить"
+            :disabled="busy"
+            data-testid="speech-remove"
+            @click="removing = item"
+          >
+            <Trash2 :size="16" aria-hidden="true" />
+          </button>
+          <ToggleSwitch
+            :model-value="!item.disabled"
+            :label="`Профиль ${item.id} включён`"
+            :disabled="busy"
+            data-testid="speech-toggle"
+            @update:model-value="run(() => speechSettings.putProfile(item.id, { disabled: !$event }))"
+          />
+        </div>
+      </article>
+    </section>
+    <p v-else-if="!loadError" class="ui-hint">Загрузка…</p>
+
+    <SettingsDialog :open="showForm" title="Новый сервер распознавания" @close="closeForm">
+      <form id="speech-form" class="ui-form" novalidate data-testid="speech-form" @submit.prevent="add">
+        <label class="ui-field">
+          <span class="ui-field__label">ID профиля</span>
+          <input v-model.trim="form.id" class="ui-input mono" autocomplete="off" spellcheck="false" data-autofocus data-testid="speech-id" />
+        </label>
+        <label class="ui-field">
+          <span class="ui-field__label">Адрес API</span>
+          <input v-model.trim="form.baseUrl" class="ui-input mono" autocomplete="off" spellcheck="false" data-testid="speech-url" />
+        </label>
+        <label class="ui-field">
+          <span class="ui-field__label">Язык речи</span>
+          <select v-model="form.language" class="ui-input" data-testid="speech-language">
+            <option v-for="item in LANGUAGES" :key="item.value" :value="item.value">{{ item.label }}</option>
+          </select>
+        </label>
+        <label class="ui-field">
+          <span class="ui-field__label">Модель на сервере</span>
+          <input v-model.trim="form.model" class="ui-input mono" autocomplete="off" spellcheck="false" data-testid="speech-model" />
+          <small class="ui-field__help">Нужна, только если сервер её просит.</small>
+        </label>
+        <p v-if="form.id && formError" class="ui-field__help ui-field__help--error" data-testid="speech-form-error">{{ formError }}</p>
+        <p v-if="actionError" class="ui-notice ui-notice--error" role="alert">
+          <CircleAlert :size="16" aria-hidden="true" />
+          <span class="ui-notice__text">{{ actionError }}</span>
         </p>
+      </form>
+      <template #actions>
+        <button type="button" class="ui-btn ui-btn--text" :disabled="busy" @click="closeForm">Отмена</button>
+        <button type="submit" form="speech-form" class="ui-btn ui-btn--filled" :disabled="!!formError || busy" data-testid="speech-save">
+          {{ busy ? "Сохраняю…" : "Добавить" }}
+        </button>
+      </template>
+    </SettingsDialog>
 
-        <form v-if="showForm" class="card form" data-testid="speech-form" @submit.prevent="add">
-          <label>
-            <span>ID профиля</span>
-            <input v-model.trim="form.id" class="mono" data-testid="speech-id" />
-          </label>
-          <label>
-            <span>Адрес API</span>
-            <input v-model.trim="form.baseUrl" class="mono" data-testid="speech-url" />
-          </label>
-          <label>
-            <span>Язык речи</span>
-            <select v-model="form.language" data-testid="speech-language">
-              <option v-for="item in LANGUAGES" :key="item.value" :value="item.value">{{ item.label }}</option>
-            </select>
-          </label>
-          <label>
-            <span>Модель на сервере (если сервер её просит)</span>
-            <input v-model.trim="form.model" class="mono" data-testid="speech-model" />
-          </label>
-          <p v-if="formError" class="field-error" data-testid="speech-form-error">{{ formError }}</p>
-          <div class="actions">
-            <button type="submit" class="primary" :disabled="!!formError || busy" data-testid="speech-save">Сохранить</button>
-            <button type="button" class="ghost" @click="showForm = false">Отмена</button>
-          </div>
-        </form>
-
-        <p v-if="!profiles.length && !showForm" class="muted" data-testid="speech-empty">
-          Серверов распознавания нет. Добавьте локальный сервер, и в поле ввода заработает микрофон.
-        </p>
-
-        <article
-          v-for="item in profiles"
-          :key="item.id"
-          class="card"
-          :class="{ 'card--off': item.disabled }"
-          :data-profile="item.id"
-        >
-          <div class="card__row">
-            <div class="card__main">
-              <strong>{{ item.id }}</strong>
-              <span class="mono muted small">{{ item.base_url }}</span>
-              <span class="muted small">
-                {{ roleOf(item) }} · {{ languageLabel(item.language) }}{{ item.model ? ` · модель ${item.model}` : "" }}
-              </span>
-              <button
-                v-if="roleOf(item) !== 'Основной' && !item.disabled"
-                type="button"
-                class="link small card__link"
-                :disabled="busy"
-                data-testid="speech-primary"
-                @click="run(() => speechSettings.makePrimary(item.id))"
-              >Сделать основным</button>
-              <span
-                v-if="checks[item.id]"
-                class="small"
-                :class="{ ok: checks[item.id] !== 'checking' && (checks[item.id] as SpeechCheck).ok, bad: checks[item.id] !== 'checking' && !(checks[item.id] as SpeechCheck).ok }"
-                data-testid="speech-check"
-              >{{ checkText(checks[item.id]) }}</span>
-            </div>
-            <div class="card__actions">
-              <button type="button" class="ghost" :disabled="checks[item.id] === 'checking'" data-testid="speech-test" @click="check(item)">Проверить</button>
-              <button
-                type="button"
-                class="ghost toggle"
-                :disabled="busy"
-                data-testid="speech-toggle"
-                @click="run(() => speechSettings.putProfile(item.id, { disabled: !item.disabled }))"
-              >{{ item.disabled ? "Включить" : "Отключить" }}</button>
-              <button type="button" class="ghost danger" :disabled="busy" data-testid="speech-remove" @click="remove(item)">Удалить</button>
-            </div>
-          </div>
-        </article>
-      </section>
-    </template>
-    <p v-else-if="!loadError" class="muted">Загрузка…</p>
+    <SettingsDialog
+      :open="!!removing"
+      :title="removing ? `Удалить профиль «${removing.id}»?` : ''"
+      alert
+      @close="busy || (removing = null)"
+    >
+      <p>Микрофон перестанет использовать этот сервер. Сам сервер не меняется.</p>
+      <p v-if="actionError" class="ui-notice ui-notice--error" role="alert">
+        <CircleAlert :size="16" aria-hidden="true" />
+        <span class="ui-notice__text">{{ actionError }}</span>
+      </p>
+      <template #actions>
+        <button type="button" class="ui-btn ui-btn--text" data-autofocus :disabled="busy" @click="removing = null">Отмена</button>
+        <button
+          type="button"
+          class="ui-btn ui-btn--filled ui-btn--danger"
+          :disabled="busy"
+          data-testid="speech-remove-confirm"
+          @click="remove"
+        >{{ busy ? "Удаляю…" : "Удалить" }}</button>
+      </template>
+    </SettingsDialog>
   </section>
 </template>
 
 <style scoped>
-.settings {
-  max-width: 860px;
-  margin: 0 auto;
-  padding: 16px 20px 48px;
-  overflow-y: auto;
-  height: 100%;
-  box-sizing: border-box;
-}
-
-.settings__header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-
-.settings__nav {
-  display: flex;
-  gap: 4px;
-  margin-left: auto;
-}
-
-.settings__nav a {
-  padding: 4px 10px;
-  border-radius: var(--radius-sm);
-  color: var(--text-muted);
-  font-size: 13px;
-  text-decoration: none;
-}
-
-.settings__nav a[aria-current="page"] {
-  background: var(--bg-subtle);
-  color: var(--text);
-}
-
-h1 {
-  margin: 0;
-  font-size: 20px;
-}
-
-h2 {
-  margin: 0;
-  font-size: 15px;
-}
-
-.block {
-  margin-top: 20px;
-}
-
-.block__head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.hint {
-  margin: 4px 0 10px;
-  color: var(--text-muted);
-  font-size: 13px;
-}
-
-.card {
-  margin-top: 8px;
-  padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
-}
-
-/* Dim the details of a switched off item, but keep its buttons readable. */
-.card--off .card__main > :not(.card__link) {
-  opacity: 0.6;
-}
-
 /* An optional action sits under the label it belongs to, so every card has the same buttons. */
-.card__link {
+.primary-link {
   align-self: flex-start;
-  min-height: 0;
-  height: auto;
-  padding: 0;
-}
-
-.card__row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px 12px;
-}
-
-.card__main {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-/* Buttons keep to the right edge; a wrapped group stays there too. */
-.card__actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-  margin-left: auto;
-}
-
-/* "Включить" and "Отключить" take the same width, so the next buttons do not move. */
-.toggle {
-  min-width: 7.2em;
-  justify-content: center;
-}
-
-.small {
-  font-size: 12px;
-}
-
-button.ghost,
-button.primary {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text);
-  font-size: 13px;
-  cursor: pointer;
-}
-
-button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-contrast);
-}
-
-button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-button.danger {
-  border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
-  color: var(--danger);
-}
-
-button.danger:not(:disabled):hover {
-  background: color-mix(in srgb, var(--danger) 10%, transparent);
-}
-
-button.link {
-  border: 0;
-  background: none;
-  color: var(--link);
-  text-decoration: underline;
-  cursor: pointer;
-}
-
-.form {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 13px;
-  color: var(--text-muted);
-}
-
-input,
-select {
-  padding: 6px 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-  color: var(--text);
-  font: inherit;
-  font-size: 14px;
-}
-
-input.mono {
-  font-family: var(--font-mono);
-}
-
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.field-error {
-  margin: 0;
-  color: var(--danger);
-  font-size: 13px;
-}
-
-.notice {
-  margin: 8px 0;
-  padding: 8px 12px;
-  border-radius: var(--radius-sm);
-  font-size: 13px;
-}
-
-.notice--error {
-  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
-  background: color-mix(in srgb, var(--danger) 8%, transparent);
-  color: var(--danger);
-}
-
-.ok {
-  color: var(--success);
-}
-
-.bad {
-  color: var(--danger);
+  margin-top: 2px;
 }
 </style>

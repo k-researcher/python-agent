@@ -126,6 +126,11 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onGlobalKeydown));
   text-align: left;
 }
 
+/* The icon keeps its size when the field gets narrow. */
+.topbar__search svg {
+  flex: none;
+}
+
 .topbar__search:hover {
   border-color: var(--text-muted);
   color: var(--text);
