@@ -12,6 +12,8 @@ export default defineConfig({
   use: {
     baseURL,
     browserName: "chromium",
+    // Mocked routes do not see requests that a service worker answers; the PWA test allows them.
+    serviceWorkers: "block",
     deviceScaleFactor: 1,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",

@@ -73,6 +73,34 @@ def test_existing_asset_is_served(frontend_dist: Path) -> None:
     assert response.path == asset
 
 
+@pytest.mark.parametrize(
+    ("path", "media_type"),
+    [
+        ("sw.js", "text/javascript"),
+        ("manifest.webmanifest", "application/manifest+json"),
+        ("icons/icon-192.png", "image/png"),
+    ],
+)
+def test_installed_app_files_are_public_with_their_types(
+    frontend_dist: Path, path: str, media_type: str
+) -> None:
+    """The browser installs the app and starts its worker before any login."""
+    from agent.main import PROTECTED_PREFIXES
+
+    (frontend_dist / "icons").mkdir()
+    (frontend_dist / path).write_bytes(b"x")
+    app = FastAPI()
+
+    @app.get("/{path:path}", response_model=None)
+    async def serve_frontend(path: str) -> FileResponse | JSONResponse:
+        return frontend_response(frontend_dist, path)
+
+    response = TestClient(app).get(f"/{path}")
+    assert response.status_code == 200
+    assert response.headers["content-type"].split(";")[0] == media_type
+    assert not f"/{path}".startswith(PROTECTED_PREFIXES)
+
+
 @pytest.mark.parametrize("exists", [True, False])
 def test_symlink_outside_frontend_is_rejected(frontend_dist: Path, exists: bool) -> None:
     outside = frontend_dist.parent / "outside"
