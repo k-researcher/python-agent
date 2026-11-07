@@ -8,6 +8,7 @@ import { useSessionStore } from "./stores/session";
 import { Realtime, type ConnectionStatus } from "./realtime";
 import { clearAuth, loginFromFragment, logout, refreshAuth } from "./auth";
 import { confirmAuthenticated, newSessionProfile, resetAuthCache } from "./router";
+import { syncThemeColor } from "./pwa";
 import type { ServerEvent } from "./api/types";
 import AppShell from "./components/layout/AppShell.vue";
 import Topbar from "./components/layout/Topbar.vue";
@@ -67,6 +68,7 @@ const theme = ref<"light" | "dark">(readStoredTheme());
 
 function applyTheme(t: "light" | "dark"): void {
   document.documentElement.setAttribute("data-theme", t);
+  syncThemeColor();
 }
 
 // Unconditionally set theme on startup/mount
@@ -253,10 +255,10 @@ function onNewSession(): void {
   void router.push({ name: "home" });
 }
 
-function onOpenSettings(): void {
+function onOpenSettings(section?: "skills"): void {
   sessionStore.close();
   if (window.innerWidth <= 760) leftOpen.value = false;
-  void router.push({ name: "settings-models" });
+  void router.push({ name: section === "skills" ? "settings-skills" : "settings-models" });
 }
 
 function endAuthSession(): void {

@@ -345,7 +345,7 @@ function onOpenChild(id: string): void {
       {{ openError }}
       <button
         type="button"
-        class="open-retry"
+        class="open-retry ui-btn ui-btn--small ui-btn--outlined ui-btn--danger"
         data-testid="open-retry"
         @click="handleRouteChange(props.id)"
       >
@@ -437,7 +437,7 @@ function onOpenChild(id: string): void {
   margin: 8px 16px;
   padding: 8px 12px;
   border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   background: color-mix(in srgb, var(--danger) 8%, transparent);
   color: var(--danger);
   font-size: 13px;
@@ -447,7 +447,7 @@ function onOpenChild(id: string): void {
   margin: 8px 16px;
   padding: 8px 12px;
   border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   background: color-mix(in srgb, var(--warning) 8%, transparent);
   color: var(--text);
   font-size: 13px;
@@ -460,18 +460,7 @@ function onOpenChild(id: string): void {
 }
 
 .open-retry {
-  padding: 3px 10px;
-  border: 1px solid currentColor;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--danger);
-  font-size: 12px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.open-retry:hover {
-  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  margin-left: 8px;
 }
 
 .session-loading,

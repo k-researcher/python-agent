@@ -558,7 +558,8 @@ textarea {
   box-sizing: border-box;
   padding: 0.5rem 0.65rem;
   border: 1px solid var(--border, #e6e6e9);
-  border-radius: var(--radius-sm, 6px);
+  /* Half the one-line height: a round field next to the round buttons, also when it grows. */
+  border-radius: 19px;
   font: inherit;
   font-size: 0.88rem;
   line-height: 1.4;
@@ -578,7 +579,7 @@ button {
   height: 38px;
   padding: 0 1rem;
   border: 1px solid var(--border, #e6e6e9);
-  border-radius: var(--radius-sm, 6px);
+  border-radius: var(--radius-pill);
   font-size: 0.85rem;
   cursor: pointer;
   white-space: nowrap;
@@ -622,10 +623,10 @@ button.stop {
   font-size: 0.75rem;
   color: var(--text-muted, #6b6b76);
   min-height: 32px;
-  padding: 0 8px;
+  padding: 0 12px;
   box-sizing: border-box;
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-pill);
   background: var(--bg-subtle);
 }
 

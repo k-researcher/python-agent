@@ -118,12 +118,17 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onGlobalKeydown));
   min-width: 0;
   width: 280px;
   max-width: 40vw;
-  padding: 6px 10px;
+  padding: 6px 12px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   background: var(--bg-subtle);
   color: var(--text-muted);
   text-align: left;
+}
+
+/* The icon keeps its size when the field gets narrow. */
+.topbar__search svg {
+  flex: none;
 }
 
 .topbar__search:hover {
@@ -186,7 +191,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onGlobalKeydown));
   gap: 6px;
   padding: 6px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-pill);
   background: var(--surface);
   color: var(--text-muted);
 }

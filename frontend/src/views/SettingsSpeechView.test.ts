@@ -31,6 +31,8 @@ async function mountView(profiles: SpeechProfile[]) {
       { path: "/", name: "home", component: { template: "<div/>" } },
       { path: "/settings/models", name: "settings-models", component: { template: "<div/>" } },
       { path: "/settings/speech", name: "settings-speech", component: SettingsSpeechView },
+      { path: "/settings/skills", name: "settings-skills", component: { template: "<div/>" } },
+      { path: "/settings/mcp", name: "settings-mcp", component: { template: "<div/>" } },
     ],
   });
   await router.push("/settings/speech");
@@ -39,21 +41,20 @@ async function mountView(profiles: SpeechProfile[]) {
   return wrapper;
 }
 
-const confirm = vi.fn((_question?: string) => true);
-
 beforeEach(() => {
   for (const call of Object.values(speechSettings)) vi.mocked(call).mockReset();
-  confirm.mockReset().mockReturnValue(true);
-  Object.defineProperty(window, "confirm", { value: confirm, configurable: true });
 });
 
-it("asks before removing a profile and keeps it when cancelled", async () => {
+it("asks in a dialog before removing a profile and keeps it when cancelled", async () => {
   const wrapper = await mountView([profile("main")]);
-  confirm.mockReturnValue(false);
   await wrapper.get('[data-profile="main"] [data-testid="speech-remove"]').trigger("click");
+  const dialog = wrapper.get('[role="alertdialog"]');
+  expect(dialog.text()).toContain("Удалить профиль «main»?");
+  await dialog.findAll("button").find((button) => button.text() === "Отмена")!.trigger("click");
   await flushPromises();
-  expect(confirm).toHaveBeenCalledWith("Удалить профиль распознавания «main»?");
   expect(speechSettings.removeProfile).not.toHaveBeenCalled();
+  expect(wrapper.find('[data-testid="speech-remove-confirm"]').exists()).toBe(false);
+  expect(wrapper.find('[data-profile="main"]').exists()).toBe(true);
 });
 
 afterEach(() => {
@@ -118,14 +119,20 @@ it("checks, reorders, switches off and removes profiles", async () => {
   vi.mocked(speechSettings.putProfile).mockResolvedValue({
     profiles: [profile("spare"), profile("main", { disabled: true })],
   });
-  await wrapper.get('[data-profile="main"] [data-testid="speech-toggle"]').trigger("click");
+  const toggle = wrapper.get('[data-profile="main"] [data-testid="speech-toggle"]');
+  expect(toggle.attributes("role")).toBe("switch");
+  expect(toggle.attributes("aria-checked")).toBe("true");
+  await toggle.trigger("click");
   await flushPromises();
   expect(speechSettings.putProfile).toHaveBeenCalledWith("main", { disabled: true });
+  expect(wrapper.get('[data-profile="main"] [data-testid="speech-toggle"]').attributes("aria-checked")).toBe("false");
 
   vi.mocked(speechSettings.removeProfile).mockResolvedValue({ profiles: [profile("spare")] });
   await wrapper.get('[data-profile="main"] [data-testid="speech-remove"]').trigger("click");
+  await wrapper.get('[data-testid="speech-remove-confirm"]').trigger("click");
   await flushPromises();
   expect(speechSettings.removeProfile).toHaveBeenCalledWith("main");
+  expect(wrapper.find('[data-testid="speech-remove-confirm"]').exists()).toBe(false);
   expect(wrapper.find('[data-profile="main"]').exists()).toBe(false);
 });
 

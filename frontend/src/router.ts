@@ -5,7 +5,9 @@ import { ApiError } from "./api/client";
 import LoginView from "./views/LoginView.vue";
 import HomeView from "./views/HomeView.vue";
 import SessionView from "./views/SessionView.vue";
+import SettingsMcpView from "./views/SettingsMcpView.vue";
 import SettingsModelsView from "./views/SettingsModelsView.vue";
+import SettingsSkillsView from "./views/SettingsSkillsView.vue";
 import SettingsSpeechView from "./views/SettingsSpeechView.vue";
 
 let authenticated: boolean | null = null;
@@ -65,6 +67,8 @@ export const router = createRouter({
     { path: "/s/:id", name: "session", component: SessionView, props: true },
     { path: "/settings/models", name: "settings-models", component: SettingsModelsView },
     { path: "/settings/speech", name: "settings-speech", component: SettingsSpeechView },
+    { path: "/settings/skills", name: "settings-skills", component: SettingsSkillsView },
+    { path: "/settings/mcp", name: "settings-mcp", component: SettingsMcpView },
     { path: "/login", name: "login", component: LoginView },
     { path: "/:pathMatch(.*)*", redirect: { name: "home" } },
   ],

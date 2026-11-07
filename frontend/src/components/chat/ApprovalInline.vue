@@ -79,27 +79,38 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
     <div class="approval-head">
       <span class="risk" :data-risk="riskLevel" data-testid="risk-label">{{ riskLabel }}</span>
       <div class="actions">
-        <button type="button" class="approve" data-testid="approve-btn" @click="approve">
-          Разрешить
-        </button>
-        <button type="button" class="reject" data-testid="reject-btn" @click="rejectClick">
+        <button
+          type="button"
+          class="ui-btn ui-btn--small ui-btn--outlined ui-btn--danger"
+          data-testid="reject-btn"
+          @click="rejectClick"
+        >
           Отклонить
+        </button>
+        <button type="button" class="ui-btn ui-btn--small ui-btn--filled" data-testid="approve-btn" @click="approve">
+          Разрешить
         </button>
       </div>
     </div>
     <div v-if="commentVisible" class="comment-field" data-testid="comment-field">
       <textarea
         v-model="comment"
+        class="ui-input"
         rows="2"
         :placeholder="'Комментарий (необязательно)'"
         data-testid="reject-comment"
       />
       <div class="comment-actions">
-        <button type="button" class="primary" data-testid="reject-submit" @click="submitReject">
-          Отправить
-        </button>
-        <button type="button" class="ghost" data-testid="reject-cancel" @click="commentVisible = false">
+        <button
+          type="button"
+          class="ui-btn ui-btn--small ui-btn--text"
+          data-testid="reject-cancel"
+          @click="commentVisible = false"
+        >
           Отмена
+        </button>
+        <button type="button" class="ui-btn ui-btn--small ui-btn--filled" data-testid="reject-submit" @click="submitReject">
+          Отправить
         </button>
       </div>
     </div>
@@ -109,83 +120,52 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKeydown));
 <style scoped>
 .approval {
   margin: 0.45rem 0 0.1rem;
-  padding: 0.5rem 0.6rem;
-  border: 1px solid var(--border, #e6e6e9);
-  border-radius: var(--radius-sm, 6px);
-  background: var(--surface, #fff);
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
 }
 
 .approval-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 0.6rem;
+  gap: 8px 12px;
 }
 
 .risk {
-  font-size: 0.75rem;
+  font-size: 12px;
   font-weight: 600;
 }
 .risk[data-risk="high"] {
-  color: var(--danger, #dc2626);
+  color: var(--danger);
 }
 .risk[data-risk="medium"] {
-  color: var(--warning, #d97706);
+  color: var(--warning);
 }
 .risk[data-risk="low"] {
-  color: var(--success, #16a34a);
+  color: var(--success);
 }
 
-.actions {
+.actions,
+.comment-actions {
   display: flex;
-  gap: 0.45rem;
-}
-.actions button {
-  padding: 0.25rem 0.65rem;
-  border-radius: var(--radius-sm, 6px);
-  border: 1px solid var(--border, #e6e6e9);
-  font-size: 0.78rem;
-  cursor: pointer;
-}
-button.approve {
-  background: var(--accent, #111114);
-  color: var(--accent-contrast, #fff);
-  border-color: var(--accent, #111114);
-}
-button.reject {
-  background: transparent;
-  color: var(--danger, #dc2626);
+  gap: 6px;
+  margin-left: auto;
 }
 
 .comment-field {
-  margin-top: 0.5rem;
+  margin-top: 8px;
 }
+
 .comment-field textarea {
-  width: 100%;
-  box-sizing: border-box;
   resize: vertical;
-  border: 1px solid var(--border, #e6e6e9);
-  border-radius: var(--radius-sm, 6px);
-  padding: 0.35rem 0.5rem;
-  font: inherit;
-  font-size: 0.8rem;
+  font-size: 13px;
 }
+
 .comment-actions {
-  display: flex;
-  gap: 0.45rem;
-  margin-top: 0.4rem;
-}
-.comment-actions button {
-  padding: 0.25rem 0.6rem;
-  border-radius: var(--radius-sm, 6px);
-  border: 1px solid var(--border, #e6e6e9);
-  font-size: 0.78rem;
-  cursor: pointer;
-  background: var(--surface, #fff);
-}
-.comment-actions .primary {
-  background: var(--accent, #111114);
-  color: var(--accent-contrast, #fff);
-  border-color: var(--accent, #111114);
+  justify-content: flex-end;
+  margin-top: 6px;
 }
 </style>

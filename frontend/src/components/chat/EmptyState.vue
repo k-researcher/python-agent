@@ -92,7 +92,7 @@ function pick(card: SuggestionCard): void {
   gap: 0.3rem;
   padding: 1rem 1.1rem;
   border: 1px solid var(--border, #e6e6e9);
-  border-radius: var(--radius, 10px);
+  border-radius: var(--radius-lg);
   background: var(--surface, #fff);
   text-align: left;
   cursor: pointer;

@@ -4,7 +4,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.models import Project, Session, User, WorkspaceMembership
-from agent.source_policy import SourceActor, SourceScope, can_use_source
+from agent.source_policy import (
+    SourceActor,
+    SourceScope,
+    can_use_personal_source,
+    can_use_source,
+)
 
 
 async def can_use_session_source(
@@ -17,7 +22,23 @@ async def can_use_session_source(
     Legacy sessions without a creator or project workspace are denied. Scalar
     columns bypass cached ORM identities. This function does not authenticate
     the request or replace tool approval and source-revision checks.
+    A source of the single-user install needs no creator; see can_use_personal_source.
     """
+    if source.workspace_id is None:
+        personal = (
+            await db.execute(
+                select(Session.mode, Project.id, Project.workspace_id)
+                .join(Project, Project.id == Session.project_id)
+                .where(Session.id == session_id)
+                .execution_options(autoflush=False)
+            )
+        ).first()
+        if personal is None:
+            return False
+        mode, project_id, workspace_id = personal
+        return can_use_personal_source(
+            source, project_id=project_id, project_workspace_id=workspace_id, mode=mode
+        )
     row = (
         await db.execute(
             select(

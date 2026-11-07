@@ -231,7 +231,7 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
             <span class="muted monitor-time">Время: {{ duration(row.duration_seconds) }}</span>
             <span v-if="hasCost(row)" class="monitor-cost">Стоимость: ${{ row.cost }}{{ row.has_unknown_cost ? " + неизвестная часть" : "" }}</span>
           </button>
-          <button v-if="canStop(row)" type="button" class="monitor-stop"
+          <button v-if="canStop(row)" type="button" class="monitor-stop ui-btn ui-btn--small ui-btn--outlined ui-btn--danger"
             :disabled="monitorStopping.includes(row.session_id)"
             :aria-label="`Остановить: ${row.title || 'агент'}`"
             @click.stop="emit('stopSession', row.session_id)">{{ monitorStopping.includes(row.session_id) ? "Останавливается…" : "Стоп" }}</button>
@@ -429,8 +429,8 @@ function onTabKeydown(event: KeyboardEvent, tabId: TabId): void {
 .monitor-title { font-weight: 600; }
 .monitor-project, .monitor-action, .monitor-time, .monitor-cost { font-size: 12px; }
 .monitor-status { white-space: normal; }
-.monitor-stop { margin: 0 10px 10px; padding: 5px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-subtle); color: var(--danger); cursor: pointer; }
-.monitor-stop:disabled { opacity: 0.6; cursor: wait; }
+.monitor-stop { align-self: flex-start; margin: 0 10px 10px; }
+.monitor-stop:disabled { cursor: wait; }
 .monitor-error { color: var(--danger); font-size: 13px; }
 
 .right-panel__tab:hover {

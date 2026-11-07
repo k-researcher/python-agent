@@ -6,6 +6,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   Archive,
+  BookOpen,
   ChevronRight,
   Folder,
   LogOut,
@@ -42,7 +43,7 @@ const emit = defineEmits<{
   selectSession: [id: string];
   createProject: [{ name: string; rootPath: string }];
   newSession: [];
-  openSettings: [];
+  openSettings: [section?: "skills"];
   signOut: [];
   closeCreateForm: [];
   openCreateForm: [];
@@ -57,6 +58,9 @@ const emit = defineEmits<{
 const INACTIVE = new Set(["completed", "stopped", "error", "interrupted"]);
 const openMenu = ref<string | null>(null);
 const menuRoot = ref<HTMLElement | null>(null);
+// The menu is placed against the window, so a scrolling list does not cut it off.
+const menuStyle = ref<Record<string, string>>({});
+const MENU_HEIGHT = 120;
 
 function isInactive(node: SessionNode): boolean {
   return INACTIVE.has(node.status);
@@ -69,6 +73,12 @@ function toggleMenu(key: string, event: Event): void {
   }
   openMenu.value = key;
   const button = event.currentTarget as HTMLElement;
+  const rect = button.getBoundingClientRect();
+  const right = `${Math.max(8, window.innerWidth - rect.right)}px`;
+  // Near the bottom of the window the menu opens upwards.
+  menuStyle.value = rect.bottom + MENU_HEIGHT > window.innerHeight
+    ? { right, bottom: `${window.innerHeight - rect.top + 4}px` }
+    : { right, top: `${rect.bottom + 4}px` };
   void nextTick(() => {
     menuRoot.value = button.closest("[data-menu-root]");
     menuRoot.value?.querySelector<HTMLElement>("[role=menuitem]:not(:disabled)")?.focus();
@@ -87,8 +97,21 @@ function onDocumentClick(event: MouseEvent): void {
   if (openMenu.value && !(event.target as Element | null)?.closest?.("[data-menu-root]")) closeMenu();
 }
 
-onMounted(() => document.addEventListener("click", onDocumentClick));
-onBeforeUnmount(() => document.removeEventListener("click", onDocumentClick));
+// A fixed menu would stay behind when its row scrolls away, so scrolling closes it.
+function onViewportChange(event: Event): void {
+  if (openMenu.value && !(event.target instanceof Element && event.target.closest("[role=menu]"))) closeMenu();
+}
+
+onMounted(() => {
+  document.addEventListener("click", onDocumentClick);
+  window.addEventListener("scroll", onViewportChange, true);
+  window.addEventListener("resize", onViewportChange);
+});
+onBeforeUnmount(() => {
+  document.removeEventListener("click", onDocumentClick);
+  window.removeEventListener("scroll", onViewportChange, true);
+  window.removeEventListener("resize", onViewportChange);
+});
 
 function sessionAction(node: SessionNode, action: "archive" | "delete"): void {
   closeMenu();
@@ -385,21 +408,21 @@ function isSelected(item: VisNode): boolean {
         />
         <div class="create-project__actions">
           <button
-            type="submit"
-            class="btn btn--primary"
-            data-create-submit
-            :disabled="isCreatingProject"
-          >
-            {{ isCreatingProject ? "Создание..." : "Создать" }}
-          </button>
-          <button
             type="button"
-            class="btn"
+            class="ui-btn ui-btn--text"
             data-create-cancel
             :disabled="isCreatingProject"
             @click="closeCreateForm"
           >
             Отмена
+          </button>
+          <button
+            type="submit"
+            class="ui-btn ui-btn--filled"
+            data-create-submit
+            :disabled="isCreatingProject"
+          >
+            {{ isCreatingProject ? "Создаю…" : "Создать" }}
           </button>
         </div>
       </form>
@@ -431,7 +454,7 @@ function isSelected(item: VisNode): boolean {
             >
               <MoreHorizontal :size="15" aria-hidden="true" />
             </button>
-            <span v-if="openMenu === `p:${project.id}`" class="row-menu__list" role="menu">
+            <span v-if="openMenu === `p:${project.id}`" class="row-menu__list" role="menu" :style="menuStyle">
               <button
                 type="button"
                 role="menuitem"
@@ -465,14 +488,19 @@ function isSelected(item: VisNode): boolean {
         />
         <div class="create-project__actions">
           <button
+            type="button"
+            class="ui-btn ui-btn--text"
+            :disabled="isDeletingProject"
+            @click="cancelDeleteProject"
+          >Отмена</button>
+          <button
             type="submit"
-            class="btn btn--danger"
+            class="ui-btn ui-btn--filled ui-btn--danger"
             data-delete-project-submit
             :disabled="typedName !== projectToDelete.name || isDeletingProject"
           >
-            {{ isDeletingProject ? "Удаление..." : "Удалить проект" }}
+            {{ isDeletingProject ? "Удаляю…" : "Удалить проект" }}
           </button>
-          <button type="button" class="btn" :disabled="isDeletingProject" @click="cancelDeleteProject">Отмена</button>
         </div>
       </form>
       <p v-if="projects.length === 0" class="muted left-sidebar__hint">Нет проектов</p>
@@ -552,7 +580,7 @@ function isSelected(item: VisNode): boolean {
               >
                 <MoreHorizontal :size="15" aria-hidden="true" />
               </button>
-              <span v-if="openMenu === `s:${item.node.id}`" class="row-menu__list" role="menu">
+              <span v-if="openMenu === `s:${item.node.id}`" class="row-menu__list" role="menu" :style="menuStyle">
                 <button
                   type="button"
                   role="menuitem"
@@ -579,6 +607,10 @@ function isSelected(item: VisNode): boolean {
     </section>
 
     <footer class="left-sidebar__footer">
+      <button type="button" class="footer-btn" data-skills @click="emit('openSettings', 'skills')">
+        <BookOpen :size="15" aria-hidden="true" />
+        <span>Навыки</span>
+      </button>
       <button type="button" class="footer-btn" data-settings @click="emit('openSettings')">
         <Settings :size="15" aria-hidden="true" />
         <span>Настройки</span>
@@ -655,10 +687,10 @@ function isSelected(item: VisNode): boolean {
 .create-project {
   display: grid;
   gap: 6px;
-  padding: 6px;
+  padding: 8px;
   margin-bottom: 6px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-lg);
   background: var(--bg-subtle);
 }
 
@@ -819,6 +851,7 @@ function isSelected(item: VisNode): boolean {
 .create-project__actions {
   display: flex;
   flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
   margin-top: 4px;
 }
@@ -826,9 +859,10 @@ function isSelected(item: VisNode): boolean {
 .create-project__input {
   width: 100%;
   box-sizing: border-box;
-  padding: 4px 8px;
+  min-height: var(--control-height);
+  padding: 6px 12px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   background: var(--surface);
   color: var(--text);
   font-size: 14px;
@@ -837,26 +871,6 @@ function isSelected(item: VisNode): boolean {
 .create-project__input:focus {
   outline: 2px solid var(--accent);
   outline-offset: -1px;
-}
-
-.btn {
-  padding: 4px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--text);
-}
-
-.btn--primary {
-  background: var(--accent);
-  color: var(--accent-contrast);
-  border-color: var(--accent);
-}
-
-.btn--danger {
-  border-color: var(--danger);
-  background: var(--danger);
-  color: #fff;
 }
 
 .delete-project__text {
@@ -917,23 +931,23 @@ function isSelected(item: VisNode): boolean {
   }
 }
 
+/* The place comes from the script (menuStyle); the corners follow the menu: outer 10, inner 6. */
 .row-menu__list {
-  position: absolute;
-  top: calc(100% + 2px);
-  right: 0;
-  z-index: 20;
+  position: fixed;
+  z-index: 50;
   display: grid;
-  min-width: 170px;
+  min-width: 180px;
   padding: 4px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius);
   background: var(--surface);
-  box-shadow: 0 6px 18px color-mix(in srgb, #000 16%, transparent);
+  box-shadow: var(--shadow);
   font-weight: 400;
 }
 
 .row-menu__item {
-  padding: 6px 8px;
+  min-height: 32px;
+  padding: 6px 10px;
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -965,7 +979,6 @@ function isSelected(item: VisNode): boolean {
   white-space: nowrap;
 }
 
-.btn:disabled,
 .create-project__input:disabled {
   opacity: 0.6;
   cursor: not-allowed;

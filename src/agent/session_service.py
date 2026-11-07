@@ -29,7 +29,8 @@ from agent.session_budget_store import (
     resolve_budget_limits,
     server_budget_limits,
 )
-from agent.skill_prompt import load_skill_set, skill_prompt_section
+from agent.skill_library import project_skill_set
+from agent.skill_prompt import skill_prompt_section
 
 
 def _session_created_at_iso(created_at: datetime | None = None) -> str:
@@ -102,7 +103,7 @@ async def create_session_record(
         f"\n\nДата и время создания сессии: {_session_created_at_iso(created_at)}\n"
         f"Семейство ОС сервера: {platform.system()}"
     )
-    skills = load_skill_set(Path(project.root_path), None)
+    skills = await project_skill_set(db, settings, project)
     section = skill_prompt_section(skills)
     if section:
         system_prompt += (

@@ -1,0 +1,482 @@
+/* Shared interface components: one look for buttons, cards, forms and notices.
+   The rules follow docs/ui-guidelines.md. This file loads after base.css, so a class here
+   wins over the element defaults there; a component's scoped styles win over a class here. */
+
+/* ---------- buttons ----------
+   One height and one pill shape. Emphasis, from high to low: filled, tonal, outlined, text.
+   An area has at most one filled button: its main action. */
+.ui-btn {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: var(--control-height);
+  padding: 0 16px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.ui-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-pill);
+}
+
+.ui-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.ui-btn--filled {
+  background: var(--accent);
+  color: var(--accent-contrast);
+}
+
+.ui-btn--filled:not(:disabled):hover {
+  background: color-mix(in srgb, var(--accent) 88%, var(--text));
+}
+
+.ui-btn--tonal {
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+}
+
+.ui-btn--outlined {
+  border-color: var(--border);
+}
+
+.ui-btn--text {
+  padding: 0 12px;
+  color: var(--accent);
+}
+
+.ui-btn--tonal:not(:disabled):hover,
+.ui-btn--outlined:not(:disabled):hover,
+.ui-btn--text:not(:disabled):hover {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+/* A destructive action that is not yet confirmed: red text, no fill. */
+.ui-btn--danger {
+  color: var(--danger);
+}
+
+.ui-btn--danger.ui-btn--outlined {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+}
+
+.ui-btn--danger:not(:disabled):hover {
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+/* The confirming button of a destructive dialog. */
+.ui-btn--danger.ui-btn--filled {
+  background: var(--danger);
+  color: var(--accent-contrast);
+}
+
+.ui-btn--danger.ui-btn--filled:not(:disabled):hover {
+  background: color-mix(in srgb, var(--danger) 88%, var(--text));
+}
+
+/* A compact button for dense places, such as a message in the chat. */
+.ui-btn--small {
+  min-height: 30px;
+  padding: 0 12px;
+  font-size: 13px;
+}
+
+/* An icon-only button: a round 40 px target. Give it aria-label and title. */
+.ui-btn--icon {
+  width: 40px;
+  min-width: 40px;
+  height: 40px;
+  padding: 0;
+  color: var(--text-muted);
+}
+
+.ui-btn--icon:not(:disabled):hover {
+  background: var(--bg-subtle);
+  color: var(--text);
+}
+
+.ui-btn--icon.ui-btn--danger:not(:disabled):hover {
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--danger);
+}
+
+/* An inline action inside text. */
+.ui-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--link);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.ui-link:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---------- page, sections and cards ---------- */
+.ui-page {
+  max-width: 860px;
+  height: 100%;
+  margin: 0 auto;
+  padding: 16px 20px 48px;
+  overflow-y: auto;
+}
+
+.ui-page__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.ui-page__title {
+  font-size: 22px;
+  font-weight: 700;
+}
+
+/* A segmented control: page sections (links) or the views of one list (tabs). */
+.ui-tabs {
+  display: inline-flex;
+  flex-wrap: wrap;
+  padding: 3px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-subtle);
+}
+
+.ui-tabs a,
+.ui-tabs button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.ui-tabs a:not([aria-current="page"]):hover,
+.ui-tabs button:not([aria-selected="true"], [aria-checked="true"]):hover {
+  color: var(--text);
+}
+
+.ui-tabs a:focus-visible,
+.ui-tabs button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: var(--radius-pill);
+}
+
+.ui-tabs [aria-current="page"],
+.ui-tabs [aria-selected="true"],
+.ui-tabs [aria-checked="true"] {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(43, 33, 24, 0.12);
+}
+
+.ui-section {
+  margin-top: 28px;
+}
+
+.ui-section__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+
+.ui-section__title {
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.ui-section__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Explanation under a title: what the section does, in one or two sentences. */
+.ui-hint {
+  margin: 4px 0 12px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.ui-card {
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.ui-card + .ui-card {
+  margin-top: 8px;
+}
+
+/* A card row: the text on the start side, the controls on the end side. */
+.ui-card__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+
+.ui-card__main {
+  display: flex;
+  flex: 1 1 280px;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ui-card__title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.ui-card__meta {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.ui-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-left: auto;
+}
+
+/* A switched off item: the text fades, the controls stay readable. */
+.ui-card--off .ui-card__main {
+  opacity: 0.6;
+}
+
+.ui-empty {
+  padding: 24px 16px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-lg);
+  color: var(--text-muted);
+  font-size: 14px;
+  text-align: center;
+}
+
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-subtle);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+/* ---------- forms ---------- */
+.ui-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.ui-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ui-field__label {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.ui-field__help {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.ui-field__help--error {
+  color: var(--danger);
+}
+
+.ui-input {
+  width: 100%;
+  min-height: var(--control-height);
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+}
+
+/* IDs, addresses and commands keep the fixed-width font inside a field. */
+.ui-input.mono {
+  font-family: var(--font-mono);
+}
+
+textarea.ui-input {
+  line-height: 1.45;
+  resize: vertical;
+}
+
+/* A list draws its own chevron, so it looks the same in every browser and theme. */
+select.ui-input {
+  padding-right: 34px;
+  appearance: none;
+  background-image: var(--select-chevron);
+  background-position: right 12px center;
+  background-size: 12px 12px;
+  background-repeat: no-repeat;
+  cursor: pointer;
+}
+
+select.ui-input:disabled {
+  cursor: default;
+}
+
+/* A number field has no spin buttons: the value is typed. */
+input.ui-input[type="number"] {
+  appearance: textfield;
+}
+
+input.ui-input[type="number"]::-webkit-inner-spin-button,
+input.ui-input[type="number"]::-webkit-outer-spin-button {
+  margin: 0;
+  appearance: none;
+}
+
+.ui-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.ui-input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.ui-input:disabled {
+  color: var(--text-muted);
+}
+
+.ui-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.ui-choice input {
+  accent-color: var(--accent);
+}
+
+/* ---------- notices ----------
+   Inline, next to what they are about; they stay until the user closes them or fixes the
+   cause. Success is the only notice that may go away by itself. */
+.ui-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 9px 10px 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--notice-color) 40%, transparent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--notice-color) 8%, transparent);
+  color: var(--notice-color);
+  font-size: 13px;
+  line-height: 1.45;
+  --notice-color: var(--info);
+}
+
+.ui-notice > svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+.ui-notice__text {
+  flex: 1;
+  min-width: 0;
+}
+
+.ui-notice .ui-btn--icon {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  margin: -5px -4px -5px 0;
+  color: inherit;
+}
+
+.ui-notice--error {
+  --notice-color: var(--danger);
+}
+
+.ui-notice--warning {
+  --notice-color: var(--warning);
+}
+
+.ui-notice--success {
+  --notice-color: var(--success);
+}
+
+/* ---------- small helpers ---------- */
+.ui-small {
+  font-size: 12px;
+}
+
+.ui-ok {
+  color: var(--success);
+}
+
+.ui-bad {
+  color: var(--danger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-btn {
+    transition: none;
+  }
+}
+
+@media (max-width: 599px) {
+  .ui-page {
+    padding: 12px 16px 40px;
+  }
+}

@@ -104,7 +104,7 @@ function changeRole(userId: string, event: Event): void {
           <button
             v-if="member.can_remove"
             type="button"
-            class="workspace-members__remove"
+            class="workspace-members__remove ui-btn ui-btn--small ui-btn--text ui-btn--danger"
             :disabled="isBusy"
             :aria-label="`Удалить участника ${member.display_name}`"
             @click="remove(member.user_id)"
@@ -158,7 +158,6 @@ select {
   padding: 6px 8px;
 }
 button { cursor: pointer; }
-.workspace-members__remove { color: var(--danger); }
 button:disabled,
 select:disabled { opacity: 0.5; cursor: not-allowed; }
 </style>

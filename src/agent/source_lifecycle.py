@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import replace
 from pathlib import Path
 from types import TracebackType
 
@@ -16,8 +14,8 @@ from sqlalchemy import select
 from agent.config import Settings
 from agent.database import session_factory
 from agent.mcp_client import StdioMcpClient
+from agent.mcp_servers import file_environment, sandbox_policy, ui_sources
 from agent.models import Project, Session
-from agent.sandbox import policy_from_settings
 from agent.session_fence import CURRENT_FENCE, TERMINAL_STATUSES, FenceLostError, fence_check
 from agent.source_access import can_use_session_source
 from agent.source_binding import mcp_tool_policy, source_scope
@@ -104,23 +102,26 @@ async def source_registry(
     project_root: Path,
     registry: ToolRegistry,
 ) -> AsyncIterator[ToolRegistry]:
-    """Discover only operator-selected sources; close all clients on every exit."""
-    sources = load_tool_sources(settings.tool_sources_file)
+    """Discover the sources of the operator file and of the UI; close all clients on exit."""
+    sources = [
+        (source, file_environment(source))
+        for source in load_tool_sources(settings.tool_sources_file)
+    ]
+    async with session_factory() as db:
+        added = await ui_sources(db, settings)
+    taken = {source.source_id for source, _ in sources}
+    # The UI refuses the ID of a file source; a later file change must not mix their tools.
+    sources.extend((source, env) for source, env in added if source.source_id not in taken)
     async with AsyncExitStack() as stack:
         try:
-            for source in sources:
+            for source, environment in sources:
                 if not await _may_connect(session_id, project_root, source):
                     continue
-                environment = {
-                    key: os.environ[key]
-                    for key in ("PATH", "LANG", *source.env_keys)
-                    if key in os.environ
-                }
                 client = StdioMcpClient(
                     list(source.command),
                     cwd=project_root,
                     env=environment,
-                    sandbox=replace(policy_from_settings(settings), mode="required"),
+                    sandbox=sandbox_policy(settings, source),
                     session_id=session_id,
                 )
                 stack.push_async_exit(_close_on_exit(client))

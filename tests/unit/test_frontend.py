@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,8 @@ APP_PATHS = [
     "login",
     "settings/models",
     "settings/speech",
+    "settings/skills",
+    "settings/mcp",
     "s/s1",
     "s/6c7125ba-a565-439c-895d-590c31514f99",
 ]
@@ -51,12 +54,51 @@ def test_unknown_or_unsafe_routes_do_not_serve_index(frontend_dist: Path, path: 
     assert response.status_code == 404
 
 
+def test_every_client_route_survives_a_reload(frontend_dist: Path) -> None:
+    """A direct link or a reload of any fixed route of the app router gets the app page."""
+    router = Path(__file__).resolve().parents[2] / "frontend" / "src" / "router.ts"
+    paths = re.findall(r'path: "/([^"]*)"', router.read_text())
+    fixed = [path for path in paths if ":" not in path]
+    assert "settings/models" in fixed
+    for path in fixed:
+        response = frontend_response(frontend_dist, path)
+        assert isinstance(response, FileResponse), path
+
+
 def test_existing_asset_is_served(frontend_dist: Path) -> None:
     asset = frontend_dist / "app.js"
     asset.write_text("export const ready = true;")
     response = frontend_response(frontend_dist, "app.js")
     assert isinstance(response, FileResponse)
     assert response.path == asset
+
+
+@pytest.mark.parametrize(
+    ("path", "media_type"),
+    [
+        ("sw.js", "text/javascript"),
+        ("manifest.webmanifest", "application/manifest+json"),
+        ("icons/icon-192.png", "image/png"),
+    ],
+)
+def test_installed_app_files_are_public_with_their_types(
+    frontend_dist: Path, path: str, media_type: str
+) -> None:
+    """The browser installs the app and starts its worker before any login."""
+    from agent.main import PROTECTED_PREFIXES
+
+    (frontend_dist / "icons").mkdir()
+    (frontend_dist / path).write_bytes(b"x")
+    app = FastAPI()
+
+    @app.get("/{path:path}", response_model=None)
+    async def serve_frontend(path: str) -> FileResponse | JSONResponse:
+        return frontend_response(frontend_dist, path)
+
+    response = TestClient(app).get(f"/{path}")
+    assert response.status_code == 200
+    assert response.headers["content-type"].split(";")[0] == media_type
+    assert not f"/{path}".startswith(PROTECTED_PREFIXES)
 
 
 @pytest.mark.parametrize("exists", [True, False])

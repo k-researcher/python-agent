@@ -100,7 +100,7 @@ onBeforeUnmount(() => {
   min-height: 34px;
   padding: 6px 10px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-pill);
   background: var(--surface);
   color: var(--text-muted);
   font: inherit;
@@ -142,7 +142,7 @@ onBeforeUnmount(() => {
   box-sizing: border-box;
   padding: 16px;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
   background: var(--surface);
   box-shadow: var(--shadow);
 }
@@ -170,12 +170,14 @@ onBeforeUnmount(() => {
   max-width: none;
   min-width: 0;
   height: 36px;
-  padding: 6px 8px;
+  padding: 6px 34px 6px 12px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
+  border-radius: var(--radius);
+  appearance: none;
+  background: var(--bg) var(--select-chevron) no-repeat right 12px center / 12px 12px;
   color: var(--text);
   font-size: 13px;
+  cursor: pointer;
 }
 
 .agent-settings .settings-panel :deep(.agent-control:focus-within) {
@@ -183,8 +185,8 @@ onBeforeUnmount(() => {
 }
 
 .agent-settings .settings-panel :deep(select:focus-visible) {
-  outline: 2px solid var(--link);
-  outline-offset: 2px;
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
 }
 
 @media (max-width: 480px) {

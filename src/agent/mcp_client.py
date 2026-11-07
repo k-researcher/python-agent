@@ -56,6 +56,7 @@ class StdioMcpClient:
         request_timeout: float = 30.0,
         sandbox: SandboxPolicy | None = None,
         session_id: str | None = None,
+        stderr_tail_bytes: int = 0,
     ) -> None:
         """Bind to a server command but do not start it.
 
@@ -63,6 +64,8 @@ class StdioMcpClient:
         The default environment keeps only PATH, HOME, and LANG.
         Session integrations must supply a required sandbox policy and session ID.
         Omitting the policy preserves the standalone client's existing behavior.
+        With ``stderr_tail_bytes`` the client keeps the end of the server error output
+        for a diagnosis; otherwise the output is dropped.
         """
         if not command:
             raise ValueError("command must not be empty")
@@ -77,6 +80,9 @@ class StdioMcpClient:
         self._request_timeout = request_timeout
         self._sandbox = sandbox
         self._session_id = session_id
+        self._stderr_limit = max(0, stderr_tail_bytes)
+        self._stderr = bytearray()
+        self._stderr_task: asyncio.Task[None] | None = None
 
         self._process: asyncio.subprocess.Process | None = None
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
@@ -134,7 +140,9 @@ class StdioMcpClient:
                 env=environment,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE
+                if self._stderr_limit
+                else asyncio.subprocess.DEVNULL,
                 start_new_session=True,
             )
         )
@@ -150,6 +158,8 @@ class StdioMcpClient:
             raise asyncio.CancelledError
         self._broken = None
         self._reader_task = asyncio.create_task(self._read_loop())
+        if self._stderr_limit and self._process.stderr is not None:
+            self._stderr_task = asyncio.create_task(self._read_stderr(self._process.stderr))
         try:
             await self._initialize()
         except BaseException:
@@ -242,6 +252,12 @@ class StdioMcpClient:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(process.wait(), timeout=1.0)
 
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._stderr_task
+            self._stderr_task = None
+
         if self._reader_task is not None:
             self._reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -315,6 +331,23 @@ class StdioMcpClient:
         )
         self._process.stdin.write((line + "\n").encode())
         await self._process.stdin.drain()
+
+    @property
+    def stderr_tail(self) -> str:
+        """Return the end of the server error output that the client kept."""
+        return self._stderr.decode("utf-8", errors="replace")
+
+    async def _read_stderr(self, reader: asyncio.StreamReader) -> None:
+        while True:
+            try:
+                chunk = await reader.read(4096)
+            except OSError:
+                return
+            if not chunk:
+                return
+            self._stderr.extend(chunk)
+            if len(self._stderr) > self._stderr_limit:
+                del self._stderr[: len(self._stderr) - self._stderr_limit]
 
     async def _read_loop(self) -> None:
         """Read stdout lines and dispatch each JSON-RPC message."""

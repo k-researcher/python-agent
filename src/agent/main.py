@@ -20,8 +20,10 @@ from agent.config import get_settings
 from agent.database import init_database, session_factory
 from agent.events import broker
 from agent.frontend import frontend_response
+from agent.mcp_api import router as mcp_router
 from agent.message_tree_api import router as message_tree_router
 from agent.settings_api import router as settings_router
+from agent.skills_api import router as skills_router
 from agent.speech_api import router as speech_router
 from agent.speech_api import settings_router as speech_settings_router
 
@@ -88,6 +90,8 @@ async def browser_auth(request: Request, call_next: RequestResponseEndpoint) -> 
 app.include_router(auth_router)
 app.include_router(settings_router)
 app.include_router(speech_settings_router)
+app.include_router(skills_router)
+app.include_router(mcp_router)
 app.include_router(speech_router)
 app.include_router(router)
 app.include_router(message_tree_router)

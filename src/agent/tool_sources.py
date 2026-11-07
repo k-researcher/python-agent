@@ -37,12 +37,18 @@ class ToolSource(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     source_id: str
-    workspace_id: str
+    # None: a source of the single-user install, for projects without a workspace.
+    workspace_id: str | None
     project_ids: frozenset[str] = frozenset()
     command: tuple[str, ...]
     env_keys: tuple[str, ...] = ()
     enabled: StrictBool = False
     risk_level: RiskLevel = RiskLevel.network_access
+    # The server may use the network even when the shell sandbox has no network.
+    allow_network: StrictBool = False
+    # Absolute directories that the sandbox opens for reading, such as the install prefix
+    # of the server program.
+    read_paths: tuple[str, ...] = ()
     allowed_modes: frozenset[Literal["dev", "ask"]] = frozenset({"dev"})
     max_result_chars: StrictInt = Field(default=20_000, gt=0, le=1_000_000)
 
@@ -55,8 +61,8 @@ class ToolSource(BaseModel):
 
     @field_validator("workspace_id")
     @classmethod
-    def _workspace_id(cls, value: str) -> str:
-        return _check_id(value)
+    def _workspace_id(cls, value: str | None) -> str | None:
+        return value if value is None else _check_id(value)
 
     @field_validator("project_ids")
     @classmethod
@@ -72,6 +78,14 @@ class ToolSource(BaseModel):
             raise ValueError("Command must not be empty")
         for argument in value:
             _check_id(argument)
+        return value
+
+    @field_validator("read_paths")
+    @classmethod
+    def _read_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for path in value:
+            if "\x00" in path or not Path(path).is_absolute() or ".." in Path(path).parts:
+                raise ValueError("Read paths must be absolute")
         return value
 
     @field_validator("env_keys")

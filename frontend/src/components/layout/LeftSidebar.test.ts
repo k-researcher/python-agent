@@ -133,8 +133,16 @@ describe("LeftSidebar — projects", () => {
     await wrapper.find('[data-settings]').trigger("click");
     await wrapper.find('[data-signout]').trigger("click");
     expect(wrapper.emitted("newSession")).toHaveLength(1);
-    expect(wrapper.emitted("openSettings")).toHaveLength(1);
+    expect(wrapper.emitted("openSettings")).toEqual([[]]);
     expect(wrapper.emitted("signOut")).toHaveLength(1);
+  });
+
+  it("opens the skills settings from their own entry", async () => {
+    const wrapper = mountSidebar();
+    const entry = wrapper.get('[data-skills]');
+    expect(entry.text()).toBe("Навыки");
+    await entry.trigger("click");
+    expect(wrapper.emitted("openSettings")).toEqual([["skills"]]);
   });
 });
 
@@ -410,7 +418,7 @@ describe("LeftSidebar — session and project actions", () => {
     await item.get("[data-project-delete]").trigger("click");
     await wrapper.setProps({ isDeletingProject: true });
     const form = wrapper.get("[data-delete-project-form]");
-    expect(form.get("[data-delete-project-submit]").text()).toBe("Удаление...");
+    expect(form.get("[data-delete-project-submit]").text()).toBe("Удаляю…");
     expect(form.get("[data-delete-project-name]").attributes("disabled")).toBeDefined();
   });
 });

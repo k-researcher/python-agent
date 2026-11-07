@@ -131,6 +131,66 @@ class Project(Base):
     sessions: Mapped[list[Session]] = relationship(back_populates="project")
 
 
+class SharedSkillDefault(Base):
+    """Whether a shared skill is on in projects that have no own choice for it."""
+
+    __tablename__ = "shared_skill_defaults"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class ProjectSkillSetting(Base):
+    """The choice of one project to use a shared or a project skill."""
+
+    __tablename__ = "project_skill_settings"
+    __table_args__ = (
+        PrimaryKeyConstraint("project_id", "scope", "name", name="pk_project_skill_settings"),
+        CheckConstraint("scope IN ('shared', 'project')", name="ck_project_skill_settings_scope"),
+    )
+
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE", name="fk_project_skill_settings_project_id")
+    )
+    scope: Mapped[str] = mapped_column(String(10))
+    name: Mapped[str] = mapped_column(String(64))
+    enabled: Mapped[bool] = mapped_column(Boolean)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class McpServer(Base):
+    """An MCP server over stdio that the owner added in the UI.
+
+    It serves projects without a workspace. Secret environment values are encrypted.
+    """
+
+    __tablename__ = "mcp_servers"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    command: Mapped[list[str]] = mapped_column(JSON)
+    # Variable name -> encrypted value.
+    env_secrets: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    # Empty: every project without a workspace.
+    project_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    allowed_modes: Mapped[list[str]] = mapped_column(JSON, default=lambda: ["dev"])
+    risk_level: Mapped[str] = mapped_column(String(30), default="network_access")
+    allow_network: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Absolute directories that the sandbox opens for reading, such as /opt/homebrew.
+    read_paths: Mapped[list[str]] = mapped_column(JSON, default=list)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # The result of the last check: {ok, checked_at, tools, error}.
+    last_check: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class Session(Base):
     __tablename__ = "sessions"
     __table_args__ = (

@@ -36,7 +36,8 @@ test.describe("sidebar footer and project form containment", () => {
 
     const footerButtons = sidebarFooter.locator("button");
     const buttonCount = await footerButtons.count();
-    expect(buttonCount, "footer should contain both actions").toBe(2);
+    expect(buttonCount, "footer should contain skills, settings and sign out").toBe(3);
+    await expect(footerButtons).toHaveText(["Навыки", "Настройки", "Выйти"]);
     for (let index = 0; index < buttonCount; index++) {
       const buttonBox = await footerButtons.nth(index).boundingBox();
       expect(
@@ -80,6 +81,38 @@ test.describe("sidebar footer and project form containment", () => {
 
     await expect(projectForm.locator("[data-create-name]")).toBeVisible();
     await expect(projectForm.locator("[data-create-path]")).toBeVisible();
+  });
+
+  test("a row menu is not cut off by the scrolling project list", async ({ page }, testInfo) => {
+    await openApp(page, testInfo);
+    await ensureLeftPanelOpen(page);
+    const row = page.locator("[data-project-item]").first();
+    await row.hover();
+    await row.locator("[data-project-menu]").click();
+    const menu = page.getByRole("menu");
+    const item = menu.locator("[data-project-delete]");
+    await expect(item).toBeVisible();
+    const box = (await menu.boundingBox())!;
+    const viewport = page.viewportSize()!;
+    expect(box.y + box.height).toBeLessThanOrEqual(viewport.height);
+    // The whole menu with its frame is on top: nothing clips or covers any of its edges.
+    // The points sit in the middle of the edges, away from the rounded corners.
+    const middleX = box.x + box.width / 2;
+    const middleY = box.y + box.height / 2;
+    for (const [x, y] of [
+      [middleX, box.y + 1],
+      [middleX, box.y + box.height - 1],
+      [box.x + 1, middleY],
+      [box.x + box.width - 1, middleY],
+    ]) {
+      const onTop = await page.evaluate(
+        ([px, py]) => document.elementFromPoint(px, py)?.closest("[role=menu]") !== null,
+        [x, y],
+      );
+      expect(onTop, `menu edge at ${x},${y}`).toBe(true);
+    }
+    await item.click();
+    await expect(page.locator("[data-delete-project-form]")).toBeVisible();
   });
 
   test("session rows align labels, status dots and chevrons", async ({ page }, testInfo) => {

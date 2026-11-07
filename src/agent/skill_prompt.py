@@ -2,15 +2,17 @@
 
 The module loads skills from project and shared directories. It
 builds a short section and returns skill bodies by name. The module
-is standalone and does not connect to sessions.
+does not read the database: the switches of each project are applied
+in ``skill_library``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent.skills import Skill, SkillError, discover_skills, skill_index
+from agent.skills import Skill, SkillError, scan_skills, skill_index
 
 _PROJECT_SKILLS_REL = Path(".agent/skills")
 _HEADER = "Available skills:"
@@ -42,47 +44,55 @@ def _is_safe_project_skills(project_root: Path) -> bool:
     return True
 
 
-def _load_directory(directory: Path) -> tuple[tuple[Skill, ...], str]:
-    """Load skills from one directory and return skills and one error."""
+def _load_directory(directory: Path) -> tuple[tuple[Skill, ...], tuple[str, ...]]:
+    """Load the valid skills of one directory and the errors of the broken ones."""
     if not directory.exists():
-        return (), ""
-    try:
-        found = discover_skills(directory)
-    except SkillError as exc:
-        return (), str(exc)
-    return tuple(found), ""
+        return (), ()
+    found, errors = scan_skills(directory)
+    return tuple(found), tuple(errors)
+
+
+def project_skills_dir(project_root: Path) -> Path:
+    """Return the directory of the skills that belong to one project."""
+    return project_root / _PROJECT_SKILLS_REL
+
+
+def project_skills_safe(project_root: Path) -> bool:
+    """Check that the project skills directory, when it exists, stays inside the project."""
+    return not project_skills_dir(project_root).exists() or _is_safe_project_skills(project_root)
+
+
+def load_scoped_skills(
+    project_root: Path | None, shared_root: Path | None
+) -> tuple[tuple[Skill, ...], tuple[Skill, ...], tuple[str, ...]]:
+    """Return the shared skills, the project skills and the load errors, without merging."""
+    errors: list[str] = []
+    project_skills: tuple[Skill, ...] = ()
+    if project_root is not None:
+        project_dir = project_skills_dir(project_root)
+        if not project_skills_safe(project_root):
+            errors.append(f"Project skills directory is not safe: {project_dir}")
+        else:
+            project_skills, found_errors = _load_directory(project_dir)
+            errors.extend(found_errors)
+    shared_skills: tuple[Skill, ...] = ()
+    if shared_root is not None:
+        shared_skills, found_errors = _load_directory(shared_root)
+        errors.extend(found_errors)
+    return shared_skills, project_skills, tuple(errors)
+
+
+def merge_skills(shared: Sequence[Skill], project: Sequence[Skill]) -> tuple[Skill, ...]:
+    """Merge two skill lists; a project skill replaces a shared skill with the same name."""
+    by_name = {skill.name: skill for skill in shared}
+    by_name.update((skill.name, skill) for skill in project)
+    return tuple(sorted(by_name.values(), key=lambda s: s.name))
 
 
 def load_skill_set(project_root: Path, shared_root: Path | None) -> SkillSet:
     """Load skills from the project and shared directories."""
-    errors: list[str] = []
-    project_skills: list[Skill] = []
-
-    project_dir = project_root / _PROJECT_SKILLS_REL
-    if project_dir.exists():
-        if not _is_safe_project_skills(project_root):
-            errors.append(f"Project skills directory is not safe: {project_dir}")
-        else:
-            found, error = _load_directory(project_dir)
-            project_skills = list(found)
-            if error:
-                errors.append(error)
-
-    shared_skills: list[Skill] = []
-    if shared_root is not None:
-        found, error = _load_directory(shared_root)
-        shared_skills = list(found)
-        if error:
-            errors.append(error)
-
-    by_name: dict[str, Skill] = {}
-    for skill in shared_skills:
-        by_name[skill.name] = skill
-    for skill in project_skills:
-        by_name[skill.name] = skill
-
-    merged = tuple(sorted(by_name.values(), key=lambda s: s.name))
-    return SkillSet(skills=merged, errors=tuple(errors))
+    shared, project, errors = load_scoped_skills(project_root, shared_root)
+    return SkillSet(skills=merge_skills(shared, project), errors=errors)
 
 
 def skill_prompt_section(skill_set: SkillSet, *, max_chars: int = 4000) -> str:
