@@ -28,14 +28,15 @@ class SourceScope:
     """Limit a tool source to one workspace and optional project and mode sets."""
 
     source_id: str
-    workspace_id: str
+    # None: a source of the single-user install, for projects without a workspace.
+    workspace_id: str | None
     project_ids: frozenset[str] = frozenset()
     enabled: bool = True
     allowed_modes: frozenset[str] = frozenset({"dev", "ask"})
 
 
-def _valid_id(value: str) -> bool:
-    return bool(value.strip())
+def _valid_id(value: str | None) -> bool:
+    return value is not None and bool(value.strip())
 
 
 def _valid_actor(actor: SourceActor, source: SourceScope) -> bool:
@@ -76,6 +77,26 @@ def can_use_source(
         and project_workspace_id == source.workspace_id
         and (not source.project_ids or project_id in source.project_ids)
         and workspace_capabilities(actor.role).run_agent
+        and tool_profile(mode) in {"dev", "ask"}
+        and tool_profile(mode) in source.allowed_modes
+    )
+
+
+def can_use_personal_source(
+    source: SourceScope, *, project_id: str, project_workspace_id: str | None, mode: str
+) -> bool:
+    """Allow a source of the single-user install in a project without a workspace.
+
+    Such an install has one owner and no user accounts, so there is no actor to check.
+    A project of a workspace never gets these sources.
+    """
+    return (
+        source.workspace_id is None
+        and project_workspace_id is None
+        and _valid_id(source.source_id)
+        and source.enabled
+        and _valid_id(project_id)
+        and (not source.project_ids or project_id in source.project_ids)
         and tool_profile(mode) in {"dev", "ask"}
         and tool_profile(mode) in source.allowed_modes
     )

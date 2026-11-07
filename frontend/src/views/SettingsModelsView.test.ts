@@ -89,6 +89,7 @@ async function mountView() {
       { path: "/settings/models", name: "settings-models", component: SettingsModelsView },
       { path: "/settings/speech", name: "settings-speech", component: { template: "<div/>" } },
       { path: "/settings/skills", name: "settings-skills", component: { template: "<div/>" } },
+      { path: "/settings/mcp", name: "settings-mcp", component: { template: "<div/>" } },
     ],
   });
   await router.push("/settings/models");

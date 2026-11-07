@@ -163,6 +163,34 @@ class ProjectSkillSetting(Base):
     )
 
 
+class McpServer(Base):
+    """An MCP server over stdio that the owner added in the UI.
+
+    It serves projects without a workspace. Secret environment values are encrypted.
+    """
+
+    __tablename__ = "mcp_servers"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    command: Mapped[list[str]] = mapped_column(JSON)
+    # Variable name -> encrypted value.
+    env_secrets: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    # Empty: every project without a workspace.
+    project_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    allowed_modes: Mapped[list[str]] = mapped_column(JSON, default=lambda: ["dev"])
+    risk_level: Mapped[str] = mapped_column(String(30), default="network_access")
+    allow_network: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Absolute directories that the sandbox opens for reading, such as /opt/homebrew.
+    read_paths: Mapped[list[str]] = mapped_column(JSON, default=list)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # The result of the last check: {ok, checked_at, tools, error}.
+    last_check: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class Session(Base):
     __tablename__ = "sessions"
     __table_args__ = (

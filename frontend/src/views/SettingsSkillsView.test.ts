@@ -56,6 +56,7 @@ async function mountView(skills: SkillItem[], query = "", errors: SkillCatalog["
       { path: "/settings/models", name: "settings-models", component: { template: "<div/>" } },
       { path: "/settings/speech", name: "settings-speech", component: { template: "<div/>" } },
       { path: "/settings/skills", name: "settings-skills", component: SettingsSkillsView },
+      { path: "/settings/mcp", name: "settings-mcp", component: { template: "<div/>" } },
     ],
   });
   await router.push(`/settings/skills${query}`);

@@ -12,6 +12,7 @@ const SECTIONS = [
   { name: "settings-models", label: "Модели" },
   { name: "settings-speech", label: "Голос" },
   { name: "settings-skills", label: "Навыки" },
+  { name: "settings-mcp", label: "MCP" },
 ] as const;
 
 function back(): void {

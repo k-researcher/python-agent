@@ -4,7 +4,13 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from agent.source_policy import SourceActor, SourceScope, can_manage_source, can_use_source
+from agent.source_policy import (
+    SourceActor,
+    SourceScope,
+    can_manage_source,
+    can_use_personal_source,
+    can_use_source,
+)
 
 
 @pytest.fixture
@@ -151,3 +157,41 @@ def test_default_scope_and_facts_are_immutable(actor: SourceActor) -> None:
         with pytest.raises(FrozenInstanceError):
             setattr(target, field, "other")
         assert not hasattr(target, "__dict__")
+
+
+def personal(source: SourceScope, **overrides: object) -> bool:
+    arguments: dict[str, object] = {
+        "project_id": "project",
+        "project_workspace_id": None,
+        "mode": "dev",
+        **overrides,
+    }
+    return can_use_personal_source(source, **arguments)  # type: ignore[arg-type]
+
+
+def test_personal_source_serves_a_project_without_a_workspace() -> None:
+    source = SourceScope("ui", None, allowed_modes=frozenset({"dev"}))
+    assert personal(source)
+    assert personal(source, project_id="other")
+    assert not personal(source, mode="ask")
+    assert not personal(replace(source, enabled=False))
+    assert not personal(replace(source, project_ids=frozenset({"other"})))
+    assert personal(replace(source, project_ids=frozenset({"project"})))
+
+
+def test_personal_source_never_serves_a_workspace_project() -> None:
+    source = SourceScope("ui", None)
+    assert not personal(source, project_workspace_id="workspace")
+
+
+def test_workspace_source_is_not_a_personal_source() -> None:
+    source = SourceScope("team", "workspace")
+    assert not personal(source)
+    actor = SourceActor("user", "workspace", "owner")
+    assert not can_use_source(
+        actor,
+        SourceScope("ui", None),
+        project_id="project",
+        project_workspace_id=None,
+        mode="dev",
+    )
