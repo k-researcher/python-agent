@@ -1,7 +1,7 @@
-"""Stdio client for the Model Context Protocol.
+"""Clients for the Model Context Protocol: the shared protocol and the stdio transport.
 
-Speak JSON-RPC 2.0 over a child process stdio.
-Each message is one line of JSON.
+Speak JSON-RPC 2.0. Over stdio each message is one line of JSON on the streams of a child
+process. The HTTP transport lives in ``agent.mcp_http``.
 This module is decoupled from the tool registry.
 """
 
@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 import signal
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,18 +22,22 @@ from agent.sandbox import prepare as prepare_sandbox
 
 # JSON-RPC 2.0 reserved error codes.
 _METHOD_NOT_FOUND = -32601
-_MAX_LINE_BYTES = 4 * 1024 * 1024
+MAX_MESSAGE_BYTES = 4 * 1024 * 1024
+_MAX_LINE_BYTES = MAX_MESSAGE_BYTES
 _MAX_LIST_PAGES = 50
+PROTOCOL_VERSION = "2025-06-18"
+CLIENT_INFO = {"name": "python-agent", "version": "0.1"}
 
 
 class McpError(Exception):
     """An error returned or raised by the MCP transport."""
 
-    def __init__(self, code: int | None, message: str) -> None:
-        """Store the JSON-RPC code and a human-readable message."""
+    def __init__(self, code: int | None, message: str, *, status: int | None = None) -> None:
+        """Store the JSON-RPC code, a human-readable message and the HTTP status, if any."""
         super().__init__(message)
         self.code = code
         self.message = message
+        self.status = status
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +49,99 @@ class McpTool:
     input_schema: dict[str, Any]
 
 
-class StdioMcpClient:
+class McpClient(ABC):
+    """The protocol part of a client: the handshake, the tool list and the tool call.
+
+    A transport sends the requests and the notifications and owns the connection.
+    """
+
+    def __init__(self) -> None:
+        self.server_info: dict[str, Any] = {}
+        self.capabilities: dict[str, Any] = {}
+
+    @property
+    def protocol_version(self) -> str | None:
+        """Return the negotiated HTTP version, or None for another transport."""
+        return None
+
+    @abstractmethod
+    async def start(self) -> None:
+        """Open the connection and perform the initialize handshake."""
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Close the connection and release its resources."""
+
+    @abstractmethod
+    async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Send a request and return its result."""
+
+    @abstractmethod
+    async def _notify(self, method: str, params: dict[str, Any]) -> None:
+        """Send a notification without waiting for a reply."""
+
+    async def __aenter__(self) -> McpClient:
+        """Start the client and return it."""
+        await self.start()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: object,
+        exc_value: object,
+        traceback: object,
+    ) -> None:
+        """Close the client."""
+        await self.close()
+
+    async def _initialize(self) -> dict[str, Any]:
+        init_params: dict[str, Any] = {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": dict(CLIENT_INFO),
+        }
+        result = await self._request("initialize", init_params)
+        self.server_info = dict(result.get("serverInfo", {}))
+        self.capabilities = dict(result.get("capabilities", {}))
+        await self._notify("notifications/initialized", {})
+        return result
+
+    async def list_tools(self) -> list[McpTool]:
+        """Fetch all tools, following pagination cursors."""
+        tools: list[McpTool] = []
+        cursor: str | None = None
+        for _ in range(_MAX_LIST_PAGES):
+            params: dict[str, Any] = {}
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = await self._request("tools/list", params)
+            items = result.get("tools", [])
+            if not isinstance(items, list):
+                raise McpError(None, "protocol error: tools is not a list")
+            for item in items:
+                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                    raise McpError(None, "protocol error: a tool has no name")
+                schema = item.get("inputSchema", {})
+                tools.append(
+                    McpTool(
+                        name=item["name"],
+                        description=str(item.get("description", "")),
+                        input_schema=dict(schema) if isinstance(schema, dict) else {},
+                    )
+                )
+            cursor = result.get("nextCursor")
+            if not isinstance(cursor, str):
+                break
+        return tools
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Invoke a remote tool and return its structured result."""
+        params: dict[str, Any] = {"name": name, "arguments": arguments}
+        result = await self._request("tools/call", params)
+        return dict(result)
+
+
+class StdioMcpClient(McpClient):
     """Talk to an MCP server over its standard streams."""
 
     def __init__(
@@ -69,6 +166,7 @@ class StdioMcpClient:
         """
         if not command:
             raise ValueError("command must not be empty")
+        super().__init__()
         if sandbox is not None:
             if sandbox.mode != "required":
                 raise ValueError("sandbox mode must be 'required'")
@@ -92,8 +190,6 @@ class StdioMcpClient:
         self._reply_tasks: set[asyncio.Task[None]] = set()
         # Set when the connection can no longer work; new requests fail at once.
         self._broken: McpError | None = None
-        self.server_info: dict[str, Any] = {}
-        self.capabilities: dict[str, Any] = {}
 
     @staticmethod
     def _default_env() -> dict[str, str]:
@@ -104,20 +200,6 @@ class StdioMcpClient:
             if value is not None:
                 result[key] = value
         return result
-
-    async def __aenter__(self) -> StdioMcpClient:
-        """Start the server and return this client."""
-        await self.start()
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: object,
-        exc_value: object,
-        traceback: object,
-    ) -> None:
-        """Close the server process."""
-        await self.close()
 
     async def start(self) -> None:
         """Spawn the server and perform the initialize handshake."""
@@ -166,52 +248,6 @@ class StdioMcpClient:
             # A failed handshake must not leave the server process running.
             await self.close()
             raise
-
-    async def _initialize(self) -> None:
-        init_params: dict[str, Any] = {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": {"name": "python-agent", "version": "0.1"},
-        }
-        result = await self._request("initialize", init_params)
-        self.server_info = dict(result.get("serverInfo", {}))
-        self.capabilities = dict(result.get("capabilities", {}))
-
-        await self._notify("notifications/initialized", {})
-
-    async def list_tools(self) -> list[McpTool]:
-        """Fetch all tools, following pagination cursors."""
-        tools: list[McpTool] = []
-        cursor: str | None = None
-        for _ in range(_MAX_LIST_PAGES):
-            params: dict[str, Any] = {}
-            if cursor is not None:
-                params["cursor"] = cursor
-            result = await self._request("tools/list", params)
-            items = result.get("tools", [])
-            if not isinstance(items, list):
-                raise McpError(None, "protocol error: tools is not a list")
-            for item in items:
-                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-                    raise McpError(None, "protocol error: a tool has no name")
-                schema = item.get("inputSchema", {})
-                tools.append(
-                    McpTool(
-                        name=item["name"],
-                        description=str(item.get("description", "")),
-                        input_schema=dict(schema) if isinstance(schema, dict) else {},
-                    )
-                )
-            cursor = result.get("nextCursor")
-            if not isinstance(cursor, str):
-                break
-        return tools
-
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Invoke a remote tool and return its structured result."""
-        params: dict[str, Any] = {"name": name, "arguments": arguments}
-        result = await self._request("tools/call", params)
-        return dict(result)
 
     async def close(self) -> None:
         """Terminate the server and release its resources."""

@@ -164,17 +164,25 @@ class ProjectSkillSetting(Base):
 
 
 class McpServer(Base):
-    """An MCP server over stdio that the owner added in the UI.
+    """An MCP server that the owner added in the UI: a command over stdio or an address.
 
-    It serves projects without a workspace. Secret environment values are encrypted.
+    It serves projects without a workspace. Secret environment values and secret header
+    values are encrypted.
     """
 
     __tablename__ = "mcp_servers"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    # Empty for a server over HTTP.
     command: Mapped[list[str]] = mapped_column(JSON)
     # Variable name -> encrypted value.
     env_secrets: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    # The MCP endpoint of a server over HTTP.
+    url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # Header name -> encrypted value, such as Authorization.
+    header_secrets: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    # The protocol era over HTTP: "auto", "modern" or "legacy".
+    http_protocol: Mapped[str] = mapped_column(String(10), default="auto")
     # Empty: every project without a workspace.
     project_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     allowed_modes: Mapped[list[str]] = mapped_column(JSON, default=lambda: ["dev"])

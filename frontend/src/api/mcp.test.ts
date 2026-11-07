@@ -57,3 +57,20 @@ it("an ID with special characters stays one path part", async () => {
   await mcpApi.check("a/b");
   expect(vi.mocked(request).mock.calls[0][0]).toBe("/api/mcp/servers/a%2Fb/check");
 });
+
+it("HTTP creation sends headers without command fields or removed secrets", async () => {
+  await mcpApi.create("remote", {
+    url: "https://example.com/mcp", headers: { Authorization: "Bearer secret", DROP: null },
+    http_protocol: "modern", project_ids: [], allowed_modes: ["ask"],
+  });
+  const body = JSON.parse(String(vi.mocked(request).mock.calls[0][1]?.body));
+  expect(body).toEqual({ id: "remote", url: "https://example.com/mcp", headers: { Authorization: "Bearer secret" },
+    http_protocol: "modern", project_ids: [], allowed_modes: ["ask"] });
+});
+
+it("HTTP updates keep null headers so the server removes them", async () => {
+  await mcpApi.update("remote", { headers: { DROP: null, SWAP: "new" }, http_protocol: "legacy" });
+  expect(JSON.parse(String(vi.mocked(request).mock.calls[0][1]?.body))).toEqual({
+    headers: { DROP: null, SWAP: "new" }, http_protocol: "legacy",
+  });
+});

@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from agent import source_lifecycle
+from agent import mcp_servers, source_lifecycle
 from agent.config import Settings
 from agent.sandbox import SandboxUnavailableError
 from agent.tool_sources import ToolSource
@@ -84,7 +84,7 @@ def lifecycle_factory(
         constructor = Mock(side_effect=clients)
         loader = Mock(return_value=sources)
         may_connect = AsyncMock(return_value=True)
-        monkeypatch.setattr(source_lifecycle, "StdioMcpClient", constructor)
+        monkeypatch.setattr(mcp_servers, "StdioMcpClient", constructor)
         monkeypatch.setattr(source_lifecycle, "load_tool_sources", loader)
         monkeypatch.setattr(source_lifecycle, "_may_connect", may_connect)
         return LifecycleHarness(

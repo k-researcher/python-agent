@@ -1,10 +1,11 @@
-"""MCP servers over stdio that the owner adds in the UI.
+"""MCP servers that the owner adds in the UI: a command over stdio or an address over HTTP.
 
 Such a server serves the projects without a workspace, that is, the single-user install.
 Its definition becomes a ToolSource without a workspace, so discovery, the approval
 revision, the source checks and the audit are the same as for a server from the operator
-file. A server always runs in the required OS sandbox. Secret environment values are kept
-encrypted and never go back to the browser.
+file. A command always runs in the required OS sandbox; the agent itself connects to an
+address. Secret environment values and secret header values are kept encrypted and never
+go back to the browser.
 """
 
 from __future__ import annotations
@@ -24,7 +25,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.config import Settings
-from agent.mcp_client import McpError, StdioMcpClient
+from agent.mcp_client import McpClient, McpError, StdioMcpClient
+from agent.mcp_http import RESERVED_HEADERS, HttpMcpClient, url_refusal
 from agent.model_overrides import SecretKeyError, decrypt_secret
 from agent.models import McpServer
 from agent.sandbox import SandboxPolicy, SandboxUnavailableError, policy_from_settings
@@ -33,6 +35,7 @@ from agent.tools.base import RiskLevel
 
 SERVER_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+HEADER_NAME = re.compile(r"[A-Za-z0-9-]{1,64}")
 MAX_COMMAND_PARTS = 64
 MAX_ARGUMENT_CHARS = 4096
 MAX_ENV_KEYS = 32
@@ -102,6 +105,28 @@ def check_secret(value: str) -> str:
     return value
 
 
+def check_url(value: str) -> str:
+    """Return the address of a server over HTTP, or refuse it with the reason."""
+    refusal = url_refusal(value)
+    if refusal is not None:
+        raise McpServerError(refusal)
+    return value
+
+
+def check_header_key(name: str) -> str:
+    if not HEADER_NAME.fullmatch(name):
+        raise McpServerError(f"Недопустимое имя заголовка: {name[:40]}")
+    if name.lower() in RESERVED_HEADERS:
+        raise McpServerError(f"Заголовок {name} задаёт агент, его нельзя менять")
+    return name
+
+
+def check_header_value(value: str) -> str:
+    if any(char in value for char in "\r\n\x00") or len(value) > MAX_SECRET_CHARS:
+        raise McpServerError("Значение заголовка слишком длинное или содержит перевод строки")
+    return value
+
+
 def _overlaps(path: Path, other: Path) -> bool:
     return path == other or path in other.parents or other in path.parents
 
@@ -161,17 +186,27 @@ def suggested_read_paths(command: Sequence[str], settings: Settings) -> list[str
 
 def to_source(server: McpServer) -> ToolSource:
     """Return the trusted source definition of a server from the UI."""
+    if server.url is not None:
+        launch: dict[str, Any] = {
+            "url": server.url,
+            "header_keys": tuple(sorted(server.header_secrets)),
+            "http_protocol": server.http_protocol,
+        }
+    else:
+        launch = {
+            "command": tuple(server.command),
+            "env_keys": tuple(sorted(server.env_secrets)),
+            "allow_network": server.allow_network,
+            "read_paths": tuple(server.read_paths),
+        }
     return ToolSource(
         source_id=server.id,
         workspace_id=None,
         project_ids=frozenset(server.project_ids),
-        command=tuple(server.command),
-        env_keys=tuple(sorted(server.env_secrets)),
         enabled=server.enabled,
         risk_level=RiskLevel(server.risk_level),
-        allow_network=server.allow_network,
-        read_paths=tuple(server.read_paths),
         allowed_modes=frozenset(server.allowed_modes),  # type: ignore[arg-type]
+        **launch,
     )
 
 
@@ -181,6 +216,42 @@ def server_environment(server: McpServer, settings: Settings) -> dict[str, str]:
     for key, ciphertext in server.env_secrets.items():
         environment[key] = decrypt_secret(ciphertext, settings)
     return environment
+
+
+def server_secrets(server: McpServer, settings: Settings) -> dict[str, str]:
+    """Return the process environment of a command, or the headers of an address."""
+    if server.url is None:
+        return server_environment(server, settings)
+    return {key: decrypt_secret(value, settings) for key, value in server.header_secrets.items()}
+
+
+def open_client(
+    settings: Settings,
+    source: ToolSource,
+    secrets: dict[str, str],
+    *,
+    cwd: Path,
+    session_id: str,
+    request_timeout: float = 30.0,
+    stderr_tail_bytes: int = 0,
+) -> McpClient:
+    """Return a client for the source; ``secrets`` are its environment or its headers."""
+    if source.url is not None:
+        return HttpMcpClient(
+            source.url,
+            headers=secrets,
+            request_timeout=request_timeout,
+            protocol=source.http_protocol,
+        )
+    return StdioMcpClient(
+        list(source.command),
+        cwd=cwd,
+        env=secrets,
+        sandbox=sandbox_policy(settings, source),
+        session_id=session_id,
+        request_timeout=request_timeout,
+        stderr_tail_bytes=stderr_tail_bytes,
+    )
 
 
 def file_environment(source: ToolSource) -> dict[str, str]:
@@ -202,14 +273,14 @@ def sandbox_policy(settings: Settings, source: ToolSource) -> SandboxPolicy:
 async def ui_sources(
     db: AsyncSession, settings: Settings
 ) -> list[tuple[ToolSource, dict[str, str]]]:
-    """Return the enabled servers from the UI with their process environments.
+    """Return the enabled servers from the UI with their secrets (see ``server_secrets``).
 
     A server whose secrets cannot be decrypted is left out, so the other servers still work.
     """
     found: list[tuple[ToolSource, dict[str, str]]] = []
     for server in (await db.scalars(select(McpServer).where(McpServer.enabled.is_(True)))).all():
         try:
-            found.append((to_source(server), server_environment(server, settings)))
+            found.append((to_source(server), server_secrets(server, settings)))
         except (SecretKeyError, ValueError):
             logger.warning(
                 "MCP server %s is left out: its definition or secrets are not valid", server.id
@@ -217,25 +288,41 @@ async def ui_sources(
     return found
 
 
-async def check_server(settings: Settings, server: McpServer) -> dict[str, Any]:
-    """Start the server in its sandbox, list its tools and stop it.
+def _check_error(error: McpError) -> str:
+    """Explain a refusal of a server over HTTP in the words of the UI."""
+    if error.status in {401, 403}:
+        return "Сервер отказал в доступе: проверьте заголовок с ключом"
+    if error.status is not None and 300 <= error.status < 400:
+        return "Сервер перенаправляет запрос на другой адрес: укажите конечный адрес"
+    if error.status == 404:
+        return "По этому адресу нет MCP-сервера: проверьте путь, например /mcp"
+    if error.message == "could not connect":
+        return "Не удалось подключиться к серверу"
+    if error.message.startswith("unsupported protocol version"):
+        return "Сервер говорит на версии MCP, которую агент пока не поддерживает"
+    return error.message
 
-    The server runs in an empty directory of its own, not in a project. Return the result
-    that the UI shows and that is kept as ``McpServer.last_check``.
+
+async def check_server(settings: Settings, server: McpServer) -> dict[str, Any]:
+    """Connect to the server, list its tools and disconnect.
+
+    A command runs in its sandbox in an empty directory of its own, not in a project.
+    Return the result that the UI shows and that is kept as ``McpServer.last_check``.
     """
     checked_at = datetime.now(UTC).isoformat()
     source = to_source(server)
     workdir = settings.data_dir / "mcp-check" / server.id
-    workdir.mkdir(parents=True, exist_ok=True)
+    if source.url is None:
+        workdir.mkdir(parents=True, exist_ok=True)
     try:
-        environment = server_environment(server, settings)
+        secrets = server_secrets(server, settings)
     except SecretKeyError:
         return {"ok": False, "checked_at": checked_at, "error": "Не удалось расшифровать секреты"}
-    client = StdioMcpClient(
-        list(source.command),
+    client = open_client(
+        settings,
+        source,
+        secrets,
         cwd=workdir,
-        env=environment,
-        sandbox=sandbox_policy(settings, source),
         session_id=f"mcp-check-{server.id}",
         request_timeout=CHECK_SECONDS,
         stderr_tail_bytes=_STDERR_BYTES,
@@ -245,6 +332,7 @@ async def check_server(settings: Settings, server: McpServer) -> dict[str, Any]:
             await client.start()
             tools = await client.list_tools()
             info = client.server_info
+            protocol = client.protocol_version
     except SandboxUnavailableError:
         return {
             "ok": False,
@@ -252,13 +340,18 @@ async def check_server(settings: Settings, server: McpServer) -> dict[str, Any]:
             "error": "Песочница ОС недоступна на этом сервере, MCP-серверы не запускаются",
         }
     except (McpError, OSError, TimeoutError) as exc:
-        message = "Сервер не ответил за минуту" if isinstance(exc, TimeoutError) else str(exc)
-        return {
-            "ok": False,
-            "checked_at": checked_at,
-            "error": message,
-            "stderr": _last_lines(client.stderr_tail),
-        }
+        if isinstance(exc, TimeoutError) or (
+            isinstance(exc, McpError) and exc.message == "timed out"
+        ):
+            message = "Сервер не ответил за минуту"
+        elif isinstance(exc, McpError):
+            message = _check_error(exc)
+        else:
+            message = str(exc)
+        failed = {"ok": False, "checked_at": checked_at, "error": message}
+        if isinstance(client, StdioMcpClient):
+            failed["stderr"] = _last_lines(client.stderr_tail)
+        return failed
     finally:
         await client.close()
     return {
@@ -273,6 +366,8 @@ async def check_server(settings: Settings, server: McpServer) -> dict[str, Any]:
             for tool in tools[:_LISTED_TOOLS]
         ],
         "tool_count": len(tools),
+        # The version that the server and the agent agreed on over HTTP.
+        **({"protocol": protocol} if protocol else {}),
     }
 
 

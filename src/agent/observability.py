@@ -131,6 +131,10 @@ def configure_json_logging(level: str = "INFO", stream: TextIO | None = None) ->
     """
     root = logging.getLogger()
     root.setLevel(level.upper())
+    # The HTTP client logs every request with its full address; an address can hold a key
+    # in its query, such as the address of an MCP server.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     for handler in root.handlers:
         if isinstance(handler.formatter, JsonLogFormatter):
             return

@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 from sqlalchemy import delete
 
-from agent import source_lifecycle
+from agent import mcp_servers
 from agent.config import Settings
 from agent.database import init_database, session_factory
 from agent.mcp_client import McpTool, StdioMcpClient
@@ -98,7 +98,7 @@ async def lifecycle_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Lif
         settings = Settings(tool_sources_file=path, data_dir=tmp_path / "runtime")
         case = LifecycleCase(session.id, user.id, workspace.id, project.id, tmp_path, settings)
     FakeClient.instances = []
-    monkeypatch.setattr(source_lifecycle, "StdioMcpClient", FakeClient)
+    monkeypatch.setattr(mcp_servers, "StdioMcpClient", FakeClient)
     return case
 
 
@@ -210,7 +210,7 @@ async def test_access_changed_during_discovery_fails_closed(
         client.on_list = revoke
         return client
 
-    monkeypatch.setattr(source_lifecycle, "StdioMcpClient", client_factory)
+    monkeypatch.setattr(mcp_servers, "StdioMcpClient", client_factory)
     with pytest.raises(ToolError, match="could not be initialized"):
         async with source_registry(
             case.settings, case.session_id, case.root, ToolRegistry(tools=())
@@ -296,7 +296,7 @@ async def test_lifecycle_real_required_sandbox_and_cleanup(
     lifecycle_case: LifecycleCase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     case = lifecycle_case
-    monkeypatch.setattr(source_lifecycle, "StdioMcpClient", StdioMcpClient)
+    monkeypatch.setattr(mcp_servers, "StdioMcpClient", StdioMcpClient)
     path = case.settings.tool_sources_file
     assert path is not None
     document = json.loads(path.read_text())

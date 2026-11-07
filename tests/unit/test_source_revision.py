@@ -228,3 +228,35 @@ def test_schema_numeric_types_and_nesting() -> None:
     first = {"minimum": 1, "maximum": 10, "type": "integer"}
     second = {"maximum": 10, "type": "integer", "minimum": 1}
     assert schema_hash(first) == schema_hash(second)
+
+
+def test_a_command_source_keeps_its_revision_after_the_http_fields() -> None:
+    """Approvals keep the revision of a source; new fields must not change an old one."""
+    source = ToolSource(
+        source_id="docs",
+        workspace_id=None,
+        project_ids=frozenset({"p2", "p1"}),
+        command=("npx", "-y", "docs"),
+        env_keys=("TOKEN",),
+        enabled=True,
+        allow_network=True,
+        read_paths=("/opt/tools",),
+        allowed_modes=frozenset({"dev", "ask"}),
+    )
+    # Computed by the release before servers over HTTP.
+    assert source_revision(source) == (
+        "4db0ff6fee8479ab31e8b8caf392075631d1780c17d7394fa97169d7990bd75c"
+    )
+
+
+def test_the_address_and_the_header_names_change_the_revision() -> None:
+    base = ToolSource(source_id="docs", workspace_id=None, url="https://mcp.example.com/mcp")
+    other_url = base.model_copy(update={"url": "https://mcp.example.com/other"})
+    with_header = ToolSource(
+        source_id="docs",
+        workspace_id=None,
+        url="https://mcp.example.com/mcp",
+        header_keys=("Authorization",),
+    )
+    revisions = {source_revision(item) for item in (base, other_url, with_header)}
+    assert len(revisions) == 3

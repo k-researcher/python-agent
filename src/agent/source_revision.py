@@ -82,6 +82,12 @@ def source_revision(source: ToolSource) -> str:
     preserved. The source object is not mutated.
     """
     payload = source.model_dump(mode="json")
+    # The HTTP fields came later: a source without them keeps its revision and approvals.
+    if payload["url"] is None:
+        del payload["url"]
+        del payload["http_protocol"]
+    if not payload["header_keys"]:
+        del payload["header_keys"]
     payload["project_ids"] = sorted(payload["project_ids"])
     payload["allowed_modes"] = sorted(payload["allowed_modes"])
     return _hash(payload)

@@ -1,9 +1,10 @@
-// MCP servers over stdio added in the UI: the list, changes and the start check.
+// MCP servers added in the UI: the list, changes and the connection check.
 
 import { request } from "./client";
 
 /** A permission profile of the session roles: "dev" may change files, "ask" only reads. */
 export type McpProfile = "dev" | "ask";
+export type McpHttpProtocol = "auto" | "modern" | "legacy";
 
 export interface McpTool {
   name: string;
@@ -12,6 +13,7 @@ export interface McpTool {
 
 export interface McpCheck {
   ok: boolean;
+  protocol?: string;
   checked_at?: string;
   server?: { name: string; version: string };
   tools?: McpTool[];
@@ -23,6 +25,9 @@ export interface McpCheck {
 export interface McpServerItem {
   id: string;
   command: string[];
+  url: string | null;
+  header_keys: string[];
+  http_protocol: McpHttpProtocol;
   /** Names only: the values are secret and never come back. */
   env_keys: string[];
   /** Empty: every project. */
@@ -36,7 +41,7 @@ export interface McpServerItem {
 }
 
 export interface McpList {
-  /** False: the OS sandbox does not work on this computer, so no server starts. */
+  /** False: the OS sandbox does not work, so commands cannot start. */
   sandbox: boolean;
   /** Servers from the operator file; their IDs are taken. */
   file_sources: string[];
@@ -44,14 +49,17 @@ export interface McpList {
 }
 
 export interface McpDraft {
-  command: string[];
+  command?: string[];
+  url?: string;
+  headers?: Record<string, string | null>;
+  http_protocol?: McpHttpProtocol;
   /** A value sets the secret, null removes the variable, a missing name keeps it. */
-  env: Record<string, string | null>;
+  env?: Record<string, string | null>;
   project_ids: string[];
   allowed_modes: McpProfile[];
-  allow_network: boolean;
+  allow_network?: boolean;
   /** Null on creation: the install directory of the program. */
-  read_paths: string[] | null;
+  read_paths?: string[] | null;
   enabled?: boolean;
 }
 
@@ -101,10 +109,14 @@ export function joinCommand(parts: string[]): string {
 export const mcpApi = {
   list: () => request<McpList>(PREFIX),
   create: (id: string, draft: McpDraft) => {
-    const env = Object.fromEntries(Object.entries(draft.env).filter((entry) => entry[1] !== null));
+    const secrets = Object.fromEntries(
+      (["env", "headers"] as const).filter((key) => draft[key] !== undefined).map((key) => [
+        key, Object.fromEntries(Object.entries(draft[key]!).filter((entry) => entry[1] !== null)),
+      ]),
+    );
     return request<McpList>(PREFIX, {
       method: "POST",
-      body: JSON.stringify({ id, ...draft, env, ...(draft.read_paths === null ? { read_paths: undefined } : {}) }),
+      body: JSON.stringify({ id, ...draft, ...secrets, ...(draft.read_paths === null ? { read_paths: undefined } : {}) }),
     });
   },
   update: (id: string, patch: Partial<McpDraft>) =>
