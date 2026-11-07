@@ -345,6 +345,11 @@
   font-size: 14px;
 }
 
+/* IDs, addresses and commands keep the fixed-width font inside a field. */
+.ui-input.mono {
+  font-family: var(--font-mono);
+}
+
 textarea.ui-input {
   line-height: 1.45;
   resize: vertical;
