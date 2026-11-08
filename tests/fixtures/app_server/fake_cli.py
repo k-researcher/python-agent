@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 import socket
 import sys
 import tomllib
@@ -23,6 +24,8 @@ def record(value):
 
 record({"argv": args, "env": dict(os.environ), "pid": os.getpid(), "cwd": str(Path.cwd())})
 if args == ["--version"]:
+    if scenario.get("block_version"):
+        signal.pause()
     print("codex-cli " + scenario.get("version", "0.164.0"))
     sys.exit(0)
 
