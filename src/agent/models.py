@@ -183,6 +183,8 @@ class McpServer(Base):
     header_secrets: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
     # The protocol era over HTTP: "auto", "modern" or "legacy".
     http_protocol: Mapped[str] = mapped_column(String(10), default="auto")
+    # How long one tool call may wait for the server, in seconds.
+    call_timeout: Mapped[int] = mapped_column(Integer, default=120)
     # Empty: every project without a workspace.
     project_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     allowed_modes: Mapped[list[str]] = mapped_column(JSON, default=lambda: ["dev"])

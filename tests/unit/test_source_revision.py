@@ -260,3 +260,11 @@ def test_the_address_and_the_header_names_change_the_revision() -> None:
     )
     revisions = {source_revision(item) for item in (base, other_url, with_header)}
     assert len(revisions) == 3
+
+
+def test_the_wait_for_a_tool_keeps_the_revision() -> None:
+    # A longer wait gives the source no new reach, so its approvals stay valid.
+    base = _source()
+    assert source_revision(base.model_copy(update={"call_timeout_seconds": 300})) == (
+        source_revision(base)
+    )

@@ -16,6 +16,7 @@ const server = (id: string, extra: Partial<McpServerItem> = {}): McpServerItem =
   allow_network: true,
   read_paths: ["/opt/homebrew"],
   enabled: true,
+  call_timeout: 120,
   last_check: null,
   updated_at: null,
   ...extra,
@@ -208,7 +209,7 @@ test("an HTTP server can be added without command fields and shows its checked p
   expect(sent).toHaveLength(1);
   expect(JSON.parse(sent[0].split(" ").slice(2).join(" "))).toEqual({
     id: "remote", url: address, headers: { Authorization: "Bearer hidden-value" },
-    http_protocol: "legacy", project_ids: [], allowed_modes: ["dev"],
+    http_protocol: "legacy", project_ids: [], allowed_modes: ["dev"], call_timeout: 120,
   });
   await expect(page.locator("body")).not.toContainText("hidden-value");
 
@@ -242,7 +243,7 @@ test("HTTP editing preserves hidden headers and a failed save stays open", async
   await expect(page.getByTestId("mcp-form-error")).toContainText("Адрес недоступен");
   await expect(page.getByRole("dialog")).toBeVisible();
   expect((await request).postDataJSON()).toEqual({ url: "https://example.com/mcp", headers: { "X-Drop": null },
-    http_protocol: "modern", project_ids: [], allowed_modes: ["dev"] });
+    http_protocol: "modern", project_ids: [], allowed_modes: ["dev"], call_timeout: 120 });
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog")).toHaveCount(0);
   expect(sent).toEqual([]);

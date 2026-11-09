@@ -35,7 +35,6 @@ from agent.mcp_servers import (
     check_server,
     check_server_id,
     check_url,
-    suggested_read_paths,
 )
 from agent.model_overrides import SecretKeyError, encrypt_secret
 from agent.models import McpServer, Project
@@ -47,6 +46,8 @@ Configuration = Annotated[Settings, Depends(get_settings)]
 Mode = Literal["dev", "ask"]
 Protocol = Literal["auto", "modern", "legacy"]
 _MAX_PROJECTS = 200
+MIN_CALL_SECONDS = 5
+MAX_CALL_SECONDS = 600
 # One check of a server at a time: two checks would share its sandbox directory.
 _checking: set[str] = set()
 
@@ -73,9 +74,11 @@ class ServerCreate(_Body):
     project_ids: list[str] = Field(default_factory=list, max_length=_MAX_PROJECTS)
     allowed_modes: list[Mode] = Field(default_factory=_dev_only, min_length=1, max_length=2)
     allow_network: bool = False
-    # None: the install directory of the program, when the sandbox may open it.
-    read_paths: list[str] | None = Field(default=None, max_length=MAX_READ_PATHS)
+    # Extra folders only: the agent finds the folders of the program and its runtime itself.
+    read_paths: list[str] = Field(default_factory=list, max_length=MAX_READ_PATHS)
     enabled: bool = True
+    # How long one tool call may wait for the server, in seconds.
+    call_timeout: int = Field(default=120, ge=MIN_CALL_SECONDS, le=MAX_CALL_SECONDS)
 
 
 class ServerUpdate(_Body):
@@ -91,6 +94,7 @@ class ServerUpdate(_Body):
     allow_network: bool | None = None
     read_paths: list[str] | None = Field(default=None, max_length=MAX_READ_PATHS)
     enabled: bool | None = None
+    call_timeout: int | None = Field(default=None, ge=MIN_CALL_SECONDS, le=MAX_CALL_SECONDS)
 
 
 def _refuse(error: McpServerError | SecretKeyError) -> HTTPException:
@@ -119,6 +123,7 @@ def _view(server: McpServer) -> dict[str, Any]:
         "allow_network": server.allow_network,
         "read_paths": list(server.read_paths),
         "enabled": server.enabled,
+        "call_timeout": server.call_timeout,
         "last_check": server.last_check,
         "updated_at": server.updated_at.isoformat() if server.updated_at else None,
     }
@@ -231,11 +236,7 @@ async def create_server(
                 "command": command,
                 "env_secrets": _secrets(payload.env, settings),
                 "allow_network": payload.allow_network,
-                "read_paths": (
-                    suggested_read_paths(command, settings)
-                    if payload.read_paths is None
-                    else check_read_paths(payload.read_paths, settings)
-                ),
+                "read_paths": check_read_paths(payload.read_paths, settings),
             }
     except (McpServerError, SecretKeyError) as error:
         raise _refuse(error) from None
@@ -247,6 +248,7 @@ async def create_server(
             project_ids=await _project_ids(db, payload.project_ids),
             allowed_modes=list(dict.fromkeys(payload.allowed_modes)),
             enabled=payload.enabled,
+            call_timeout=payload.call_timeout,
             **launch,
         )
     )
@@ -299,6 +301,9 @@ async def update_server(
         server.allowed_modes = list(dict.fromkeys(payload.allowed_modes))
     if payload.allow_network is not None:
         server.allow_network = payload.allow_network
+    if payload.call_timeout is not None:
+        # The check lists the tools and does not call them, so its result stays.
+        server.call_timeout = payload.call_timeout
     launch_changed = _launch(server) != before
     if payload.enabled is not None:
         server.enabled = payload.enabled

@@ -7,6 +7,7 @@ import { ChevronDown, CircleAlert, Pencil, Plus, Trash2, TriangleAlert, X } from
 import { api } from "../api/client";
 import type { Project } from "../api/types";
 import {
+  MCP_CALL_SECONDS,
   MCP_ENV_KEY,
   MCP_SERVER_ID,
   joinCommand,
@@ -147,6 +148,7 @@ const editor = reactive({
   env: [] as EnvRow[],
   allowNetwork: false,
   readPaths: "",
+  callTimeout: MCP_CALL_SECONDS.default as number,
   allProjects: true,
   projectIds: [] as string[],
   profiles: ["dev"] as McpProfile[],
@@ -210,6 +212,13 @@ const pathsError = computed(() => {
   return wrong ? `Путь должен быть абсолютным: ${wrong}` : "";
 });
 
+const timeoutError = computed(() => {
+  const value = editor.callTimeout;
+  return Number.isInteger(value) && value >= MCP_CALL_SECONDS.min && value <= MCP_CALL_SECONDS.max
+    ? ""
+    : `Целое число секунд от ${MCP_CALL_SECONDS.min} до ${MCP_CALL_SECONDS.max}`;
+});
+
 const projectsError = computed(() => (!editor.allProjects && !editor.projectIds.length ? "Выберите проекты" : ""));
 const profilesError = computed(() => (editor.profiles.length ? "" : "Выберите хотя бы одну группу ролей"));
 
@@ -221,6 +230,7 @@ const canSave = computed(() => {
     (editor.transport === "http" ? !!editor.url && !urlError.value : Array.isArray(parts) && parts.length > 0) &&
     !envError.value &&
     (editor.transport === "http" || !pathsError.value) &&
+    !timeoutError.value &&
     !projectsError.value &&
     !profilesError.value
   );
@@ -238,6 +248,7 @@ function openCreate(): void {
     env: [],
     allowNetwork: false,
     readPaths: "",
+    callTimeout: MCP_CALL_SECONDS.default,
     allProjects: true,
     projectIds: [],
     profiles: ["dev"],
@@ -260,6 +271,7 @@ function openEdit(item: McpServerItem): void {
     env: (item.url ? item.header_keys : item.env_keys).map((key) => ({ key, value: "", saved: true, removed: false })),
     allowNetwork: item.allow_network,
     readPaths: item.read_paths.join("\n"),
+    callTimeout: item.call_timeout,
     allProjects: !item.project_ids.length,
     projectIds: [...item.project_ids],
     profiles: [...item.allowed_modes],
@@ -308,6 +320,7 @@ function draft(): McpDraft {
     }),
     project_ids: editor.allProjects ? [] : editor.projectIds,
     allowed_modes: editor.profiles,
+    call_timeout: editor.callTimeout,
   };
 }
 
@@ -646,11 +659,29 @@ onMounted(load);
             rows="2"
             :aria-invalid="!!pathsError"
             spellcheck="false"
-            :placeholder="editor.mode === 'create' ? 'Пусто — папка программы определится сама' : '/opt/homebrew'"
+            :placeholder="'Обычно не нужно'"
             data-testid="mcp-paths"
           />
           <small class="ui-field__help" :class="{ 'ui-field__help--error': pathsError }">
-            {{ pathsError || "По одной на строку. Программа сервера и её среда должны быть в этих папках." }}
+            {{ pathsError || "Только дополнительные папки, по одной на строку. Папку программы и её Python или Node агент находит сам." }}
+          </small>
+        </label>
+
+        <label class="ui-field">
+          <span class="ui-field__label">Ожидание ответа инструмента, секунд</span>
+          <input
+            v-model.number="editor.callTimeout"
+            class="ui-input timeout"
+            type="number"
+            inputmode="numeric"
+            :min="MCP_CALL_SECONDS.min"
+            :max="MCP_CALL_SECONDS.max"
+            :aria-invalid="!!timeoutError"
+            aria-describedby="mcp-timeout-help"
+            data-testid="mcp-timeout"
+          />
+          <small id="mcp-timeout-help" class="ui-field__help" :class="{ 'ui-field__help--error': timeoutError }">
+            {{ timeoutError || "Поиск в интернете или разбор большого файла может идти дольше минуты. Если сервер не ответил, агент отменяет запрос." }}
           </small>
         </label>
 
@@ -807,6 +838,11 @@ onMounted(load);
 
 .file-sources {
   margin-top: 16px;
+}
+
+/* Seconds are three digits at most: a short field. */
+.timeout {
+  max-width: 120px;
 }
 
 .group {

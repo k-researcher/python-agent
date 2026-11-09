@@ -343,3 +343,11 @@ def test_swift_package_tests_run_in_the_sandbox(layout: tuple[Path, Path, Path])
     }
     result = asyncio.run(ShellTool().execute(_context(project, temp_root), arguments))
     assert result["exit_code"] == 0, result["stderr"]
+
+
+def test_time_zone_links_through_var_can_be_followed() -> None:
+    # /etc/localtime and /usr/share/zoneinfo lead through the /var link.
+    text = profile(Path("/p"), Path("/t"), [])
+    assert '(subpath "/var/db/timezone")' in text
+    assert '(subpath "/private/var/db/timezone")' in text
+    assert '(literal "/var")' in text

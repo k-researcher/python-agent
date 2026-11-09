@@ -24,6 +24,7 @@ const server = (id: string, extra: Partial<McpServerItem> = {}): McpServerItem =
   allow_network: false,
   read_paths: ["/opt/tools"],
   enabled: true,
+  call_timeout: 120,
   last_check: null,
   updated_at: null,
   ...extra,
@@ -134,6 +135,7 @@ it("a new server is sent with its secret, projects and roles", async () => {
     env: { DOCS_TOKEN: "secret-value" },
     project_ids: ["p1"],
     allowed_modes: ["dev", "ask"],
+    call_timeout: 120,
     allow_network: true,
     read_paths: null,
   });
@@ -210,6 +212,7 @@ it("editing keeps an untouched secret, replaces a typed one and removes a droppe
     env: { DROP: null, SWAP: "new-value" },
     project_ids: ["p1"],
     allowed_modes: ["dev"],
+    call_timeout: 120,
     allow_network: false,
     read_paths: ["/opt/tools", "/opt/more"],
   });
@@ -354,7 +357,7 @@ it("a new HTTP server sends only address fields and the selected protocol", asyn
   await flushPromises();
   expect(mcpApi.create).toHaveBeenCalledWith("remote", {
     url: "https://example.com/mcp", headers: { Authorization: "Bearer secret" },
-    http_protocol: "modern", project_ids: [], allowed_modes: ["dev"],
+    http_protocol: "modern", project_ids: [], allowed_modes: ["dev"], call_timeout: 120,
   });
   expect(wrapper.text()).not.toContain("Bearer secret");
 });
@@ -374,7 +377,7 @@ it("editing HTTP keeps untouched headers, replaces and removes secrets and keeps
   await flushPromises();
   expect(mcpApi.update).toHaveBeenCalledWith("remote", {
     url: "https://other.example.com/mcp", headers: { DROP: null, SWAP: "replacement" },
-    http_protocol: "legacy", project_ids: [], allowed_modes: ["dev"],
+    http_protocol: "legacy", project_ids: [], allowed_modes: ["dev"], call_timeout: 120,
   });
 });
 
@@ -395,4 +398,21 @@ it("an invalid URL and duplicate header names block HTTP saving", async () => {
   expect(wrapper.text()).toContain("Имена заголовков повторяются");
   await wrapper.find('[data-testid="mcp-form"]').trigger("submit");
   expect(mcpApi.update).not.toHaveBeenCalled();
+});
+
+it("the wait for a tool is kept, limited and sent with the server", async () => {
+  const wrapper = await mountView(listOf([server("docs", { call_timeout: 300 })]));
+  await wrapper.find('[data-testid="mcp-edit"]').trigger("click");
+  const field = wrapper.find('[data-testid="mcp-timeout"]');
+  expect((field.element as HTMLInputElement).value).toBe("300");
+  for (const value of ["4", "601", "2.5", ""]) {
+    await field.setValue(value);
+    expect(save(wrapper).attributes("disabled")).toBeDefined();
+    expect(wrapper.find("#mcp-timeout-help").classes()).toContain("ui-field__help--error");
+  }
+  await field.setValue("90");
+  expect(save(wrapper).attributes("disabled")).toBeUndefined();
+  await wrapper.find('[data-testid="mcp-form"]').trigger("submit");
+  await flushPromises();
+  expect(vi.mocked(mcpApi.update).mock.calls[0][1].call_timeout).toBe(90);
 });

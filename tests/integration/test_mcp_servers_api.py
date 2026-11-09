@@ -488,3 +488,37 @@ def test_http_server_serves_sessions_with_its_headers(client: TestClient, tmp_pa
             return source.url, source.http_protocol, headers, allowed
 
     assert run(client, check) == (URL, "modern", {"X-Key": SECRET}, True)
+
+
+def test_call_timeout_is_kept_within_limits(client: TestClient) -> None:
+    created = create(client)
+    assert by_id(created.json())["docs"]["call_timeout"] == 120
+    for value in (4, 601, "long"):
+        assert create(client, id="bad", call_timeout=value).status_code == 422
+    assert client.put("/api/mcp/servers/docs", json={"call_timeout": 0}).status_code == 422
+
+    async def mark() -> None:
+        async with session_factory() as db:
+            row = await db.get(McpServer, "docs")
+            assert row is not None
+            row.last_check = {"ok": True, "tools": []}
+            await db.commit()
+
+    run(client, mark)
+    response = client.put("/api/mcp/servers/docs", json={"call_timeout": 300})
+    assert response.status_code == 200, response.text
+    view = by_id(response.json())["docs"]
+    # The check lists the tools and does not call them, so a new wait keeps its result.
+    assert view["call_timeout"] == 300
+    assert view["last_check"] == {"ok": True, "tools": []}
+    row = run(client, lambda: stored("docs"))
+    assert row is not None and to_source(row).call_timeout_seconds == 300
+    http = create_http(client, call_timeout=60)
+    assert by_id(http.json())["remote"]["call_timeout"] == 60
+
+
+def test_a_new_server_stores_no_folders_the_agent_finds_itself(client: TestClient) -> None:
+    # The program folders are found at each start, so the settings keep only extra folders.
+    response = create(client)
+    assert response.status_code == 201, response.text
+    assert by_id(response.json())["docs"]["read_paths"] == []

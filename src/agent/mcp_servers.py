@@ -157,31 +157,64 @@ def check_read_paths(values: Iterable[str], settings: Settings) -> list[str]:
     return paths
 
 
-def install_prefix(program: str, path: str | None = None) -> str | None:
-    """Return the install directory of a program, such as /opt/homebrew for npx.
-
-    The sandbox opens this directory for reading, so the program and its runtime can load.
-    A directory that is too wide (the file system root or the home directory) is refused.
-    """
-    found = program if "/" in program else shutil.which(program, path=path)
-    if found is None or not Path(found).is_absolute():
-        return None
-    prefix = Path(os.path.abspath(found)).parent.parent
+def _prefix(program: Path) -> str | None:
+    """Return the directory above the bin directory of a program, unless it is too wide."""
+    prefix = program.parent.parent
     home = Path.home()
     if prefix == Path(prefix.anchor) or prefix == home or prefix in home.parents:
         return None
     return str(prefix)
 
 
-def suggested_read_paths(command: Sequence[str], settings: Settings) -> list[str]:
-    """Return the install directory of the program when the sandbox may open it."""
-    prefix = install_prefix(command[0])
-    if prefix is None:
-        return []
+def _interpreter(script: Path) -> str | None:
+    """Return the program named on the first line of a script, such as its Python."""
     try:
-        return [check_read_path(prefix, settings)]
-    except McpServerError:
+        with script.open("rb") as handle:
+            line = handle.readline(512)
+    except OSError:
+        return None
+    if not line.startswith(b"#!"):
+        return None
+    parts = line[2:].decode(errors="replace").split()
+    if parts and Path(parts[0]).name == "env":
+        parts = [part for part in parts[1:] if not part.startswith("-")]
+        return shutil.which(parts[0]) if parts else None
+    return parts[0] if parts and Path(parts[0]).is_absolute() else None
+
+
+def runtime_read_paths(command: Sequence[str], settings: Settings) -> list[str]:
+    """Return the install directories that a server program needs to start.
+
+    A virtual environment links its Python to an interpreter elsewhere, such as a uv or
+    pyenv install, and a script names its interpreter on the first line. The sandbox opens
+    the real install directory of the program and of that interpreter for reading, so the
+    settings do not need these folders and an interpreter update does not break the server.
+    For a program in a virtual environment it opens the project folder that holds the
+    environment, because a project installed in development mode imports its code from there.
+    """
+    found = command[0] if "/" in command[0] else shutil.which(command[0])
+    if found is None or not Path(found).is_absolute():
         return []
+    # Both the path as written and the real path count: npx of Homebrew is a link from
+    # /opt/homebrew/bin into lib/node_modules, and it needs the whole install.
+    programs = [Path(os.path.abspath(found)), Path(found).resolve()]
+    interpreter = _interpreter(programs[1])
+    if interpreter is not None:
+        programs += [Path(os.path.abspath(interpreter)), Path(interpreter).resolve()]
+    paths: list[str] = []
+    for program in programs:
+        prefix = _prefix(program)
+        if prefix is not None and (Path(prefix) / "pyvenv.cfg").is_file():
+            # A project installed into its own environment keeps its code next to it.
+            # When that folder is too wide, the environment alone is opened.
+            prefix = _prefix(Path(prefix) / "bin") or prefix
+        if prefix is None or prefix in paths:
+            continue
+        try:
+            paths.append(check_read_path(prefix, settings))
+        except McpServerError:
+            continue
+    return paths
 
 
 def to_source(server: McpServer) -> ToolSource:
@@ -206,6 +239,7 @@ def to_source(server: McpServer) -> ToolSource:
         enabled=server.enabled,
         risk_level=RiskLevel(server.risk_level),
         allowed_modes=frozenset(server.allowed_modes),  # type: ignore[arg-type]
+        call_timeout_seconds=server.call_timeout,
         **launch,
     )
 
@@ -241,6 +275,7 @@ def open_client(
             source.url,
             headers=secrets,
             request_timeout=request_timeout,
+            call_timeout=source.call_timeout_seconds,
             protocol=source.http_protocol,
         )
     return StdioMcpClient(
@@ -250,6 +285,7 @@ def open_client(
         sandbox=sandbox_policy(settings, source),
         session_id=session_id,
         request_timeout=request_timeout,
+        call_timeout=source.call_timeout_seconds,
         stderr_tail_bytes=stderr_tail_bytes,
     )
 
@@ -262,11 +298,12 @@ def file_environment(source: ToolSource) -> dict[str, str]:
 def sandbox_policy(settings: Settings, source: ToolSource) -> SandboxPolicy:
     """Return the required sandbox of a server: its network choice and its read paths."""
     base = policy_from_settings(settings)
+    found = runtime_read_paths(source.command, settings) if source.command else []
     return replace(
         base,
         mode="required",
         allow_network=base.allow_network or source.allow_network,
-        extra_read_paths=(*base.extra_read_paths, *source.read_paths),
+        extra_read_paths=tuple(dict.fromkeys((*base.extra_read_paths, *source.read_paths, *found))),
     )
 
 

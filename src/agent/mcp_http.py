@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from agent.mcp_client import CLIENT_INFO, MAX_MESSAGE_BYTES, McpClient, McpError
+from agent.mcp_client import CALL_TIMEOUT, CLIENT_INFO, MAX_MESSAGE_BYTES, McpClient, McpError
 
 MAX_URL_CHARS = 2048
 # Versions with the initialize handshake and this transport; an older server uses
@@ -36,6 +36,7 @@ HttpProtocol = Literal["auto", "modern", "legacy"]
 _MODERN_ERRORS = frozenset({-32020, -32021, -32022})
 # Failures without an answer of the server: they say nothing about its era.
 _NO_ANSWER = frozenset({"timed out", "could not connect", "connection failed"})
+_CANCEL_SECONDS = 5.0
 # The client sets these headers itself.
 RESERVED_HEADERS = frozenset(
     {
@@ -112,6 +113,7 @@ class HttpMcpClient(McpClient):
         *,
         headers: dict[str, str] | None = None,
         request_timeout: float = 30.0,
+        call_timeout: float = CALL_TIMEOUT,
         transport: httpx.AsyncBaseTransport | None = None,
         protocol: HttpProtocol = "auto",
     ) -> None:
@@ -122,7 +124,7 @@ class HttpMcpClient(McpClient):
         """
         if url_refusal(url) is not None:
             raise ValueError("MCP address is not allowed")
-        super().__init__()
+        super().__init__(call_timeout=call_timeout)
         self._url = url
         self._headers = dict(headers or {})
         self._request_timeout = request_timeout
@@ -145,7 +147,8 @@ class HttpMcpClient(McpClient):
             return
         self._client = httpx.AsyncClient(
             transport=self._transport,
-            timeout=self._request_timeout,
+            # Only the connection has its own limit; each request has its whole wait below.
+            timeout=httpx.Timeout(None, connect=self._request_timeout),
             follow_redirects=False,
             trust_env=False,
         )
@@ -234,9 +237,11 @@ class HttpMcpClient(McpClient):
                 headers["Mcp-Name"] = header_value(name)
         return headers
 
-    async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def _request(
+        self, method: str, params: dict[str, Any], *, timeout: float | None = None
+    ) -> dict[str, Any]:
         try:
-            return await self._request_once(method, params)
+            return await self._request_once(method, params, timeout)
         except McpError as error:
             if error.status != 404 or method == "initialize" or self._session_id is None:
                 raise
@@ -245,9 +250,11 @@ class HttpMcpClient(McpClient):
         self._session_id = None
         self._protocol = None
         await self._initialize()
-        return await self._request_once(method, params)
+        return await self._request_once(method, params, timeout)
 
-    async def _request_once(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def _request_once(
+        self, method: str, params: dict[str, Any], timeout: float | None = None
+    ) -> dict[str, Any]:
         if self._client is None:
             raise McpError(None, "client is not started", kind="transport_error")
         call_id = self._next_id
@@ -256,9 +263,10 @@ class HttpMcpClient(McpClient):
             params = {**params, "_meta": {**params.get("_meta", {}), **_request_meta()}}
         message = {"jsonrpc": "2.0", "id": call_id, "method": method, "params": params}
         try:
-            async with asyncio.timeout(self._request_timeout):
+            async with asyncio.timeout(timeout or self._request_timeout):
                 result = await self._send(message, call_id)
         except TimeoutError:
+            await self._cancel_remote(method, call_id)
             raise McpError(None, "timed out", kind="timeout") from None
         assert result is not None
         result_type = result.get("resultType", "complete")
@@ -273,6 +281,23 @@ class HttpMcpClient(McpClient):
                 raise McpError(None, f"unsupported protocol version: {str(version)[:40]}")
             self._protocol = str(version)
         return result
+
+    async def _cancel_remote(self, method: str, call_id: int) -> None:
+        """Tell a legacy server that the result of a timed out request is no longer wanted.
+
+        A modern server takes the closed response stream as the cancellation. A legacy
+        server does not, so it gets the notification. The handshake is never cancelled.
+        """
+        if self._modern or method == "initialize":
+            return
+        message = {
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": call_id, "reason": "timed out"},
+        }
+        with contextlib.suppress(McpError, httpx.HTTPError, TimeoutError):
+            async with asyncio.timeout(_CANCEL_SECONDS):
+                await self._send(message, None)
 
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
         if self._client is None:

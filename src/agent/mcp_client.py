@@ -26,6 +26,8 @@ MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 _MAX_LINE_BYTES = MAX_MESSAGE_BYTES
 _MAX_LIST_PAGES = 50
 PROTOCOL_VERSION = "2025-06-18"
+# A tool may search the web or read a large file: its call waits longer than other requests.
+CALL_TIMEOUT = 120.0
 CLIENT_INFO = {"name": "python-agent", "version": "0.1"}
 McpFailureKind = Literal["timeout", "transport_error", "protocol_error"]
 
@@ -64,9 +66,10 @@ class McpClient(ABC):
     A transport sends the requests and the notifications and owns the connection.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, call_timeout: float = CALL_TIMEOUT) -> None:
         self.server_info: dict[str, Any] = {}
         self.capabilities: dict[str, Any] = {}
+        self._call_timeout = call_timeout
 
     @property
     def protocol_version(self) -> str | None:
@@ -82,8 +85,10 @@ class McpClient(ABC):
         """Close the connection and release its resources."""
 
     @abstractmethod
-    async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Send a request and return its result."""
+    async def _request(
+        self, method: str, params: dict[str, Any], *, timeout: float | None = None
+    ) -> dict[str, Any]:
+        """Send a request and return its result; ``timeout`` replaces the usual wait."""
 
     @abstractmethod
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
@@ -146,7 +151,7 @@ class McpClient(ABC):
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Invoke a remote tool and return its structured result."""
         params: dict[str, Any] = {"name": name, "arguments": arguments}
-        result = await self._request("tools/call", params)
+        result = await self._request("tools/call", params, timeout=self._call_timeout)
         return dict(result)
 
 
@@ -160,6 +165,7 @@ class StdioMcpClient(McpClient):
         cwd: Path,
         env: dict[str, str] | None = None,
         request_timeout: float = 30.0,
+        call_timeout: float = CALL_TIMEOUT,
         sandbox: SandboxPolicy | None = None,
         session_id: str | None = None,
         stderr_tail_bytes: int = 0,
@@ -175,7 +181,7 @@ class StdioMcpClient(McpClient):
         """
         if not command:
             raise ValueError("command must not be empty")
-        super().__init__()
+        super().__init__(call_timeout=call_timeout)
         if sandbox is not None:
             if sandbox.mode != "required":
                 raise ValueError("sandbox mode must be 'required'")
@@ -324,6 +330,8 @@ class StdioMcpClient(McpClient):
         self,
         method: str,
         params: dict[str, Any],
+        *,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         """Send a request and wait for its response."""
         call_id = self._next_id
@@ -354,17 +362,39 @@ class StdioMcpClient(McpClient):
             raise
 
         try:
-            result = await asyncio.wait_for(future, timeout=self._request_timeout)
+            result = await asyncio.wait_for(future, timeout=timeout or self._request_timeout)
         except TimeoutError:
             self._pending.pop(call_id, None)
+            self._cancel_remote(method, call_id, "timed out")
             raise McpError(None, "timed out", kind="timeout") from None
         except asyncio.CancelledError:
             # Keep the client usable after an external cancellation.
             self._pending.pop(call_id, None)
+            self._cancel_remote(method, call_id, "cancelled")
             raise
         if not isinstance(result, dict):
             raise McpError(None, f"protocol error: result of {method} is not an object")
         return result
+
+    def _cancel_remote(self, method: str, call_id: int, reason: str) -> None:
+        """Tell the server that the result of a request is no longer wanted.
+
+        Over stdio only this notification stops the work; the handshake is never cancelled.
+        The write does not wait, so it also works while the caller is being cancelled.
+        """
+        stdin = self._process.stdin if self._process is not None else None
+        if method == "initialize" or stdin is None or stdin.is_closing():
+            return
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": call_id, "reason": reason},
+            },
+            separators=(",", ":"),
+        )
+        with contextlib.suppress(OSError):
+            stdin.write((line + "\n").encode())
 
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
         """Send a JSON-RPC notification without waiting for a reply."""

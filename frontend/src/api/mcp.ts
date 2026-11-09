@@ -36,6 +36,8 @@ export interface McpServerItem {
   allow_network: boolean;
   read_paths: string[];
   enabled: boolean;
+  /** How long one tool call may wait for the server, in seconds. */
+  call_timeout: number;
   last_check: McpCheck | null;
   updated_at: string | null;
 }
@@ -61,8 +63,10 @@ export interface McpDraft {
   /** Null on creation: the install directory of the program. */
   read_paths?: string[] | null;
   enabled?: boolean;
+  call_timeout?: number;
 }
 
+export const MCP_CALL_SECONDS = { min: 5, max: 600, default: 120 } as const;
 export const MCP_SERVER_ID = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 export const MCP_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 

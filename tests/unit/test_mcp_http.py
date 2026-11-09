@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from collections.abc import Callable
@@ -415,3 +416,102 @@ def test_refused_addresses(url: str) -> None:
     assert url_refusal(url) is not None
     with pytest.raises(ValueError):
         HttpMcpClient(url)
+
+
+class SlowTools:
+    """A scripted server whose tool call answers after a delay."""
+
+    def __init__(self, server: Server, delay: float) -> None:
+        self.server = server
+        self.delay = delay
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and rpc(request).get("method") == "tools/call":
+            self.server.requests.append(request)
+            await asyncio.sleep(self.delay)
+            return reply(rpc(request), {"resultType": "complete", "content": []})
+        return self.server(request)
+
+
+@pytest.mark.parametrize("modern", [False, True])
+async def test_tool_call_waits_longer_than_other_requests(modern: bool) -> None:
+    server = Server(modern=modern)
+    mcp = HttpMcpClient(
+        URL,
+        transport=httpx.MockTransport(SlowTools(server, 0.5)),
+        request_timeout=0.2,
+        call_timeout=5.0,
+    )
+    async with mcp:
+        result = await mcp.call_tool("search", {})
+    assert result["content"] == []
+
+
+async def test_timed_out_call_is_cancelled_on_a_legacy_server() -> None:
+    server = Server()
+    mcp = HttpMcpClient(URL, transport=httpx.MockTransport(SlowTools(server, 10)), call_timeout=0.2)
+    async with mcp:
+        with pytest.raises(McpError) as error:
+            await mcp.call_tool("search", {})
+    assert error.value.kind == "timeout"
+    posts = server.posts()
+    call = next(message for message in posts if message.get("method") == "tools/call")
+    cancel = [message for message in posts if message.get("method") == "notifications/cancelled"]
+    assert [message["params"] for message in cancel] == [
+        {"requestId": call["id"], "reason": "timed out"}
+    ]
+    sent = next(r for r in server.requests if rpc_method(r) == "notifications/cancelled")
+    assert sent.headers["mcp-session-id"] == SESSION
+
+
+async def test_timed_out_call_on_a_modern_server_only_closes_the_stream() -> None:
+    server = Server(modern=True)
+    mcp = HttpMcpClient(URL, transport=httpx.MockTransport(SlowTools(server, 10)), call_timeout=0.2)
+    async with mcp:
+        with pytest.raises(McpError, match="timed out"):
+            await mcp.call_tool("search", {})
+    assert "notifications/cancelled" not in [message.get("method") for message in server.posts()]
+
+
+def rpc_method(request: httpx.Request) -> str | None:
+    return rpc(request).get("method") if request.method == "POST" else None
+
+
+async def test_a_slow_tool_over_a_real_connection_is_not_cut_by_the_request_limit() -> None:
+    """A real socket: the HTTP library applies its own read limit only there."""
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        while True:
+            head = await reader.readuntil(b"\r\n\r\n")
+            length = next(
+                int(line.split(b":", 1)[1])
+                for line in head.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            )
+            message = json.loads(await reader.readexactly(length))
+            if "id" not in message:
+                writer.write(b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\n\r\n")
+                await writer.drain()
+                continue
+            if message["method"] == "tools/call":
+                await asyncio.sleep(0.6)
+                result: dict[str, Any] = {"content": []}
+            else:
+                result = {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {}}
+            body = json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}).encode()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n"
+                + f"mcp-session-id: {SESSION}\r\ncontent-length: {len(body)}\r\n\r\n".encode()
+                + body
+            )
+            await writer.drain()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        mcp = HttpMcpClient(f"http://127.0.0.1:{port}/mcp", protocol="legacy", request_timeout=0.2)
+        async with mcp:
+            result = await mcp.call_tool("search", {})
+    finally:
+        server.close()
+    assert result == {"content": []}

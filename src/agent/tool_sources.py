@@ -68,6 +68,8 @@ class ToolSource(BaseModel):
     read_paths: tuple[str, ...] = ()
     allowed_modes: frozenset[Literal["dev", "ask"]] = frozenset({"dev"})
     max_result_chars: StrictInt = Field(default=20_000, gt=0, le=1_000_000)
+    # How long one tool call may wait for the server, in seconds.
+    call_timeout_seconds: StrictInt = Field(default=120, ge=5, le=600)
 
     @field_validator("source_id")
     @classmethod

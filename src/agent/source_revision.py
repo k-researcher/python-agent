@@ -82,6 +82,8 @@ def source_revision(source: ToolSource) -> str:
     preserved. The source object is not mutated.
     """
     payload = source.model_dump(mode="json")
+    # The wait for a tool does not change what the source can do or reach.
+    del payload["call_timeout_seconds"]
     # The HTTP fields came later: a source without them keeps its revision and approvals.
     if payload["url"] is None:
         del payload["url"]
