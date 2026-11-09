@@ -7,14 +7,24 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
+from agent.mcp_http import RESERVED_HEADERS, url_refusal
 from agent.tools.base import RiskLevel
 
 _MAX_FILE_BYTES = 1 << 20
 _MAX_SOURCES = 100
 _SOURCE_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 _ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_HEADER_NAME = re.compile(r"[A-Za-z0-9-]{1,64}")
 
 
 class ToolSourceError(ValueError):
@@ -30,7 +40,8 @@ def _check_id(value: str) -> str:
 class ToolSource(BaseModel):
     """Describe an operator-controlled source, disabled until explicitly enabled.
 
-    Environment entries are variable names, not secret values. This model does
+    A source is a command that runs over stdio or the address of a server over HTTP.
+    Environment entries and header entries are names, not secret values. This model does
     not execute commands, authenticate callers, or grant tool approvals.
     """
 
@@ -40,8 +51,14 @@ class ToolSource(BaseModel):
     # None: a source of the single-user install, for projects without a workspace.
     workspace_id: str | None
     project_ids: frozenset[str] = frozenset()
-    command: tuple[str, ...]
+    command: tuple[str, ...] = ()
     env_keys: tuple[str, ...] = ()
+    # The MCP endpoint of a server over HTTP, instead of a command.
+    url: str | None = None
+    # Names of the HTTP headers with secret values, such as Authorization.
+    header_keys: tuple[str, ...] = ()
+    # The protocol era of a server over HTTP; "auto" asks the server.
+    http_protocol: Literal["auto", "modern", "legacy"] = "auto"
     enabled: StrictBool = False
     risk_level: RiskLevel = RiskLevel.network_access
     # The server may use the network even when the shell sandbox has no network.
@@ -51,6 +68,8 @@ class ToolSource(BaseModel):
     read_paths: tuple[str, ...] = ()
     allowed_modes: frozenset[Literal["dev", "ask"]] = frozenset({"dev"})
     max_result_chars: StrictInt = Field(default=20_000, gt=0, le=1_000_000)
+    # How long one tool call may wait for the server, in seconds.
+    call_timeout_seconds: StrictInt = Field(default=120, ge=5, le=600)
 
     @field_validator("source_id")
     @classmethod
@@ -74,8 +93,6 @@ class ToolSource(BaseModel):
     @field_validator("command")
     @classmethod
     def _command(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if not value:
-            raise ValueError("Command must not be empty")
         for argument in value:
             _check_id(argument)
         return value
@@ -94,6 +111,33 @@ class ToolSource(BaseModel):
         if any(not _ENV_KEY.fullmatch(key) for key in value):
             raise ValueError("Invalid environment variable name")
         return value
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, value: str | None) -> str | None:
+        if value is not None and url_refusal(value) is not None:
+            raise ValueError("Invalid MCP address")
+        return value
+
+    @field_validator("header_keys")
+    @classmethod
+    def _header_keys(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for key in value:
+            if not _HEADER_NAME.fullmatch(key) or key.lower() in RESERVED_HEADERS:
+                raise ValueError("Invalid header name")
+        return value
+
+    @model_validator(mode="after")
+    def _transport(self) -> ToolSource:
+        if self.url is None:
+            if not self.command:
+                raise ValueError("Command must not be empty")
+            if self.header_keys or self.http_protocol != "auto":
+                raise ValueError("Headers and the protocol belong to a server over HTTP")
+        elif self.command or self.env_keys or self.read_paths or self.allow_network:
+            # The agent itself connects to the address; nothing runs in the sandbox.
+            raise ValueError("A server over HTTP has no command, environment or sandbox")
+        return self
 
 
 def _unique_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -125,6 +169,9 @@ def load_tool_sources(path: Path | None) -> tuple[ToolSource, ...]:
         if not isinstance(entries, list) or len(entries) > _MAX_SOURCES:
             raise ToolSourceError("Invalid tool-source list")
         sources = tuple(ToolSource.model_validate(entry) for entry in entries)
+        if any(source.url is not None for source in sources):
+            # Servers over HTTP and their header secrets are kept by the UI.
+            raise ToolSourceError("Servers over HTTP are added in the UI")
         identities = {(source.workspace_id, source.source_id) for source in sources}
         if len(identities) != len(sources):
             raise ToolSourceError("Duplicate tool source")

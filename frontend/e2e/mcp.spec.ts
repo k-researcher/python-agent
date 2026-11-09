@@ -7,12 +7,16 @@ import { expectNoHorizontalOverflow, openApp } from "./helpers";
 const server = (id: string, extra: Partial<McpServerItem> = {}): McpServerItem => ({
   id,
   command: ["npx", "-y", `@example/${id}-server-with-a-long-package-name`, "--stdio"],
+  url: null,
+  header_keys: [],
+  http_protocol: "auto",
   env_keys: [],
   project_ids: [],
   allowed_modes: ["dev"],
   allow_network: true,
   read_paths: ["/opt/homebrew"],
   enabled: true,
+  call_timeout: 120,
   last_check: null,
   updated_at: null,
   ...extra,
@@ -53,7 +57,10 @@ async function openMcp(page: Page, list: McpList = initial()): Promise<string[]>
     if (request.method() !== "GET") sent.push(`${request.method()} ${new URL(request.url()).pathname} ${request.postData() ?? ""}`);
     if (request.method() === "POST" && new URL(request.url()).pathname === "/api/mcp/servers") {
       const body = JSON.parse(request.postData() ?? "{}");
-      list = { ...list, servers: [...list.servers, server(body.id, { command: body.command, env_keys: Object.keys(body.env) })] };
+      list = { ...list, servers: [...list.servers, server(body.id, {
+        command: body.command ?? [], env_keys: Object.keys(body.env ?? {}), url: body.url ?? null,
+        header_keys: Object.keys(body.headers ?? {}), http_protocol: body.http_protocol ?? "auto",
+      })] };
       return route.fulfill({ status: 201, json: list });
     }
     if (request.method() === "DELETE") {
@@ -75,6 +82,8 @@ test("MCP page fits the screen with long commands and opened details", async ({ 
   await page.locator('[data-server="docs"] [data-testid="mcp-check"]').click();
   await page.locator('[data-server="broken"] [data-testid="mcp-check"]').click();
   await expect(page.getByTestId("mcp-details")).toHaveCount(2);
+  await expect(page.locator('[data-server="docs"] [data-testid="mcp-check"]')).toContainText("Каталог получен");
+  await expect(page.getByTestId("mcp-settings")).toContainText("но не вызывает их и не проверяет доступ к их внешним сервисам");
   await expectNoHorizontalOverflow(page);
   // Every card action stays inside its card.
   for (const id of ["docs", "broken"]) {
@@ -160,4 +169,82 @@ test("delete asks first with the safe choice focused", async ({ page }, info) =>
   await expect(alert).toBeHidden();
   await expect(page.locator("[data-server]")).toHaveCount(1);
   expect(sent).toEqual(["DELETE /api/mcp/servers/docs "]);
+});
+
+test("an HTTP server can be added without command fields and shows its checked protocol", async ({ page }, info) => {
+  await openApp(page, info);
+  const sent = await openMcp(page, { sandbox: false, file_sources: [], servers: [] });
+  await page.getByTestId("mcp-add").click();
+  await page.getByTestId("mcp-id").fill("remote");
+  await page.getByRole("radio", { name: "Адрес", exact: true }).click();
+  await expect(page.getByRole("radio", { name: "Адрес", exact: true })).toHaveAttribute("aria-checked", "true");
+  await expect(page.getByTestId("mcp-no-sandbox")).toHaveCount(0);
+  for (const id of ["mcp-command", "mcp-network", "mcp-paths"]) await expect(page.getByTestId(id)).toHaveCount(0);
+  const address = "https://example.com/mcp/endpoint-with-a-long-path-for-documentation-search";
+  await page.getByTestId("mcp-url").fill(address);
+  const mono = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--font-mono").trim());
+  expect(await page.getByTestId("mcp-url").evaluate(element => getComputedStyle(element).fontFamily)).toBe(mono);
+  await page.getByTestId("mcp-env-add").click();
+  await page.getByTestId("mcp-env-key").fill("Authorization");
+  await expect(page.getByTestId("mcp-save")).toBeDisabled();
+  await page.getByTestId("mcp-env-value").fill("Bearer hidden-value");
+  await expect(page.getByTestId("mcp-env-value")).toHaveAttribute("type", "password");
+  for (const name of ["Авто", "Новая (2026-07-28)", "С рукопожатием"]) {
+    const option = page.getByRole("radio", { name, exact: true });
+    await option.focus();
+    await page.keyboard.press("Space");
+    await expect(option).toHaveAttribute("aria-checked", "true");
+  }
+  const options = page.locator('[aria-label="Протокол HTTP"] button');
+  for (const option of await options.all()) await expect(option).toBeInViewport({ ratio: 1 });
+  const shots = process.env.UI_E2E_SHOTS;
+  if (shots) await page.screenshot({ path: `${shots}/${info.project.name}-mcp-http-editor.png`, animations: "disabled" });
+  await expectNoHorizontalOverflow(page);
+  await page.getByTestId("mcp-save").click();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  const card = page.locator('[data-server="remote"]');
+  await expect(card).toContainText(address);
+  await expect(card.locator(".ui-badge")).toHaveText("HTTP");
+  await expect(card).not.toContainText("без сети");
+  expect(sent).toHaveLength(1);
+  expect(JSON.parse(sent[0].split(" ").slice(2).join(" "))).toEqual({
+    id: "remote", url: address, headers: { Authorization: "Bearer hidden-value" },
+    http_protocol: "legacy", project_ids: [], allowed_modes: ["dev"], call_timeout: 120,
+  });
+  await expect(page.locator("body")).not.toContainText("hidden-value");
+
+  await page.route("**/api/mcp/servers/remote/check", route => route.fulfill({ json: {
+    sandbox: false, file_sources: [], servers: [server("remote", {
+      command: [], url: address, header_keys: ["Authorization"], http_protocol: "legacy",
+      last_check: { ok: true, protocol: "2025-06-18", tool_count: 1, tools: [{ name: "search" }] },
+    })],
+  } }));
+  await card.getByTestId("mcp-check-run").click();
+  await expect(card.getByTestId("mcp-check")).toContainText("2025-06-18");
+  await expect(card.getByTestId("mcp-details")).toContainText("search");
+  await expectNoHorizontalOverflow(page);
+  if (shots) await page.screenshot({ path: `${shots}/${info.project.name}-mcp-http-card.png`, fullPage: true, animations: "disabled" });
+});
+
+test("HTTP editing preserves hidden headers and a failed save stays open", async ({ page }, info) => {
+  await openApp(page, info);
+  const sent = await openMcp(page, { sandbox: false, file_sources: [], servers: [server("remote", {
+    command: [], url: "https://example.com/mcp", header_keys: ["Authorization", "X-Drop"], http_protocol: "modern",
+  })] });
+  await page.locator('[data-server="remote"]').getByTestId("mcp-edit").click();
+  await expect(page.getByTestId("mcp-url")).toBeFocused();
+  await expect(page.getByRole("radio", { name: "Команда", exact: true })).toBeDisabled();
+  await expect(page.getByRole("radio", { name: "Новая (2026-07-28)", exact: true })).toHaveAttribute("aria-checked", "true");
+  for (const input of await page.getByTestId("mcp-env-value").all()) await expect(input).toHaveValue("");
+  await page.getByRole("button", { name: "Убрать заголовок X-Drop", exact: true }).click();
+  await page.route("**/api/mcp/servers/remote", route => route.fulfill({ status: 422, json: { detail: "Адрес недоступен" } }));
+  const request = page.waitForRequest(request => request.method() === "PUT");
+  await page.getByTestId("mcp-save").click();
+  await expect(page.getByTestId("mcp-form-error")).toContainText("Адрес недоступен");
+  await expect(page.getByRole("dialog")).toBeVisible();
+  expect((await request).postDataJSON()).toEqual({ url: "https://example.com/mcp", headers: { "X-Drop": null },
+    http_protocol: "modern", project_ids: [], allowed_modes: ["dev"], call_timeout: 120 });
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(sent).toEqual([]);
 });

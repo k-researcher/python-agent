@@ -67,7 +67,14 @@ def test_profile_denies_by_default_and_closes_risky_operations() -> None:
 
 
 def test_profile_network_is_explicit() -> None:
-    assert "(allow network*)" in profile(Path("/p"), Path("/t"), [], allow_network=True)
+    enabled = profile(Path("/p"), Path("/t"), [], allow_network=True)
+    disabled = profile(Path("/p"), Path("/t"), [], allow_network=False)
+    assert "(allow network*)" in enabled
+    assert '(allow mach-lookup (global-name "com.apple.trustd.agent"))' in enabled
+    assert "com.apple.trustd" not in disabled
+    assert "network" not in disabled
+    assert "securityd" not in enabled
+    assert "Keychains" not in enabled
 
 
 def test_profile_quotes_paths_and_refuses_control_characters() -> None:
@@ -336,3 +343,11 @@ def test_swift_package_tests_run_in_the_sandbox(layout: tuple[Path, Path, Path])
     }
     result = asyncio.run(ShellTool().execute(_context(project, temp_root), arguments))
     assert result["exit_code"] == 0, result["stderr"]
+
+
+def test_time_zone_links_through_var_can_be_followed() -> None:
+    # /etc/localtime and /usr/share/zoneinfo lead through the /var link.
+    text = profile(Path("/p"), Path("/t"), [])
+    assert '(subpath "/var/db/timezone")' in text
+    assert '(subpath "/private/var/db/timezone")' in text
+    assert '(literal "/var")' in text

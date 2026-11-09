@@ -161,6 +161,13 @@ def test_configure_json_logging_single_handler() -> None:
     assert len(json_handlers) == 1
 
 
+def test_request_addresses_of_the_http_client_stay_out_of_the_log() -> None:
+    """An address may hold a key in its query; the HTTP client logs it at INFO."""
+    configure_json_logging(level="DEBUG")
+    for name in ("httpx", "httpcore"):
+        assert logging.getLogger(name).level == logging.WARNING
+
+
 def test_timed_ok(caplog: pytest.LogCaptureFixture) -> None:
     logger = logging.getLogger("agent.observability")
     with caplog.at_level(logging.INFO, logger=logger.name), timed("op", logger=logger):

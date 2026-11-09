@@ -11,6 +11,7 @@ vi.mock("../api/speech", () => ({
     removeProfile: vi.fn(),
     makePrimary: vi.fn(),
     testProfile: vi.fn(),
+    restartProfile: vi.fn(),
   },
 }));
 
@@ -20,6 +21,7 @@ const profile = (id: string, extra: Partial<SpeechProfile> = {}): SpeechProfile 
   model: "",
   language: "",
   disabled: false,
+  restart: false,
   ...extra,
 });
 
@@ -142,4 +144,52 @@ it("shows a save error in plain words", async () => {
   await wrapper.get('[data-profile="spare"] [data-testid="speech-primary"]').trigger("click");
   await flushPromises();
   expect(wrapper.get('[data-testid="speech-error"]').text()).toBe("Не удалось сохранить: HTTP 500");
+});
+
+it("shows the restart button only when the server has a restart command", async () => {
+  const wrapper = await mountView([profile("main", { restart: true }), profile("spare")]);
+  expect(wrapper.find('[data-profile="main"] [data-testid="speech-restart"]').exists()).toBe(true);
+  expect(wrapper.find('[data-profile="spare"] [data-testid="speech-restart"]').exists()).toBe(false);
+});
+
+it("restarts the server, blocks both buttons meanwhile and shows the check result", async () => {
+  let finish: (value: { ok: boolean; status: number; seconds: number; restarted: boolean }) => void = () => {};
+  vi.mocked(speechSettings.restartProfile).mockReturnValue(new Promise((resolve) => (finish = resolve)));
+  const wrapper = await mountView([profile("main", { restart: true })]);
+  const card = () => wrapper.get('[data-profile="main"]');
+  await card().get('[data-testid="speech-restart"]').trigger("click");
+  expect(speechSettings.restartProfile).toHaveBeenCalledWith("main");
+  expect(card().get('[data-testid="speech-check"]').text()).toBe("Перезапускаю…");
+  expect(card().get('[data-testid="speech-restart"]').attributes("disabled")).toBeDefined();
+  expect(card().get('[data-testid="speech-test"]').attributes("disabled")).toBeDefined();
+  finish({ ok: true, status: 200, seconds: 0.4, restarted: true });
+  await flushPromises();
+  expect(card().get('[data-testid="speech-check"]').text()).toBe("Перезапущен, отвечает за 0,4 с");
+  expect(card().get('[data-testid="speech-restart"]').attributes("disabled")).toBeUndefined();
+});
+
+it("shows why a restart failed", async () => {
+  vi.mocked(speechSettings.restartProfile).mockResolvedValue({
+    ok: false,
+    status: null,
+    seconds: null,
+    restarted: false,
+    message: "Перезапуск не удался — программа из команды не найдена. Проверьте AGENT_SPEECH_RESTART_COMMANDS.",
+  });
+  const wrapper = await mountView([profile("main", { restart: true })]);
+  await wrapper.get('[data-testid="speech-restart"]').trigger("click");
+  await flushPromises();
+  const status = wrapper.get('[data-testid="speech-check"]');
+  expect(status.text()).toBe(
+    "Перезапуск не удался — программа из команды не найдена. Проверьте AGENT_SPEECH_RESTART_COMMANDS.",
+  );
+  expect(status.classes()).toContain("ui-bad");
+});
+
+it("says that the server was restarted but does not pass the check", async () => {
+  vi.mocked(speechSettings.restartProfile).mockResolvedValue({ ok: false, status: 500, seconds: 0.1, restarted: true });
+  const wrapper = await mountView([profile("main", { restart: true })]);
+  await wrapper.get('[data-testid="speech-restart"]').trigger("click");
+  await flushPromises();
+  expect(wrapper.get('[data-testid="speech-check"]').text()).toBe("Перезапущен, но не отвечает: HTTP 500");
 });

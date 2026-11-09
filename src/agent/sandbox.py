@@ -41,7 +41,9 @@ SYSTEM_READ_PATHS = (
     "/usr",
     "/System",
     "/Library/Developer/CommandLineTools",
-    "/private/var/db/timezone",
+    # Time zone data. Programs reach it through the links /etc/localtime and
+    # /usr/share/zoneinfo, which pass the /var link, so the path keeps that form.
+    "/var/db/timezone",
     "/private/var/db/dyld",
     "/private/var/select",  # /bin/sh starts the shell that this link selects
 )
@@ -222,6 +224,8 @@ def profile(
     ]
     if allow_network:
         lines.append("(allow network*)")
+        # Native TLS clients ask this service to verify certificate trust.
+        lines.append('(allow mach-lookup (global-name "com.apple.trustd.agent"))')
     return "\n".join(lines) + "\n"
 
 

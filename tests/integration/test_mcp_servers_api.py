@@ -4,24 +4,29 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from functools import partial
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from agent import api, mcp_api
+from agent import api, mcp_api, mcp_servers
 from agent.config import Settings, get_settings
 from agent.database import session_factory
-from agent.mcp_servers import to_source, ui_sources
+from agent.mcp_http import HttpMcpClient
+from agent.mcp_servers import check_server, server_secrets, to_source, ui_sources
 from agent.model_overrides import decrypt_secret
 from agent.models import McpServer, Project, Session, Workspace
 from agent.source_access import can_use_session_source
 from agent.source_binding import source_scope
 from tests.integration.helpers import authed_client
+from tests.unit.test_mcp_http import Server
 
 SECRET = "value-that-must-stay-hidden"
+URL = "https://mcp.example.com/mcp"
 
 
 @pytest.fixture
@@ -313,3 +318,207 @@ def test_ui_server_never_serves_a_workspace_project(client: TestClient, tmp_path
             return await can_use_session_source(db, session_id, source_scope(to_source(row)))
 
     assert run(client, check) is False
+
+
+def create_http(client: TestClient, **values: Any) -> Any:
+    body = {"id": "remote", "url": URL, **values}
+    return client.post("/api/mcp/servers", json=body)
+
+
+def test_header_values_are_encrypted_and_never_returned(client: TestClient) -> None:
+    response = create_http(client, headers={"Authorization": f"Bearer {SECRET}"})
+    assert response.status_code == 201, response.text
+    assert SECRET not in response.text
+    listed = client.get("/api/mcp/servers")
+    assert SECRET not in listed.text
+    view = by_id(listed.json())["remote"]
+    assert view["url"] == URL
+    assert view["header_keys"] == ["Authorization"]
+    assert view["http_protocol"] == "auto"
+    assert view["command"] == [] and view["read_paths"] == [] and view["env_keys"] == []
+    row = run(client, lambda: stored("remote"))
+    assert row is not None
+    ciphertext = row.header_secrets["Authorization"]
+    assert SECRET not in ciphertext
+    assert decrypt_secret(ciphertext, api.settings) == f"Bearer {SECRET}"
+    assert server_secrets(row, api.settings) == {"Authorization": f"Bearer {SECRET}"}
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"url": "http://mcp.example.com/mcp"},
+        {"url": "https://user:pass@mcp.example.com/mcp"},
+        {"url": "https://169.254.169.254/latest"},
+        {"url": "ftp://mcp.example.com"},
+        {"url": ""},
+        {"headers": {"Mcp-Session-Id": "x"}},
+        {"headers": {"Content-Type": "text/plain"}},
+        {"headers": {"Bad Name": "x"}},
+        {"headers": {"X-Key": "one\r\nX-Other: two"}},
+        {"headers": {"X-Key": "a", "x-key": "b"}},
+        {"http_protocol": "2024"},
+        {"env": {"TOKEN": "x"}},
+        {"read_paths": ["/opt/tools"]},
+        {"allow_network": True},
+        {"command": ["server"]},
+    ],
+)
+def test_invalid_http_definitions_are_refused(client: TestClient, values: dict[str, Any]) -> None:
+    response = create_http(client, **values)
+    assert response.status_code == 422, response.text
+    assert run(client, lambda: stored("remote")) is None
+
+
+def test_a_server_has_a_command_or_an_address(client: TestClient) -> None:
+    neither = client.post("/api/mcp/servers", json={"id": "none"})
+    assert neither.status_code == 422, neither.text
+    assert create(client, headers={"X-Key": "x"}).status_code == 422
+    assert create(client, http_protocol="modern").status_code == 422
+    assert create(client, http_protocol="auto").status_code == 201
+
+
+def test_update_of_http_server_keeps_its_transport(client: TestClient) -> None:
+    create_http(client, headers={"X-Key": "one", "X-Drop": "two"})
+    create(client)
+    for body in ({"command": ["x"]}, {"env": {"A": "b"}}, {"allow_network": True}):
+        response = client.put("/api/mcp/servers/remote", json=body)
+        assert response.status_code == 422, response.text
+    for body in ({"url": URL}, {"headers": {"X-Key": "x"}}, {"http_protocol": "legacy"}):
+        response = client.put("/api/mcp/servers/docs", json=body)
+        assert response.status_code == 422, response.text
+    clash = client.put("/api/mcp/servers/remote", json={"headers": {"x-key": "again"}})
+    assert clash.status_code == 422, clash.text
+    response = client.put(
+        "/api/mcp/servers/remote",
+        json={"headers": {"X-Drop": None, "X-New": "three"}, "http_protocol": "legacy"},
+    )
+    assert response.status_code == 200, response.text
+    view = by_id(response.json())["remote"]
+    assert view["header_keys"] == ["X-Key", "X-New"]
+    assert view["http_protocol"] == "legacy"
+    assert "three" not in response.text
+
+
+def test_a_new_address_or_protocol_drops_the_old_check(client: TestClient) -> None:
+    create_http(client)
+
+    async def mark() -> None:
+        async with session_factory() as db:
+            row = await db.get(McpServer, "remote")
+            assert row is not None
+            row.last_check = {"ok": True, "tools": []}
+            await db.commit()
+
+    for body in (
+        {"url": "https://other.example.com/mcp"},
+        {"http_protocol": "modern"},
+        {"headers": {"X-Key": "x"}},
+    ):
+        run(client, mark)
+        response = client.put("/api/mcp/servers/remote", json=body)
+        assert by_id(response.json())["remote"]["last_check"] is None, body
+    run(client, mark)
+    same = client.put("/api/mcp/servers/remote", json={"http_protocol": "modern"})
+    assert by_id(same.json())["remote"]["last_check"] == {"ok": True, "tools": []}
+
+
+@pytest.mark.parametrize(
+    ("modern", "protocol", "version"),
+    [(False, "auto", "2025-06-18"), (True, "auto", "2026-07-28"), (False, "legacy", "2025-06-18")],
+)
+def test_check_of_http_server_lists_tools_with_the_headers(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    modern: bool,
+    protocol: str,
+    version: str,
+) -> None:
+    create_http(client, headers={"X-Key": SECRET}, http_protocol=protocol)
+    server = Server(modern=modern)
+    monkeypatch.setattr(
+        mcp_servers, "HttpMcpClient", partial(HttpMcpClient, transport=httpx.MockTransport(server))
+    )
+    response = client.post("/api/mcp/servers/remote/check")
+    assert response.status_code == 200, response.text
+    result = by_id(response.json())["remote"]["last_check"]
+    assert result["ok"] is True, result
+    assert result["protocol"] == version
+    assert result["tool_count"] == 1
+    assert "stderr" not in result
+    assert SECRET not in response.text
+    posts = [request for request in server.requests if request.method == "POST"]
+    assert posts and all(request.headers["x-key"] == SECRET for request in posts)
+    # Nothing runs for a server over HTTP, so no sandbox directory appears.
+    assert not (api.settings.data_dir / "mcp-check" / "remote").exists()
+
+
+def test_check_explains_a_refused_key(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    create_http(client, headers={"Authorization": "Bearer wrong"})
+
+    def denied(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401)
+
+    monkeypatch.setattr(
+        mcp_servers, "HttpMcpClient", partial(HttpMcpClient, transport=httpx.MockTransport(denied))
+    )
+
+    async def check() -> dict[str, Any]:
+        row = await stored("remote")
+        assert row is not None
+        return await check_server(api.settings, row)
+
+    result = run(client, check)
+    assert result["ok"] is False
+    assert result["error"] == "Сервер отказал в доступе: проверьте заголовок с ключом"
+    assert URL not in json.dumps(result, ensure_ascii=False)
+
+
+def test_http_server_serves_sessions_with_its_headers(client: TestClient, tmp_path: Path) -> None:
+    root = tmp_path / "a"
+    root.mkdir()
+    project = client.post("/api/projects", json={"name": "a", "root_path": str(root)}).json()["id"]
+    create_http(client, project_ids=[project], headers={"X-Key": SECRET}, http_protocol="modern")
+
+    async def check() -> tuple[str | None, str, dict[str, str], bool]:
+        async with session_factory() as db:
+            source, headers = next(item for item in await ui_sources(db, api.settings))
+            session_id = await _session(project)
+            allowed = await can_use_session_source(db, session_id, source_scope(source))
+            return source.url, source.http_protocol, headers, allowed
+
+    assert run(client, check) == (URL, "modern", {"X-Key": SECRET}, True)
+
+
+def test_call_timeout_is_kept_within_limits(client: TestClient) -> None:
+    created = create(client)
+    assert by_id(created.json())["docs"]["call_timeout"] == 120
+    for value in (4, 601, "long"):
+        assert create(client, id="bad", call_timeout=value).status_code == 422
+    assert client.put("/api/mcp/servers/docs", json={"call_timeout": 0}).status_code == 422
+
+    async def mark() -> None:
+        async with session_factory() as db:
+            row = await db.get(McpServer, "docs")
+            assert row is not None
+            row.last_check = {"ok": True, "tools": []}
+            await db.commit()
+
+    run(client, mark)
+    response = client.put("/api/mcp/servers/docs", json={"call_timeout": 300})
+    assert response.status_code == 200, response.text
+    view = by_id(response.json())["docs"]
+    # The check lists the tools and does not call them, so a new wait keeps its result.
+    assert view["call_timeout"] == 300
+    assert view["last_check"] == {"ok": True, "tools": []}
+    row = run(client, lambda: stored("docs"))
+    assert row is not None and to_source(row).call_timeout_seconds == 300
+    http = create_http(client, call_timeout=60)
+    assert by_id(http.json())["remote"]["call_timeout"] == 60
+
+
+def test_a_new_server_stores_no_folders_the_agent_finds_itself(client: TestClient) -> None:
+    # The program folders are found at each start, so the settings keep only extra folders.
+    response = create(client)
+    assert response.status_code == 201, response.text
+    assert by_id(response.json())["docs"]["read_paths"] == []

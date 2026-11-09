@@ -170,3 +170,35 @@ def test_error_and_traceback_do_not_disclose_input(tmp_path: Path, missing: bool
     assert secret not in str(caught.value)
     assert secret not in "".join(traceback.format_exception(caught.value))
     assert caught.value.__suppress_context__ is True
+
+
+def test_a_source_is_a_command_or_an_address() -> None:
+    from agent.tool_sources import ToolSource
+
+    http = ToolSource(
+        source_id="docs",
+        workspace_id=None,
+        url="https://mcp.example.com/mcp",
+        header_keys=("Authorization",),
+    )
+    assert http.command == ()
+    refused: list[dict[str, object]] = [
+        {},
+        {"command": ["server"], "url": "https://mcp.example.com/mcp"},
+        {"command": ["server"], "header_keys": ["Authorization"]},
+        {"url": "https://mcp.example.com/mcp", "env_keys": ["TOKEN"]},
+        {"url": "https://mcp.example.com/mcp", "allow_network": True},
+        {"url": "https://mcp.example.com/mcp", "read_paths": ["/opt"]},
+        {"url": "http://mcp.example.com/mcp"},
+        {"url": "https://mcp.example.com/mcp", "header_keys": ["Mcp-Session-Id"]},
+        {"url": "https://mcp.example.com/mcp", "header_keys": ["Bad Header"]},
+    ]
+    for values in refused:
+        with pytest.raises(ValidationError):
+            ToolSource(source_id="docs", workspace_id=None, **values)  # type: ignore[arg-type]
+
+
+def test_the_operator_file_keeps_command_sources_only(tmp_path: Path) -> None:
+    http = {"source_id": "docs", "workspace_id": "w", "url": "https://mcp.example.com/mcp"}
+    with pytest.raises(ToolSourceError):
+        load_tool_sources(_config(tmp_path, {"sources": [http]}))

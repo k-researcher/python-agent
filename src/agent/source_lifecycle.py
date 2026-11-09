@@ -13,8 +13,8 @@ from sqlalchemy import select
 
 from agent.config import Settings
 from agent.database import session_factory
-from agent.mcp_client import StdioMcpClient
-from agent.mcp_servers import file_environment, sandbox_policy, ui_sources
+from agent.mcp_client import McpClient
+from agent.mcp_servers import file_environment, open_client, ui_sources
 from agent.models import Project, Session
 from agent.session_fence import CURRENT_FENCE, TERMINAL_STATUSES, FenceLostError, fence_check
 from agent.source_access import can_use_session_source
@@ -51,7 +51,7 @@ async def _may_connect(session_id: str, project_root: Path, source: ToolSource) 
         return allowed
 
 
-async def _close_client(client: StdioMcpClient) -> None:
+async def _close_client(client: McpClient) -> None:
     closing = asyncio.create_task(client.close())
     cancelled = False
     while not closing.done():
@@ -72,7 +72,7 @@ async def _close_client(client: StdioMcpClient) -> None:
 
 
 def _close_on_exit(
-    client: StdioMcpClient,
+    client: McpClient,
 ) -> Callable[
     [type[BaseException] | None, BaseException | None, TracebackType | None],
     Awaitable[bool],
@@ -114,15 +114,11 @@ async def source_registry(
     sources.extend((source, env) for source, env in added if source.source_id not in taken)
     async with AsyncExitStack() as stack:
         try:
-            for source, environment in sources:
+            for source, secrets in sources:
                 if not await _may_connect(session_id, project_root, source):
                     continue
-                client = StdioMcpClient(
-                    list(source.command),
-                    cwd=project_root,
-                    env=environment,
-                    sandbox=sandbox_policy(settings, source),
-                    session_id=session_id,
+                client = open_client(
+                    settings, source, secrets, cwd=project_root, session_id=session_id
                 )
                 stack.push_async_exit(_close_on_exit(client))
                 await client.start()

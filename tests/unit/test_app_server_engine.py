@@ -83,7 +83,7 @@ def done(status="completed"):
 
 @pytest.fixture
 def peer(tmp_path, monkeypatch):
-    """Only the explicitly created fake executable may cross the shared guard."""
+    """Run only the local fake script through the real process guard."""
     scenario_file, log = tmp_path / "scenario.json", tmp_path / "wire.jsonl"
     binary = tmp_path / "engine-cli"
     binary.write_text(
@@ -110,7 +110,8 @@ def peer(tmp_path, monkeypatch):
 
     async def start(command, **kwargs):
         assert Path(command[0]) == binary
-        process = await original(command, **kwargs)
+        # Use the trusted interpreter to avoid variable direct-script startup time.
+        process = await original([str(Path(sys.executable).resolve()), *command], **kwargs)
         processes.append(process)
         return process
 
@@ -224,6 +225,7 @@ async def test_handshake_environment_isolation_and_resume(peer):
         ({"version": "0.164.1"}, "degraded"),
         ({"version": "0.164.0-beta"}, "degraded"),
         ({"version": "bad"}, "degraded"),
+        ({"block_version": True}, "unavailable"),
         ({"auth": {"type": "apiKey"}}, "unavailable"),
         ({"auth": None}, "unavailable"),
         ({"auth": {"type": "newKind"}}, "unavailable"),

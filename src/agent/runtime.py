@@ -1892,9 +1892,12 @@ class AgentSupervisor:
                     tool_call_id=call.id,
                     before_send=before_send,
                 )
+                result = {"success": not output.get("is_error", False), "output": output}
+                if not result["success"]:
+                    result["error"] = "MCP tool reported an error"
             else:
                 output = await tool.execute(context, dict(call.arguments))
-            result = {"success": True, "output": output}
+                result = {"success": True, "output": output}
         except FenceLostError:
             raise
         except BudgetExceeded:

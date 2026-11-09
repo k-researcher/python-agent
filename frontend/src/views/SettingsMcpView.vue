@@ -1,12 +1,13 @@
 <script setup lang="ts">
-// MCP servers: programs that give the agent new tools. Each one runs in the OS sandbox,
-// and every call of its tools waits for the user's approval.
+// MCP servers give the agent new tools. Commands run in the OS sandbox.
+// Every tool call waits for the user's approval.
 
 import { computed, onMounted, reactive, ref } from "vue";
 import { ChevronDown, CircleAlert, Pencil, Plus, Trash2, TriangleAlert, X } from "lucide-vue-next";
 import { api } from "../api/client";
 import type { Project } from "../api/types";
 import {
+  MCP_CALL_SECONDS,
   MCP_ENV_KEY,
   MCP_SERVER_ID,
   joinCommand,
@@ -14,6 +15,7 @@ import {
   splitCommand,
   type McpCheck,
   type McpDraft,
+  type McpHttpProtocol,
   type McpList,
   type McpProfile,
   type McpServerItem,
@@ -31,6 +33,11 @@ const PROFILES: { value: McpProfile; label: string; roles: string }[] = (["dev",
   label: value === "dev" ? "Роли, которые меняют файлы" : "Роли только для чтения",
   roles: SESSION_MODES.filter((mode) => ROLE_PROFILES[mode] === value).map((mode) => MODE_LABELS[mode]).join(", "),
 }));
+const PROTOCOLS: { value: McpHttpProtocol; label: string }[] = [
+  { value: "auto", label: "Авто" },
+  { value: "modern", label: "Новая (2026-07-28)" },
+  { value: "legacy", label: "С рукопожатием" },
+];
 
 const list = ref<McpList | null>(null);
 const projects = ref<Project[]>([]);
@@ -95,7 +102,7 @@ function checkText(check: McpCheck): string {
   if (!check.ok) return check.error || "Сервер не запустился";
   const count = check.tool_count ?? check.tools?.length ?? 0;
   const name = check.server?.name ? ` · ${check.server.name}${check.server.version ? ` ${check.server.version}` : ""}` : "";
-  return `Работает · ${count} ${plural(count, "инструмент", "инструмента", "инструментов")}${name}`;
+  return `Каталог получен · ${count} ${plural(count, "инструмент", "инструмента", "инструментов")}${name}${check.protocol ? ` · ${check.protocol}` : ""}`;
 }
 
 function toggleDetails(id: string): void {
@@ -135,14 +142,19 @@ const editor = reactive({
   mode: "create" as "create" | "edit",
   id: "",
   command: "",
+  transport: "command" as "command" | "http",
+  url: "",
+  protocol: "auto" as McpHttpProtocol,
   env: [] as EnvRow[],
   allowNetwork: false,
   readPaths: "",
+  callTimeout: MCP_CALL_SECONDS.default as number,
   allProjects: true,
   projectIds: [] as string[],
   profiles: ["dev"] as McpProfile[],
   saving: false,
   touched: false,
+  submitted: false,
   error: "",
 });
 
@@ -165,24 +177,46 @@ const commandParts = computed<string[] | string>(() => {
 const commandError = computed(() => {
   const parts = commandParts.value;
   if (typeof parts === "string") return parts;
-  return !parts.length && editor.touched ? "Введите команду запуска" : "";
+  return !parts.length && editor.submitted ? "Введите команду запуска" : "";
+});
+
+const urlError = computed(() => {
+  if (!editor.url) return editor.submitted ? "Введите адрес сервера" : "";
+  try {
+    const url = new URL(editor.url);
+    if (!["https:", "http:"].includes(url.protocol) || !url.hostname) return "Укажите адрес HTTP или HTTPS";
+    if (url.username || url.password) return "Добавьте ключ в заголовки, а не в адрес";
+    if (url.hash || /[\s]/.test(editor.url)) return "Адрес не должен содержать пробелы и #";
+  } catch {
+    return "Укажите полный адрес сервера";
+  }
+  return "";
 });
 
 const envError = computed(() => {
+  const http = editor.transport === "http";
   const names = editor.env.filter((row) => !row.removed).map((row) => row.key.trim());
   for (const name of names) {
-    if (!name) return "Введите имя переменной";
-    if (!MCP_ENV_KEY.test(name)) return `Недопустимое имя переменной: ${name}`;
+    if (!name) return http ? "Введите имя заголовка" : "Введите имя переменной";
+    if (!(http ? /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/ : MCP_ENV_KEY).test(name)) return `Недопустимое имя: ${name}`;
   }
   const fresh = editor.env.filter((row) => !row.removed && !row.saved && !row.value);
-  if (fresh.length) return `Введите значение переменной ${fresh[0].key || ""}`.trim();
-  return new Set(names).size === names.length ? "" : "Имена переменных повторяются";
+  if (fresh.length) return `Введите значение ${http ? "заголовка" : "переменной"} ${fresh[0].key || ""}`.trim();
+  const unique = http ? names.map((name) => name.toLowerCase()) : names;
+  return new Set(unique).size === unique.length ? "" : `Имена ${http ? "заголовков" : "переменных"} повторяются`;
 });
 
 const pathList = computed(() => editor.readPaths.split("\n").map((line) => line.trim()).filter(Boolean));
 const pathsError = computed(() => {
   const wrong = pathList.value.find((path) => !path.startsWith("/"));
   return wrong ? `Путь должен быть абсолютным: ${wrong}` : "";
+});
+
+const timeoutError = computed(() => {
+  const value = editor.callTimeout;
+  return Number.isInteger(value) && value >= MCP_CALL_SECONDS.min && value <= MCP_CALL_SECONDS.max
+    ? ""
+    : `Целое число секунд от ${MCP_CALL_SECONDS.min} до ${MCP_CALL_SECONDS.max}`;
 });
 
 const projectsError = computed(() => (!editor.allProjects && !editor.projectIds.length ? "Выберите проекты" : ""));
@@ -193,10 +227,10 @@ const canSave = computed(() => {
   return (
     !editor.saving &&
     (editor.mode === "edit" || (!!editor.id && !idError.value)) &&
-    Array.isArray(parts) &&
-    parts.length > 0 &&
+    (editor.transport === "http" ? !!editor.url && !urlError.value : Array.isArray(parts) && parts.length > 0) &&
     !envError.value &&
-    !pathsError.value &&
+    (editor.transport === "http" || !pathsError.value) &&
+    !timeoutError.value &&
     !projectsError.value &&
     !profilesError.value
   );
@@ -208,14 +242,19 @@ function openCreate(): void {
     mode: "create",
     id: "",
     command: "",
+    transport: "command",
+    url: "",
+    protocol: "auto",
     env: [],
     allowNetwork: false,
     readPaths: "",
+    callTimeout: MCP_CALL_SECONDS.default,
     allProjects: true,
     projectIds: [],
     profiles: ["dev"],
     saving: false,
     touched: false,
+    submitted: false,
     error: "",
   });
 }
@@ -226,16 +265,27 @@ function openEdit(item: McpServerItem): void {
     mode: "edit",
     id: item.id,
     command: joinCommand(item.command),
-    env: item.env_keys.map((key) => ({ key, value: "", saved: true, removed: false })),
+    transport: item.url ? "http" : "command",
+    url: item.url ?? "",
+    protocol: item.http_protocol,
+    env: (item.url ? item.header_keys : item.env_keys).map((key) => ({ key, value: "", saved: true, removed: false })),
     allowNetwork: item.allow_network,
     readPaths: item.read_paths.join("\n"),
+    callTimeout: item.call_timeout,
     allProjects: !item.project_ids.length,
     projectIds: [...item.project_ids],
     profiles: [...item.allowed_modes],
     saving: false,
     touched: false,
+    submitted: false,
     error: "",
   });
+}
+
+function setTransport(transport: "command" | "http"): void {
+  if (editor.mode === "edit" || editor.transport === transport) return;
+  editor.transport = transport;
+  editor.env = [];
 }
 
 function addEnv(): void {
@@ -258,17 +308,25 @@ function draft(): McpDraft {
     else if (row.value) env[row.key.trim()] = row.value;
   }
   return {
-    command: commandParts.value as string[],
-    env,
+    ...(editor.transport === "http" ? {
+      url: editor.url,
+      headers: env,
+      http_protocol: editor.protocol,
+    } : {
+      command: commandParts.value as string[],
+      env,
+      allow_network: editor.allowNetwork,
+      read_paths: editor.mode === "create" && !pathList.value.length ? null : pathList.value,
+    }),
     project_ids: editor.allProjects ? [] : editor.projectIds,
     allowed_modes: editor.profiles,
-    allow_network: editor.allowNetwork,
-    read_paths: editor.mode === "create" && !pathList.value.length ? null : pathList.value,
+    call_timeout: editor.callTimeout,
   };
 }
 
 async function save(): Promise<void> {
   editor.touched = true;
+  editor.submitted = true;
   if (!canSave.value) return;
   editor.saving = true;
   editor.error = "";
@@ -319,9 +377,10 @@ onMounted(load);
     <SettingsHeader title="MCP" />
 
     <p class="ui-hint">
-      MCP-сервер — программа, которая даёт агенту новые инструменты: поиск по документации, работу с
-      сервисами и другое. Сервер работает в песочнице: видит только папку проекта и указанные папки, а сеть
-      получает, только если её разрешить. Каждый вызов его инструмента агент просит подтвердить.
+      MCP-сервер даёт агенту новые инструменты: поиск по документации, работу с сервисами и другое.
+      Можно запустить программу или подключиться по адресу HTTP. Программа работает в песочнице:
+      видит папку проекта и указанные папки, а сеть получает, только если её разрешить.
+      Каждый вызов инструмента агент просит подтвердить.
     </p>
 
     <p v-if="loadError" class="ui-notice ui-notice--error" role="alert">
@@ -331,10 +390,10 @@ onMounted(load);
     </p>
 
     <template v-if="list">
-      <p v-if="!list.sandbox" class="ui-notice ui-notice--warning" data-testid="mcp-no-sandbox">
+      <p v-if="!list.sandbox && (editor.open ? editor.transport === 'command' : list.servers.some(item => !item.url))" class="ui-notice ui-notice--warning" data-testid="mcp-no-sandbox">
         <TriangleAlert :size="16" aria-hidden="true" />
         <span class="ui-notice__text">
-          Песочница ОС недоступна на этом компьютере, поэтому MCP-серверы не запустятся. Настройки можно сохранить заранее.
+          Песочница ОС недоступна на этом компьютере, поэтому MCP-серверы с командой не запустятся. Настройки можно сохранить заранее.
         </span>
       </p>
       <div aria-live="polite" role="status" class="live">
@@ -364,13 +423,13 @@ onMounted(load);
           </div>
         </div>
         <p class="ui-hint">
-          Выключатель включает сервер для новых запусков агента. «Проверить» запускает сервер и показывает его
-          инструменты.
+          Выключатель включает сервер для новых запусков агента. «Проверить» получает список инструментов,
+          но не вызывает их и не проверяет доступ к их внешним сервисам.
         </p>
 
         <div v-if="!list.servers.length" class="ui-empty" data-testid="mcp-empty">
           <p>MCP-серверов пока нет.</p>
-          <p class="empty__more">Добавьте сервер: укажите команду запуска, например <code>npx -y пакет-сервера</code>.</p>
+          <p class="empty__more">Добавьте сервер: укажите команду запуска или адрес HTTP.</p>
         </div>
 
         <article
@@ -382,14 +441,17 @@ onMounted(load);
         >
           <div class="ui-card__row">
             <div class="ui-card__main">
-              <strong class="ui-card__title">{{ item.id }}</strong>
-              <span class="mono ui-card__meta command">{{ joinCommand(item.command) }}</span>
+              <strong class="ui-card__title">{{ item.id }} <span v-if="item.url" class="ui-badge">HTTP</span></strong>
+              <span class="mono ui-card__meta command">{{ item.url || joinCommand(item.command) }}</span>
               <span class="ui-card__meta">
                 {{ projectNames(item.project_ids) }} · {{ profileText(item.allowed_modes) }}
-                · {{ item.allow_network ? "сеть разрешена" : "без сети" }}
+                <template v-if="!item.url"> · {{ item.allow_network ? "сеть разрешена" : "без сети" }}</template>
               </span>
               <span v-if="item.env_keys.length" class="ui-card__meta">
                 Секреты: <span class="mono">{{ item.env_keys.join(", ") }}</span>
+              </span>
+              <span v-if="item.header_keys?.length" class="ui-card__meta">
+                Заголовки: <span class="mono">{{ item.header_keys.join(", ") }}</span>
               </span>
               <span v-if="checking.has(item.id)" class="ui-card__meta" data-testid="mcp-check">Запускаю сервер…</span>
               <button
@@ -459,7 +521,8 @@ onMounted(load);
             <p v-else-if="item.last_check.ok" class="ui-card__meta">Сервер не сообщил ни одного инструмента.</p>
             <template v-else>
               <p class="ui-card__meta">
-                Проверьте команду в терминале. Если программе не хватает папки, добавьте её в «Папки для чтения».
+                <template v-if="item.url">Проверьте адрес, заголовки доступа и выбранный протокол.</template>
+                <template v-else>Проверьте команду в терминале. Если программе не хватает папки, добавьте её в «Папки для чтения».</template>
               </p>
               <pre v-if="item.last_check.stderr" class="stderr">{{ item.last_check.stderr }}</pre>
             </template>
@@ -497,7 +560,28 @@ onMounted(load);
             {{ idError || "Короткое имя, например docs. По нему названы инструменты сервера." }}
           </small>
         </label>
-        <label class="ui-field">
+        <div class="ui-tabs" role="group" aria-label="Подключение">
+          <button v-for="option in ([{ value: 'command', label: 'Команда' }, { value: 'http', label: 'Адрес' }] as const)"
+            :key="option.value" type="button" role="radio" :aria-checked="editor.transport === option.value"
+            :disabled="editor.mode === 'edit'" @click="setTransport(option.value)">{{ option.label }}</button>
+        </div>
+        <label v-if="editor.transport === 'http'" class="ui-field">
+          <span class="ui-field__label">Адрес сервера</span>
+          <input v-model.trim="editor.url" class="ui-input mono" type="url" autocomplete="off" spellcheck="false"
+            :aria-invalid="!!urlError" aria-describedby="mcp-url-help" placeholder="https://example.com/mcp"
+            :data-autofocus="editor.mode === 'edit' ? '' : undefined" data-testid="mcp-url" />
+          <small id="mcp-url-help" class="ui-field__help" :class="{ 'ui-field__help--error': urlError }">
+            {{ urlError || "HTTPS; HTTP разрешён только на этом компьютере. Ключи добавьте в заголовки." }}
+          </small>
+        </label>
+        <div v-if="editor.transport === 'http'" class="ui-field">
+          <span class="ui-field__label">Протокол</span>
+          <div class="ui-tabs" role="group" aria-label="Протокол HTTP">
+            <button v-for="option in PROTOCOLS" :key="option.value" type="button" role="radio"
+              :aria-checked="editor.protocol === option.value" @click="editor.protocol = option.value">{{ option.label }}</button>
+          </div>
+        </div>
+        <label v-else class="ui-field">
           <span class="ui-field__label">Команда запуска</span>
           <input
             v-model="editor.command"
@@ -516,7 +600,7 @@ onMounted(load);
         </label>
 
         <fieldset class="group">
-          <legend class="ui-field__label">Секреты</legend>
+          <legend class="ui-field__label">{{ editor.transport === 'http' ? 'Заголовки' : 'Секреты' }}</legend>
           <p class="ui-field__help">
             <span>Ключи и токены для сервера. Хранятся зашифрованными и больше не показываются.</span>
           </p>
@@ -525,7 +609,7 @@ onMounted(load);
               v-model="row.key"
               class="ui-input mono"
               :disabled="row.saved"
-              :aria-label="`Имя переменной ${index + 1}`"
+              :aria-label="`Имя ${editor.transport === 'http' ? 'заголовка' : 'переменной'} ${index + 1}`"
               placeholder="ИМЯ"
               autocomplete="off"
               spellcheck="false"
@@ -535,7 +619,7 @@ onMounted(load);
               v-model="row.value"
               class="ui-input"
               type="password"
-              :aria-label="`Значение переменной ${row.key || index + 1}`"
+              :aria-label="`Значение ${editor.transport === 'http' ? 'заголовка' : 'переменной'} ${row.key || index + 1}`"
               :placeholder="row.saved ? 'Сохранено — введите, чтобы заменить' : 'Значение'"
               autocomplete="new-password"
               data-testid="mcp-env-value"
@@ -543,7 +627,7 @@ onMounted(load);
             <button
               type="button"
               class="ui-btn ui-btn--icon ui-btn--danger"
-              :aria-label="`Убрать переменную ${row.key}`"
+              :aria-label="`Убрать ${editor.transport === 'http' ? 'заголовок' : 'переменную'} ${row.key}`"
               title="Убрать"
               @click="removeEnv(row)"
             >
@@ -552,12 +636,12 @@ onMounted(load);
           </div>
           <button type="button" class="ui-btn ui-btn--text add-env" data-testid="mcp-env-add" @click="addEnv">
             <Plus :size="16" aria-hidden="true" />
-            <span>Добавить секрет</span>
+            <span>{{ editor.transport === 'http' ? 'Добавить заголовок' : 'Добавить секрет' }}</span>
           </button>
           <small v-if="envError" class="ui-field__help ui-field__help--error">{{ envError }}</small>
         </fieldset>
 
-        <div class="switch-row">
+        <div v-if="editor.transport === 'command'" class="switch-row">
           <div>
             <span class="ui-field__label">Доступ к сети</span>
             <p class="ui-field__help">
@@ -567,7 +651,7 @@ onMounted(load);
           <ToggleSwitch v-model="editor.allowNetwork" label="Доступ к сети" data-testid="mcp-network" />
         </div>
 
-        <label class="ui-field">
+        <label v-if="editor.transport === 'command'" class="ui-field">
           <span class="ui-field__label">Папки для чтения</span>
           <textarea
             v-model="editor.readPaths"
@@ -575,11 +659,29 @@ onMounted(load);
             rows="2"
             :aria-invalid="!!pathsError"
             spellcheck="false"
-            :placeholder="editor.mode === 'create' ? 'Пусто — папка программы определится сама' : '/opt/homebrew'"
+            :placeholder="'Обычно не нужно'"
             data-testid="mcp-paths"
           />
           <small class="ui-field__help" :class="{ 'ui-field__help--error': pathsError }">
-            {{ pathsError || "По одной на строку. Программа сервера и её среда должны быть в этих папках." }}
+            {{ pathsError || "Только дополнительные папки, по одной на строку. Папку программы и её Python или Node агент находит сам." }}
+          </small>
+        </label>
+
+        <label class="ui-field">
+          <span class="ui-field__label">Ожидание ответа инструмента, секунд</span>
+          <input
+            v-model.number="editor.callTimeout"
+            class="ui-input timeout"
+            type="number"
+            inputmode="numeric"
+            :min="MCP_CALL_SECONDS.min"
+            :max="MCP_CALL_SECONDS.max"
+            :aria-invalid="!!timeoutError"
+            aria-describedby="mcp-timeout-help"
+            data-testid="mcp-timeout"
+          />
+          <small id="mcp-timeout-help" class="ui-field__help" :class="{ 'ui-field__help--error': timeoutError }">
+            {{ timeoutError || "Поиск в интернете или разбор большого файла может идти дольше минуты. Если сервер не ответил, агент отменяет запрос." }}
           </small>
         </label>
 
@@ -736,6 +838,11 @@ onMounted(load);
 
 .file-sources {
   margin-top: 16px;
+}
+
+/* Seconds are three digits at most: a short field. */
+.timeout {
+  max-width: 120px;
 }
 
 .group {

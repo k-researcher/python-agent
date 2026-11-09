@@ -11,11 +11,30 @@ import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
+from agent.mcp_client import McpError
 from agent.session_fence import FenceLostError
 from agent.tools.base import ToolContext, ToolError
 from agent.tools.mcp_tools import McpBackedTool
 
 logger = logging.getLogger(__name__)
+
+_FAILURE_MESSAGES = {
+    "timeout": "MCP request timed out",
+    "transport_error": "MCP transport failed",
+    "protocol_error": "MCP protocol request failed",
+}
+
+
+def _failure_kind(error: Exception) -> str:
+    """Classify a local exception without retaining remote text or arbitrary attributes."""
+    cause = error.__cause__ if isinstance(error, ToolError) else error
+    if isinstance(cause, McpError) and cause.kind in _FAILURE_MESSAGES:
+        return cause.kind
+    if isinstance(cause, TimeoutError):
+        return "timeout"
+    if isinstance(cause, OSError):
+        return "transport_error"
+    return "invocation_error"
 
 
 async def _persist(record: Coroutine[Any, Any, None]) -> bool:
@@ -99,11 +118,12 @@ async def execute_mcp_attempt(
     except FenceLostError:
         await record_failure("error", "fence_lost")
         raise
-    except Exception:
-        cancelled = await record_failure("error", phase)
+    except Exception as exc:
+        outcome = _failure_kind(exc) if phase == "invocation_error" else phase
+        cancelled = await record_failure("error", outcome)
         if cancelled:
             raise asyncio.CancelledError from None
-        raise ToolError("MCP invocation failed") from None
+        raise ToolError(_FAILURE_MESSAGES.get(outcome, "MCP invocation failed")) from None
 
     status = "error" if result.get("is_error") else "completed"
     outcome = "tool_error" if result.get("is_error") else "completed"

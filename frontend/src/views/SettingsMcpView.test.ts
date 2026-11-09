@@ -15,12 +15,16 @@ vi.mock("../api/mcp", async (original) => ({
 const server = (id: string, extra: Partial<McpServerItem> = {}): McpServerItem => ({
   id,
   command: ["npx", "-y", `${id}-server`],
+  url: null,
+  header_keys: [],
+  http_protocol: "auto",
   env_keys: [],
   project_ids: [],
   allowed_modes: ["dev"],
   allow_network: false,
   read_paths: ["/opt/tools"],
   enabled: true,
+  call_timeout: 120,
   last_check: null,
   updated_at: null,
   ...extra,
@@ -131,6 +135,7 @@ it("a new server is sent with its secret, projects and roles", async () => {
     env: { DOCS_TOKEN: "secret-value" },
     project_ids: ["p1"],
     allowed_modes: ["dev", "ask"],
+    call_timeout: 120,
     allow_network: true,
     read_paths: null,
   });
@@ -207,6 +212,7 @@ it("editing keeps an untouched secret, replaces a typed one and removes a droppe
     env: { DROP: null, SWAP: "new-value" },
     project_ids: ["p1"],
     allowed_modes: ["dev"],
+    call_timeout: 120,
     allow_network: false,
     read_paths: ["/opt/tools", "/opt/more"],
   });
@@ -246,7 +252,8 @@ it("a check shows the tools of a working server", async () => {
   await flushPromises();
 
   expect(mcpApi.check).toHaveBeenCalledWith("docs");
-  expect(wrapper.find('[data-testid="mcp-check"]').text()).toBe("Работает · 2 инструмента · docs 1.2");
+  expect(wrapper.find('[data-testid="mcp-check"]').text()).toBe("Каталог получен · 2 инструмента · docs 1.2");
+  expect(wrapper.text()).toContain("но не вызывает их и не проверяет доступ к их внешним сервисам");
   expect(wrapper.find('[data-testid="mcp-details"]').text()).toContain("search");
   // The result line folds the details away.
   await wrapper.find('[data-testid="mcp-check"]').trigger("click");
@@ -289,4 +296,123 @@ it("removal waits for the confirmation", async () => {
   expect(mcpApi.remove).toHaveBeenCalledWith("docs");
   expect(wrapper.find('[data-testid="mcp-empty"]').exists()).toBe(true);
   expect(wrapper.find('[data-testid="mcp-status"]').text()).toBe("Сервер «docs» удалён");
+});
+
+const httpServer = (extra: Partial<McpServerItem> = {}) => server("remote", {
+  command: [], url: "https://example.com/mcp", header_keys: ["Authorization"],
+  read_paths: [], allow_network: false, ...extra,
+});
+
+it("leaving ID does not change the launch help while the transport button is clicked", async () => {
+  const wrapper = await mountView(listOf([]));
+  await wrapper.find('[data-testid="mcp-add"]').trigger("click");
+  const help = wrapper.find("#mcp-command-help").text();
+  await wrapper.find('[data-testid="mcp-id"]').setValue("remote");
+  await wrapper.find('[data-testid="mcp-id"]').trigger("blur");
+  expect(wrapper.find("#mcp-command-help").text()).toBe(help);
+  await wrapper.find('[aria-label="Подключение"] button[aria-checked="false"]').trigger("click");
+  expect(wrapper.find('[data-testid="mcp-url"]').exists()).toBe(true);
+});
+
+it("an HTTP card shows its address, header names and checked protocol without a sandbox warning", async () => {
+  const wrapper = await mountView(listOf([httpServer({ last_check: {
+    ok: true, protocol: "2026-07-28", tool_count: 1,
+  } })], { sandbox: false }));
+  const card = wrapper.find('[data-server="remote"]');
+  expect(card.find('.ui-badge').text()).toBe("HTTP");
+  expect(card.text()).toContain("https://example.com/mcp");
+  expect(card.text()).toContain("Заголовки: Authorization");
+  expect(card.text()).toContain("2026-07-28");
+  expect(card.text()).not.toContain("без сети");
+  expect(wrapper.find('[data-testid="mcp-no-sandbox"]').exists()).toBe(false);
+});
+
+it("a new HTTP server sends only address fields and the selected protocol", async () => {
+  const wrapper = await mountView(listOf([], { sandbox: false }));
+  await wrapper.find('[data-testid="mcp-add"]').trigger("click");
+  await wrapper.find('[data-testid="mcp-id"]').setValue("remote");
+  await wrapper.find('[data-testid="mcp-command"]').setValue("unused");
+  await wrapper.find('[data-testid="mcp-env-add"]').trigger("click");
+  await wrapper.find('[data-testid="mcp-env-key"]').setValue("UNUSED");
+  await wrapper.find('[data-testid="mcp-env-value"]').setValue("unused-secret");
+  await wrapper.find('[aria-label="Подключение"] button[aria-checked="false"]').trigger("click");
+  expect(wrapper.find('[data-testid="mcp-command"]').exists()).toBe(false);
+  expect(wrapper.find('[data-testid="mcp-network"]').exists()).toBe(false);
+  expect(wrapper.find('[data-testid="mcp-paths"]').exists()).toBe(false);
+  expect(wrapper.find('[data-testid="mcp-no-sandbox"]').exists()).toBe(false);
+  expect(wrapper.findAll('[data-testid="mcp-env-row"]')).toHaveLength(0);
+  expect(save(wrapper).attributes("disabled")).toBeDefined();
+  await wrapper.find('[data-testid="mcp-url"]').setValue("https://example.com/mcp");
+  await wrapper.find('[data-testid="mcp-env-add"]').trigger("click");
+  await wrapper.find('[data-testid="mcp-env-key"]').setValue("Authorization");
+  expect(save(wrapper).attributes("disabled")).toBeDefined();
+  await wrapper.find('[data-testid="mcp-env-value"]').setValue("Bearer secret");
+  expect(wrapper.find('[data-testid="mcp-env-value"]').attributes("type")).toBe("password");
+  const protocols = wrapper.findAll('[aria-label="Протокол HTTP"] button');
+  expect(protocols[0].attributes("aria-checked")).toBe("true");
+  await protocols[1].trigger("click");
+  expect(protocols[1].attributes("aria-checked")).toBe("true");
+  vi.mocked(mcpApi.create).mockResolvedValue(listOf([httpServer()]));
+  await wrapper.find('[data-testid="mcp-form"]').trigger("submit");
+  await flushPromises();
+  expect(mcpApi.create).toHaveBeenCalledWith("remote", {
+    url: "https://example.com/mcp", headers: { Authorization: "Bearer secret" },
+    http_protocol: "modern", project_ids: [], allowed_modes: ["dev"], call_timeout: 120,
+  });
+  expect(wrapper.text()).not.toContain("Bearer secret");
+});
+
+it("editing HTTP keeps untouched headers, replaces and removes secrets and keeps the transport", async () => {
+  const item = httpServer({ header_keys: ["DROP", "KEEP", "SWAP"], http_protocol: "legacy" });
+  const wrapper = await mountView(listOf([item]));
+  await wrapper.find('[data-testid="mcp-edit"]').trigger("click");
+  expect(wrapper.findAll('[aria-label="Подключение"] button').every(button => button.attributes("disabled") !== undefined)).toBe(true);
+  const rows = wrapper.findAll('[data-testid="mcp-env-row"]');
+  expect(rows.every(row => (row.findAll("input")[1].element as HTMLInputElement).value === "")).toBe(true);
+  await rows[0].find("button").trigger("click");
+  await rows[2].findAll("input")[1].setValue("replacement");
+  await wrapper.find('[data-testid="mcp-url"]').setValue("https://other.example.com/mcp");
+  vi.mocked(mcpApi.update).mockResolvedValue(listOf([item]));
+  await wrapper.find('[data-testid="mcp-form"]').trigger("submit");
+  await flushPromises();
+  expect(mcpApi.update).toHaveBeenCalledWith("remote", {
+    url: "https://other.example.com/mcp", headers: { DROP: null, SWAP: "replacement" },
+    http_protocol: "legacy", project_ids: [], allowed_modes: ["dev"], call_timeout: 120,
+  });
+});
+
+it("an invalid URL and duplicate header names block HTTP saving", async () => {
+  const wrapper = await mountView(listOf([httpServer({ header_keys: [] })]));
+  await wrapper.find('[data-testid="mcp-edit"]').trigger("click");
+  for (const url of ["invalid", "ftp://example.com/mcp", "https://user:pass@example.com/mcp", "https://example.com/#secret"]) {
+    await wrapper.find('[data-testid="mcp-url"]').setValue(url);
+    expect(save(wrapper).attributes("disabled")).toBeDefined();
+  }
+  await wrapper.find('[data-testid="mcp-url"]').setValue("https://example.com/mcp");
+  for (const key of ["X-Key", "x-key"]) {
+    await wrapper.find('[data-testid="mcp-env-add"]').trigger("click");
+    const row = wrapper.findAll('[data-testid="mcp-env-row"]').at(-1)!;
+    await row.findAll("input")[0].setValue(key);
+    await row.findAll("input")[1].setValue("value");
+  }
+  expect(wrapper.text()).toContain("Имена заголовков повторяются");
+  await wrapper.find('[data-testid="mcp-form"]').trigger("submit");
+  expect(mcpApi.update).not.toHaveBeenCalled();
+});
+
+it("the wait for a tool is kept, limited and sent with the server", async () => {
+  const wrapper = await mountView(listOf([server("docs", { call_timeout: 300 })]));
+  await wrapper.find('[data-testid="mcp-edit"]').trigger("click");
+  const field = wrapper.find('[data-testid="mcp-timeout"]');
+  expect((field.element as HTMLInputElement).value).toBe("300");
+  for (const value of ["4", "601", "2.5", ""]) {
+    await field.setValue(value);
+    expect(save(wrapper).attributes("disabled")).toBeDefined();
+    expect(wrapper.find("#mcp-timeout-help").classes()).toContain("ui-field__help--error");
+  }
+  await field.setValue("90");
+  expect(save(wrapper).attributes("disabled")).toBeUndefined();
+  await wrapper.find('[data-testid="mcp-form"]').trigger("submit");
+  await flushPromises();
+  expect(vi.mocked(mcpApi.update).mock.calls[0][1].call_timeout).toBe(90);
 });

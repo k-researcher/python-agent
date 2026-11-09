@@ -171,6 +171,7 @@ async def _start_client(
     config: dict[str, Any],
     *,
     request_timeout: float = 5.0,
+    call_timeout: float | None = None,
     env: dict[str, str] | None = None,
 ) -> StdioMcpClient:
     """Write the config, spawn the server, and run the handshake."""
@@ -178,6 +179,8 @@ async def _start_client(
     options: dict[str, Any] = {}
     if env is not None:
         options["env"] = env
+    if call_timeout is not None:
+        options["call_timeout"] = call_timeout
     client = StdioMcpClient(
         [sys.executable, str(_write_server(tmp_path)), str(config_path)],
         cwd=tmp_path,
@@ -342,7 +345,7 @@ async def test_call_tool_timeout(tmp_path: Path) -> None:
         "events_file": str(tmp_path / "events.jsonl"),
         "hang_on": ["slow_call"],
     }
-    client = await _start_client(tmp_path, config, request_timeout=0.3)
+    client = await _start_client(tmp_path, config, call_timeout=0.3)
     try:
         with pytest.raises(McpError) as exc_info:
             await client.call_tool("slow_call", {})
@@ -351,6 +354,55 @@ async def test_call_tool_timeout(tmp_path: Path) -> None:
 
     assert exc_info.value.code is None
     assert exc_info.value.message == "timed out"
+    assert exc_info.value.kind == "timeout"
+    # The server learns that the result is no longer wanted and may stop the work.
+    events = _read_events(tmp_path)
+    call = next(event for event in events if event.get("method") == "tools/call")
+    cancel = [event for event in events if event.get("method") == "notifications/cancelled"]
+    assert cancel == [
+        {
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": call["id"], "reason": "timed out"},
+        }
+    ]
+
+
+async def test_tool_call_waits_longer_than_other_requests(tmp_path: Path) -> None:
+    config = {
+        "events_file": str(tmp_path / "events.jsonl"),
+        "delay_methods": {"search": 0.6},
+    }
+    client = await _start_client(tmp_path, config, request_timeout=0.2, call_timeout=5.0)
+    try:
+        result = await client.call_tool("search", {})
+    finally:
+        await client.close()
+
+    assert result["content"][0]["text"] == "result-search"
+    assert not [e for e in _read_events(tmp_path) if e.get("method") == "notifications/cancelled"]
+
+
+async def test_cancelled_call_tells_the_server(tmp_path: Path) -> None:
+    config = {"events_file": str(tmp_path / "events.jsonl"), "hang_on": ["slow_call"]}
+    client = await _start_client(tmp_path, config)
+    try:
+        task = asyncio.create_task(client.call_tool("slow_call", {}))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Let the server read the notification before the client closes its input.
+        await asyncio.sleep(0.3)
+    finally:
+        await client.close()
+
+    events = _read_events(tmp_path)
+    call = next(event for event in events if event.get("method") == "tools/call")
+    cancel = [event for event in events if event.get("method") == "notifications/cancelled"]
+    assert [event["params"] for event in cancel] == [
+        {"requestId": call["id"], "reason": "cancelled"}
+    ]
 
 
 async def test_call_tool_timeout_then_other_requests_still_work(tmp_path: Path) -> None:
@@ -358,7 +410,7 @@ async def test_call_tool_timeout_then_other_requests_still_work(tmp_path: Path) 
         "events_file": str(tmp_path / "events.jsonl"),
         "hang_on": ["slow_call"],
     }
-    client = await _start_client(tmp_path, config, request_timeout=0.2)
+    client = await _start_client(tmp_path, config, call_timeout=0.2)
     try:
         with pytest.raises(McpError, match="timed out"):
             await client.call_tool("slow_call", {})
@@ -382,6 +434,7 @@ async def test_server_dies_mid_request(tmp_path: Path) -> None:
         await client.close()
 
     assert exc_info.value.message in ("server closed", "read failed: ")
+    assert exc_info.value.kind == "transport_error"
 
 
 async def test_server_request_gets_method_not_found(tmp_path: Path) -> None:

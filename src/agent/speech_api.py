@@ -10,11 +10,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent import speech
+from agent.config import Settings, get_settings
 from agent.database import get_db
 
 settings_router = APIRouter(prefix="/api/settings/speech", tags=["speech settings"])
 router = APIRouter(prefix="/api/speech", tags=["speech"])
 Database = Annotated[AsyncSession, Depends(get_db)]
+Configuration = Annotated[Settings, Depends(get_settings)]
 
 
 class ProfilePatch(BaseModel):
@@ -26,18 +28,20 @@ class ProfilePatch(BaseModel):
     disabled: bool | None = None
 
 
-def _view(profile: speech.SpeechProfile) -> dict[str, Any]:
+def _view(profile: speech.SpeechProfile, settings: Settings) -> dict[str, Any]:
     return {
         "id": profile.id,
         "base_url": profile.base_url,
         "model": profile.model,
         "language": profile.language,
         "disabled": profile.disabled,
+        # The command itself stays on the server; the UI only learns that it exists.
+        "restart": profile.id in settings.speech_restart_commands,
     }
 
 
-async def _settings(db: AsyncSession) -> dict[str, Any]:
-    return {"profiles": [_view(item) for item in await speech.ordered_profiles(db)]}
+async def _settings(db: AsyncSession, settings: Settings) -> dict[str, Any]:
+    return {"profiles": [_view(item, settings) for item in await speech.ordered_profiles(db)]}
 
 
 async def _profile(db: AsyncSession, profile_id: str) -> speech.SpeechProfile:
@@ -48,12 +52,14 @@ async def _profile(db: AsyncSession, profile_id: str) -> speech.SpeechProfile:
 
 
 @settings_router.get("")
-async def get_speech_settings(db: Database) -> dict[str, Any]:
-    return await _settings(db)
+async def get_speech_settings(db: Database, settings: Configuration) -> dict[str, Any]:
+    return await _settings(db, settings)
 
 
 @settings_router.put("/profiles/{profile_id}")
-async def put_profile(profile_id: str, patch: ProfilePatch, db: Database) -> dict[str, Any]:
+async def put_profile(
+    profile_id: str, patch: ProfilePatch, db: Database, settings: Configuration
+) -> dict[str, Any]:
     if speech.PROFILE_ID.fullmatch(profile_id) is None:
         raise HTTPException(422, "Use letters, digits, dot, dash or underscore in the ID")
     if patch.base_url is not None and not speech.is_local_url(patch.base_url):
@@ -73,30 +79,43 @@ async def put_profile(profile_id: str, patch: ProfilePatch, db: Database) -> dic
         if value is not None:
             setattr(profile, name, value)
     await db.commit()
-    return await _settings(db)
+    return await _settings(db, settings)
 
 
 @settings_router.delete("/profiles/{profile_id}")
-async def delete_profile(profile_id: str, db: Database) -> dict[str, Any]:
+async def delete_profile(profile_id: str, db: Database, settings: Configuration) -> dict[str, Any]:
     await db.delete(await _profile(db, profile_id))
     await db.commit()
-    return await _settings(db)
+    return await _settings(db, settings)
 
 
 @settings_router.post("/profiles/{profile_id}/primary")
-async def make_primary(profile_id: str, db: Database) -> dict[str, Any]:
+async def make_primary(profile_id: str, db: Database, settings: Configuration) -> dict[str, Any]:
     """Put the profile first and keep the order of the others."""
     chosen = await _profile(db, profile_id)
     others = [item for item in await speech.ordered_profiles(db) if item.id != chosen.id]
     for index, item in enumerate([chosen, *others]):
         item.priority = index
     await db.commit()
-    return await _settings(db)
+    return await _settings(db, settings)
 
 
 @settings_router.post("/profiles/{profile_id}/test")
 async def test_profile(profile_id: str, db: Database) -> dict[str, Any]:
     return await speech.test_profile(db, await _profile(db, profile_id))
+
+
+@settings_router.post("/profiles/{profile_id}/restart")
+async def restart_profile(profile_id: str, db: Database, settings: Configuration) -> dict[str, Any]:
+    """Run the restart command from the server configuration, then check the server."""
+    profile = await _profile(db, profile_id)
+    command = settings.speech_restart_commands.get(profile.id)
+    if command is None:
+        raise HTTPException(404, "No restart command for this profile")
+    try:
+        return await speech.restart_profile(db, profile, command)
+    except speech.SpeechError as error:
+        raise HTTPException(error.status, str(error)) from None
 
 
 @router.post("/transcribe")

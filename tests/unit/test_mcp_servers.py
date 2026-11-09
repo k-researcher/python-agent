@@ -17,7 +17,8 @@ from agent.mcp_servers import (
     check_read_path,
     check_server,
     check_server_id,
-    suggested_read_paths,
+    runtime_read_paths,
+    sandbox_policy,
     to_source,
 )
 from agent.model_overrides import encrypt_secret
@@ -86,22 +87,109 @@ def test_read_path_through_a_link_into_the_data_is_refused(
         check_read_path(str(link), settings)
 
 
-def test_install_directory_of_the_program_is_suggested(settings: Settings, tmp_path: Path) -> None:
+def test_install_directory_of_the_program_is_opened(settings: Settings, tmp_path: Path) -> None:
     program = tmp_path / "toolbox" / "bin" / "server"
     program.parent.mkdir(parents=True)
     program.write_text("#!/bin/sh\n")
     program.chmod(program.stat().st_mode | stat.S_IXUSR)
-    assert suggested_read_paths([str(program)], settings) == [str(tmp_path / "toolbox")]
-    # A program at the root of the file system would open everything: nothing is suggested.
-    assert suggested_read_paths(["/bin/sh"], settings) == []
-    assert suggested_read_paths(["no-such-program-anywhere"], settings) == []
+    assert runtime_read_paths([str(program)], settings) == [str(tmp_path / "toolbox")]
+    # A program at the root of the file system would open everything: nothing is opened.
+    assert runtime_read_paths(["/bin/sh"], settings) == []
+
+
+def _virtual_environment(tmp_path: Path) -> tuple[Path, Path]:
+    """Build a server script in a virtual environment whose Python lives elsewhere."""
+    runtime = tmp_path / "runtimes" / "cpython-3.13" / "bin" / "python3.13"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("")
+    environment = tmp_path / "server" / ".venv" / "bin"
+    environment.mkdir(parents=True)
+    (environment.parent / "pyvenv.cfg").write_text(f"home = {runtime.parent}\n")
+    (environment / "python").symlink_to(runtime)
+    script = environment / "docs-server"
+    script.write_text(f"#!{environment / 'python'}\nimport docs\n")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return script, runtime
+
+
+def test_the_real_python_of_a_virtual_environment_is_opened(
+    settings: Settings, tmp_path: Path
+) -> None:
+    script, _ = _virtual_environment(tmp_path)
+    # The project folder holds the environment and the code of a development install.
+    assert runtime_read_paths([str(script), "--stdio"], settings) == [
+        str(tmp_path / "server"),
+        str(tmp_path / "runtimes" / "cpython-3.13"),
+    ]
+
+
+def test_a_linked_program_opens_its_install_and_its_real_folder(
+    settings: Settings, tmp_path: Path
+) -> None:
+    # The layout of npx in Homebrew: a link from bin into lib/node_modules.
+    real = tmp_path / "brew" / "lib" / "node_modules" / "npm" / "bin" / "npx-cli.js"
+    real.parent.mkdir(parents=True)
+    real.write_text("")
+    (tmp_path / "brew" / "bin").mkdir()
+    (tmp_path / "brew" / "bin" / "npx").symlink_to(real)
+    assert runtime_read_paths([str(tmp_path / "brew" / "bin" / "npx")], settings) == [
+        str(tmp_path / "brew"),
+        str(tmp_path / "brew" / "lib" / "node_modules" / "npm"),
+    ]
+
+
+def test_an_interpreter_found_through_env_is_opened(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, runtime = _virtual_environment(tmp_path)
+    runtime.chmod(runtime.stat().st_mode | stat.S_IXUSR)
+    (runtime.parent / "node").symlink_to(runtime)
+    monkeypatch.setenv("PATH", str(runtime.parent))
+    script = tmp_path / "tool" / "bin" / "server"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env -S node --no-warnings\n")
+    assert runtime_read_paths([str(script)], settings) == [
+        str(tmp_path / "tool"),
+        str(tmp_path / "runtimes" / "cpython-3.13"),
+    ]
+
+
+def test_runtime_paths_never_open_the_agent_data(settings: Settings, tmp_path: Path) -> None:
+    script, runtime = _virtual_environment(tmp_path)
+    settings.data_dir.mkdir(parents=True)
+    moved = settings.data_dir / "cpython" / "bin" / "python3.13"
+    moved.parent.mkdir(parents=True)
+    moved.write_text("")
+    (script.parent / "python").unlink()
+    (script.parent / "python").symlink_to(moved)
+    assert runtime_read_paths([str(script)], settings) == [str(tmp_path / "server")]
+    assert runtime_read_paths(["no-such-program-anywhere"], settings) == []
+
+
+def test_the_sandbox_of_a_server_gets_its_runtime_without_settings(
+    settings: Settings, tmp_path: Path
+) -> None:
+    script, _ = _virtual_environment(tmp_path)
+    source = to_source(server(settings, command=[str(script)], read_paths=["/opt/extra"]))
+    paths = sandbox_policy(settings, source).extra_read_paths
+    assert "/opt/extra" in paths
+    assert str(tmp_path / "runtimes" / "cpython-3.13") in paths
+
+
+def test_an_environment_in_the_home_folder_opens_only_itself(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The folder above an environment can be too wide to open.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "server")
+    script, _ = _virtual_environment(tmp_path)
+    assert runtime_read_paths([str(script)], settings)[0] == str(tmp_path / "server" / ".venv")
 
 
 def test_a_program_inside_the_agent_data_is_not_opened(settings: Settings) -> None:
     program = settings.data_dir / "bin" / "server"
     program.parent.mkdir(parents=True)
     program.write_text("#!/bin/sh\n")
-    assert suggested_read_paths([str(program)], settings) == []
+    assert runtime_read_paths([str(program)], settings) == []
 
 
 def server(settings: Settings, **values: object) -> McpServer:
@@ -115,6 +203,7 @@ def server(settings: Settings, **values: object) -> McpServer:
         "allow_network": False,
         "read_paths": [],
         "enabled": True,
+        "call_timeout": 120,
         **values,
     }
     return McpServer(**fields)
