@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -262,3 +263,114 @@ def test_speech_routes_need_a_login() -> None:
         assert anonymous.get(SETTINGS).status_code == 401
         response = anonymous.post("/api/speech/transcribe", content=AUDIO, headers=WEBM)
         assert response.status_code == 401
+
+
+@pytest.fixture
+def marker(tmp_path: Path) -> Path:
+    """The file that the test restart command writes."""
+    return tmp_path / "restarted"
+
+
+@pytest.fixture
+def restart_client(marker: Path) -> Iterator[TestClient]:
+    """A client with restart commands: "main" writes the marker file, the others fail."""
+    from agent.config import get_settings
+
+    settings = get_settings().model_copy(
+        update={
+            "speech_restart_commands": {
+                # The shell expands $(echo done): the command runs through /bin/sh.
+                "main": f"echo $(echo done) > '{marker}'",
+                "broken": "echo 'service not loaded' >&2; exit 3",
+                "missing": "no-such-restart-program-xyz",
+                "slow": "sleep 5",
+            }
+        }
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
+    try:
+        with authed_client() as test_client:
+            test_client.portal.call(_clean)  # type: ignore[union-attr]
+            yield test_client
+            test_client.portal.call(_clean)  # type: ignore[union-attr]
+    finally:
+        app.dependency_overrides.pop(get_settings, None)
+
+
+def test_restart_runs_the_configured_command_and_checks_the_server(
+    restart_client: TestClient, marker: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "GET" and calls.count("GET") == 1:
+            raise httpx.ConnectError("starting")
+        return httpx.Response(200, json={"text": ""})
+
+    _servers(monkeypatch, respond)
+    monkeypatch.setattr(speech, "RESTART_POLL_SECONDS", 0.01)
+    _add(restart_client, "main", 8178)
+    _add(restart_client, "spare", 8179)
+
+    profiles = {item["id"]: item for item in restart_client.get(SETTINGS).json()["profiles"]}
+    assert profiles["main"]["restart"] is True
+    assert profiles["spare"]["restart"] is False
+    assert "command" not in profiles["main"]
+
+    result = restart_client.post(f"{SETTINGS}/profiles/main/restart").json()
+    assert result["ok"] is True and result["restarted"] is True and result["status"] == 200
+    assert marker.read_text().strip() == "done"
+    assert calls == ["GET", "GET", "POST"]
+
+
+def test_restart_without_a_command_or_with_a_failing_command(
+    restart_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _servers(monkeypatch, lambda request: httpx.Response(200, json={"text": ""}))
+    _add(restart_client, "spare", 8179)
+    _add(restart_client, "broken", 8180)
+    _add(restart_client, "missing", 8181)
+    _add(restart_client, "slow", 8182)
+    monkeypatch.setattr(speech, "RESTART_COMMAND_TIMEOUT_SECONDS", 0.2)
+    assert restart_client.post(f"{SETTINGS}/profiles/spare/restart").status_code == 404
+    assert restart_client.post(f"{SETTINGS}/profiles/none/restart").status_code == 404
+
+    def message(profile_id: str) -> str:
+        result = restart_client.post(f"{SETTINGS}/profiles/{profile_id}/restart").json()
+        assert result["ok"] is False and result["restarted"] is False
+        assert result["status"] is None and result["seconds"] is None
+        return str(result["message"])
+
+    assert message("broken") == (
+        "Перезапуск не удался — команда завершилась с ошибкой, код 3: service not loaded. "
+        "Проверьте AGENT_SPEECH_RESTART_COMMANDS."
+    )
+    assert message("missing").startswith("Перезапуск не удался — программа из команды не найдена: ")
+    assert message("slow") == "Перезапуск не удался — команда не завершилась за 0.2 с."
+
+
+def test_restart_reports_a_server_that_does_not_come_back(
+    restart_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down")
+
+    _servers(monkeypatch, respond)
+    monkeypatch.setattr(speech, "RESTART_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(speech, "RESTART_READY_TIMEOUT_SECONDS", 0.1)
+    _add(restart_client, "main", 8178)
+    result = restart_client.post(f"{SETTINGS}/profiles/main/restart").json()
+    assert result["ok"] is False and result["restarted"] is True
+    assert result["message"] == (
+        "Команда выполнена, но сервер не ответил за 0.1 с. Посмотрите журнал сервера распознавания."
+    )
+
+
+def test_an_empty_restart_command_is_refused() -> None:
+    from pydantic import ValidationError
+
+    from agent.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(speech_restart_commands={"main": "  "})

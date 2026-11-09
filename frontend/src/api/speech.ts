@@ -8,6 +8,8 @@ export interface SpeechProfile {
   model: string;
   language: string;
   disabled: boolean;
+  /** The server configuration has a restart command for this profile. */
+  restart: boolean;
 }
 
 export interface SpeechSettings {
@@ -26,6 +28,8 @@ export interface SpeechCheck {
   status: number | null;
   seconds: number | null;
   message?: string;
+  /** Set only by a restart: false means the restart command itself failed. */
+  restarted?: boolean;
 }
 
 const PREFIX = "/api/settings/speech";
@@ -38,6 +42,7 @@ export const speechSettings = {
   removeProfile: (id: string) => request<SpeechSettings>(profilePath(id), { method: "DELETE" }),
   makePrimary: (id: string) => request<SpeechSettings>(`${profilePath(id)}/primary`, { method: "POST" }),
   testProfile: (id: string) => request<SpeechCheck>(`${profilePath(id)}/test`, { method: "POST" }),
+  restartProfile: (id: string) => request<SpeechCheck>(`${profilePath(id)}/restart`, { method: "POST" }),
 };
 
 /** Send a recording as the raw request body and get its text. */

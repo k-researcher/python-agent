@@ -8,6 +8,7 @@ kept in memory for one request and is never stored.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import re
@@ -29,6 +30,11 @@ from agent.models import Base, OutboundAudit, utcnow
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
 TRANSCRIBE_TIMEOUT_SECONDS = 120.0
 TEST_TIMEOUT_SECONDS = 30.0
+RESTART_COMMAND_TIMEOUT_SECONDS = 30.0
+# A large model can need some time to load after a restart.
+RESTART_READY_TIMEOUT_SECONDS = 60.0
+RESTART_POLL_SECONDS = 0.5
+RESTART_ERROR_CHARS = 200
 PROFILE_ID = re.compile(r"[A-Za-z0-9._-]{1,100}\Z")
 LANGUAGE = re.compile(r"[a-z]{2,3}\Z")
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -203,3 +209,93 @@ async def test_profile(db: AsyncSession, profile: SpeechProfile) -> dict[str, An
     )
     seconds = round(time.monotonic() - started, 2)
     return {"ok": text is not None, "status": status, "seconds": seconds if status else None}
+
+
+# One restart at a time: a second click must not kill a server that is still starting.
+_restart_lock = asyncio.Lock()
+
+
+def _first_line(output: bytes) -> str:
+    """The first non-empty line of the command output, short enough for one status line."""
+    for line in output.decode(errors="replace").splitlines():
+        if line.strip():
+            text = line.strip()
+            return text if len(text) <= RESTART_ERROR_CHARS else text[:RESTART_ERROR_CHARS] + "…"
+    return ""
+
+
+def _restart_failure(code: int, error: str) -> str:
+    """A message that says what went wrong and what to look at."""
+    if code == 127:
+        reason = "программа из команды не найдена"
+    elif code == 126:
+        reason = "нет прав на запуск программы из команды"
+    else:
+        reason = f"команда завершилась с ошибкой, код {code}"
+    detail = f": {error}" if error else ""
+    return f"Перезапуск не удался — {reason}{detail}. Проверьте AGENT_SPEECH_RESTART_COMMANDS."
+
+
+async def _run_restart_command(command: str) -> str | None:
+    """Run the command with /bin/sh. Return a message for a failure, or None."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "/bin/sh",
+            "-c",
+            command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError:
+        return "Перезапуск не удался — не запускается /bin/sh."
+    try:
+        _, error = await asyncio.wait_for(process.communicate(), RESTART_COMMAND_TIMEOUT_SECONDS)
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+        seconds = f"{RESTART_COMMAND_TIMEOUT_SECONDS:g}"
+        return f"Перезапуск не удался — команда не завершилась за {seconds} с."
+    code = process.returncode
+    return None if code == 0 else _restart_failure(code or 0, _first_line(error))
+
+
+async def _wait_until_answers(base_url: str) -> bool:
+    """True when the server gives any HTTP answer before the time limit."""
+    deadline = time.monotonic() + RESTART_READY_TIMEOUT_SECONDS
+    async with client() as http:
+        while time.monotonic() < deadline:
+            try:
+                await http.get(base_url, timeout=RESTART_POLL_SECONDS * 4)
+                return True
+            except (httpx.HTTPError, httpx.InvalidURL):
+                await asyncio.sleep(RESTART_POLL_SECONDS)
+    return False
+
+
+async def restart_profile(db: AsyncSession, profile: SpeechProfile, command: str) -> dict[str, Any]:
+    """Run the restart command from the configuration, wait for the server, then check it."""
+    if _restart_lock.locked():
+        raise SpeechError("Перезапуск уже идёт", status=409)
+    async with _restart_lock:
+        failure = await _run_restart_command(command)
+        if failure is not None:
+            return {
+                "ok": False,
+                "status": None,
+                "seconds": None,
+                "restarted": False,
+                "message": failure,
+            }
+        if not await _wait_until_answers(profile.base_url):
+            return {
+                "ok": False,
+                "status": None,
+                "seconds": None,
+                "restarted": True,
+                "message": (
+                    f"Команда выполнена, но сервер не ответил за "
+                    f"{RESTART_READY_TIMEOUT_SECONDS:g} с. Посмотрите журнал сервера распознавания."
+                ),
+            }
+        return {**await test_profile(db, profile), "restarted": True}

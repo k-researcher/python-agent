@@ -142,6 +142,9 @@ class Settings(BaseSettings):
     knowledge_base_embedding_url: str = ""
     knowledge_base_embedding_api_key: str = ""
     knowledge_base_embedding_model: str = ""
+    # Speech profile ID -> the shell command that restarts its server, run by /bin/sh.
+    # Only the server configuration can set it; the UI can only run it.
+    speech_restart_commands: dict[str, str] = Field(default_factory=dict)
     max_parallel_sessions: int = Field(default=4, ge=1, le=32)
     max_auto_hops: int = Field(default=3, ge=1)
     max_child_depth: int = Field(default=3, ge=0, le=10)
@@ -170,6 +173,14 @@ class Settings(BaseSettings):
     # An empty value removes the language rule from the prompts.
     response_language: str = Field(default="ru", max_length=20)
     frontend_dist: Path = PROJECT_ROOT / "frontend" / "dist"
+
+    @field_validator("speech_restart_commands")
+    @classmethod
+    def _speech_restart_commands_valid(cls, value: dict[str, str]) -> dict[str, str]:
+        for profile_id, command in value.items():
+            if not command.strip():
+                raise ValueError(f"Speech restart command for {profile_id!r} is empty")
+        return value
 
     @field_validator("max_session_cost")
     @classmethod

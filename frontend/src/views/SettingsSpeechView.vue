@@ -13,7 +13,8 @@ const loadError = ref("");
 const actionError = ref("");
 const busy = ref(false);
 const showForm = ref(false);
-const checks = reactive<Record<string, SpeechCheck | "checking">>({});
+type CheckState = SpeechCheck | "checking" | "restarting";
+const checks = reactive<Record<string, CheckState>>({});
 const form = reactive({ id: "local", baseUrl: "http://127.0.0.1:8178/v1", language: "", model: "" });
 
 const LANGUAGES = [
@@ -59,11 +60,18 @@ function languageLabel(value: string): string {
   return LANGUAGES.find((item) => item.value === value)?.label ?? value;
 }
 
-function checkText(result: SpeechCheck | "checking" | undefined): string {
+function checkText(result: CheckState | undefined): string {
   if (result === undefined) return "";
   if (result === "checking") return "Проверяю…";
-  if (result.ok) return `Отвечает${result.seconds === null ? "" : ` за ${result.seconds.toLocaleString("ru-RU")} с`}`;
-  return result.status === null ? "Сервер недоступен" : `Не отвечает: HTTP ${result.status}`;
+  if (result === "restarting") return "Перезапускаю…";
+  // A restart reports its own failure: the command failed or the server did not come back.
+  if (!result.ok && result.restarted !== undefined && result.message) return result.message;
+  if (result.ok) {
+    const time = result.seconds === null ? "" : ` за ${result.seconds.toLocaleString("ru-RU")} с`;
+    return `${result.restarted ? "Перезапущен, отвечает" : "Отвечает"}${time}`;
+  }
+  const failure = result.status === null ? "сервер недоступен" : `не отвечает: HTTP ${result.status}`;
+  return result.restarted ? `Перезапущен, но ${failure}` : failure[0].toUpperCase() + failure.slice(1);
 }
 
 async function load(): Promise<void> {
@@ -103,6 +111,25 @@ async function check(item: SpeechProfile): Promise<void> {
     checks[item.id] = await speechSettings.testProfile(item.id);
   } catch (error) {
     checks[item.id] = { ok: false, status: null, seconds: null, message: message(error) };
+  }
+}
+
+function pending(id: string): boolean {
+  return checks[id] === "checking" || checks[id] === "restarting";
+}
+
+function finished(id: string): SpeechCheck | null {
+  const result = checks[id];
+  return result === undefined || result === "checking" || result === "restarting" ? null : result;
+}
+
+// The server runs the command from its own configuration and then checks the profile.
+async function restart(item: SpeechProfile): Promise<void> {
+  checks[item.id] = "restarting";
+  try {
+    checks[item.id] = await speechSettings.restartProfile(item.id);
+  } catch (error) {
+    checks[item.id] = { ok: false, status: null, seconds: null, restarted: false, message: message(error) };
   }
 }
 
@@ -179,8 +206,8 @@ onMounted(load);
             v-if="checks[item.id]"
             class="ui-small"
             :class="{
-              'ui-ok': checks[item.id] !== 'checking' && (checks[item.id] as SpeechCheck).ok,
-              'ui-bad': checks[item.id] !== 'checking' && !(checks[item.id] as SpeechCheck).ok,
+              'ui-ok': finished(item.id)?.ok === true,
+              'ui-bad': finished(item.id)?.ok === false,
             }"
             data-testid="speech-check"
           >{{ checkText(checks[item.id]) }}</span>
@@ -197,10 +224,18 @@ onMounted(load);
           <button
             type="button"
             class="ui-btn ui-btn--outlined"
-            :disabled="checks[item.id] === 'checking'"
+            :disabled="pending(item.id)"
             data-testid="speech-test"
             @click="check(item)"
           >Проверить</button>
+          <button
+            v-if="item.restart"
+            type="button"
+            class="ui-btn ui-btn--outlined"
+            :disabled="pending(item.id)"
+            data-testid="speech-restart"
+            @click="restart(item)"
+          >Перезапустить</button>
           <button
             type="button"
             class="ui-btn ui-btn--icon ui-btn--danger"
