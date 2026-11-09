@@ -351,6 +351,7 @@ async def test_call_tool_timeout(tmp_path: Path) -> None:
 
     assert exc_info.value.code is None
     assert exc_info.value.message == "timed out"
+    assert exc_info.value.kind == "timeout"
 
 
 async def test_call_tool_timeout_then_other_requests_still_work(tmp_path: Path) -> None:
@@ -382,6 +383,7 @@ async def test_server_dies_mid_request(tmp_path: Path) -> None:
         await client.close()
 
     assert exc_info.value.message in ("server closed", "read failed: ")
+    assert exc_info.value.kind == "transport_error"
 
 
 async def test_server_request_gets_method_not_found(tmp_path: Path) -> None:

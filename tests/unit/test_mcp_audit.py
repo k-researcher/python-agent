@@ -218,21 +218,38 @@ async def test_semantic_error_preserves_wire_result_and_records_fixed_outcome(
     harness.assert_pair("error", "tool_error")
 
 
-@pytest.mark.parametrize("error", [McpError(-32000, SECRET), OSError(SECRET), RuntimeError(SECRET)])
+@pytest.mark.parametrize(
+    ("error", "outcome", "message"),
+    [
+        (McpError(-32000, SECRET), "protocol_error", "MCP protocol request failed"),
+        (McpError(None, SECRET, kind="timeout"), "timeout", "MCP request timed out"),
+        (McpError(None, SECRET, kind="transport_error"), "transport_error", "MCP transport failed"),
+        (TimeoutError(SECRET), "timeout", "MCP request timed out"),
+        (OSError(SECRET), "transport_error", "MCP transport failed"),
+        (RuntimeError(SECRET), "invocation_error", "MCP invocation failed"),
+        # Remote text cannot select a local failure category.
+        (McpError(-32000, "timed out"), "protocol_error", "MCP protocol request failed"),
+    ],
+)
 async def test_transport_exception_is_sanitized(
-    harness: Harness, error: Exception, caplog: pytest.LogCaptureFixture
+    harness: Harness,
+    error: Exception,
+    outcome: str,
+    message: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     harness.client.error = error
 
-    with pytest.raises(ToolError, match="^MCP invocation failed$") as caught:
+    with pytest.raises(ToolError) as caught:
         await harness.execute()
 
+    assert str(caught.value) == message
     assert caught.value.__cause__ is None
     assert caught.value.__suppress_context__
     assert SECRET not in str(caught.value)
     assert SECRET not in caplog.text
     assert len(harness.client.calls) == 1
-    harness.assert_pair("error", "invocation_error")
+    harness.assert_pair("error", outcome)
 
 
 async def test_guard_denied_never_calls_remote(harness: Harness) -> None:

@@ -101,7 +101,7 @@ function checkText(check: McpCheck): string {
   if (!check.ok) return check.error || "Сервер не запустился";
   const count = check.tool_count ?? check.tools?.length ?? 0;
   const name = check.server?.name ? ` · ${check.server.name}${check.server.version ? ` ${check.server.version}` : ""}` : "";
-  return `Работает · ${count} ${plural(count, "инструмент", "инструмента", "инструментов")}${name}${check.protocol ? ` · ${check.protocol}` : ""}`;
+  return `Каталог получен · ${count} ${plural(count, "инструмент", "инструмента", "инструментов")}${name}${check.protocol ? ` · ${check.protocol}` : ""}`;
 }
 
 function toggleDetails(id: string): void {
@@ -410,8 +410,8 @@ onMounted(load);
           </div>
         </div>
         <p class="ui-hint">
-          Выключатель включает сервер для новых запусков агента. «Проверить» запускает сервер и показывает его
-          инструменты.
+          Выключатель включает сервер для новых запусков агента. «Проверить» получает список инструментов,
+          но не вызывает их и не проверяет доступ к их внешним сервисам.
         </p>
 
         <div v-if="!list.servers.length" class="ui-empty" data-testid="mcp-empty">

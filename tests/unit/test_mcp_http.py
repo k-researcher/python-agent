@@ -17,6 +17,31 @@ URL = "https://mcp.example.com/mcp"
 SESSION = "session-1"
 
 
+@pytest.mark.parametrize(
+    ("exception", "kind"),
+    [
+        (httpx.ReadTimeout, "timeout"),
+        (httpx.ConnectError, "transport_error"),
+        (httpx.ReadError, "transport_error"),
+    ],
+)
+async def test_connection_failures_have_safe_typed_categories(
+    exception: type[httpx.HTTPError], kind: str
+) -> None:
+    requests = []
+
+    def fail(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise exception("credential-canary", request=request)
+
+    client = HttpMcpClient(URL, transport=httpx.MockTransport(fail), protocol="modern")
+    with pytest.raises(McpError) as caught:
+        await client.start()
+    assert caught.value.kind == kind
+    assert "credential-canary" not in str(caught.value)
+    assert len(requests) == 1
+
+
 def rpc(request: httpx.Request) -> dict[str, Any]:
     return json.loads(request.content)
 

@@ -67,7 +67,14 @@ def test_profile_denies_by_default_and_closes_risky_operations() -> None:
 
 
 def test_profile_network_is_explicit() -> None:
-    assert "(allow network*)" in profile(Path("/p"), Path("/t"), [], allow_network=True)
+    enabled = profile(Path("/p"), Path("/t"), [], allow_network=True)
+    disabled = profile(Path("/p"), Path("/t"), [], allow_network=False)
+    assert "(allow network*)" in enabled
+    assert '(allow mach-lookup (global-name "com.apple.trustd.agent"))' in enabled
+    assert "com.apple.trustd" not in disabled
+    assert "network" not in disabled
+    assert "securityd" not in enabled
+    assert "Keychains" not in enabled
 
 
 def test_profile_quotes_paths_and_refuses_control_characters() -> None:

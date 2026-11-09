@@ -15,7 +15,7 @@ import signal
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from agent.sandbox import SandboxPolicy, SandboxUnavailableError
 from agent.sandbox import prepare as prepare_sandbox
@@ -27,17 +27,26 @@ _MAX_LINE_BYTES = MAX_MESSAGE_BYTES
 _MAX_LIST_PAGES = 50
 PROTOCOL_VERSION = "2025-06-18"
 CLIENT_INFO = {"name": "python-agent", "version": "0.1"}
+McpFailureKind = Literal["timeout", "transport_error", "protocol_error"]
 
 
 class McpError(Exception):
     """An error returned or raised by the MCP transport."""
 
-    def __init__(self, code: int | None, message: str, *, status: int | None = None) -> None:
+    def __init__(
+        self,
+        code: int | None,
+        message: str,
+        *,
+        status: int | None = None,
+        kind: McpFailureKind = "protocol_error",
+    ) -> None:
         """Store the JSON-RPC code, a human-readable message and the HTTP status, if any."""
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+        self.kind = kind
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,7 +317,7 @@ class StdioMcpClient(McpClient):
         self._reply_tasks.clear()
 
         # Fail any requests still waiting for a response.
-        self._fail_pending(McpError(None, "server closed"))
+        self._fail_pending(McpError(None, "server closed", kind="transport_error"))
         self._process = None
 
     async def _request(
@@ -321,7 +330,7 @@ class StdioMcpClient(McpClient):
         self._next_id += 1
 
         if self._process is None or self._process.stdin is None:
-            raise McpError(None, "client is not started")
+            raise McpError(None, "client is not started", kind="transport_error")
         if self._broken is not None:
             raise self._broken
 
@@ -338,7 +347,7 @@ class StdioMcpClient(McpClient):
         except (BrokenPipeError, OSError) as exc:
             self._pending.pop(call_id, None)
             if not future.done():
-                future.set_exception(McpError(None, f"write failed: {exc}"))
+                future.set_exception(McpError(None, f"write failed: {exc}", kind="transport_error"))
         except asyncio.CancelledError:
             # A cancelled caller must not orphan the pending future.
             self._pending.pop(call_id, None)
@@ -348,7 +357,7 @@ class StdioMcpClient(McpClient):
             result = await asyncio.wait_for(future, timeout=self._request_timeout)
         except TimeoutError:
             self._pending.pop(call_id, None)
-            raise McpError(None, "timed out") from None
+            raise McpError(None, "timed out", kind="timeout") from None
         except asyncio.CancelledError:
             # Keep the client usable after an external cancellation.
             self._pending.pop(call_id, None)
@@ -360,7 +369,7 @@ class StdioMcpClient(McpClient):
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
         """Send a JSON-RPC notification without waiting for a reply."""
         if self._process is None or self._process.stdin is None:
-            raise McpError(None, "client is not started")
+            raise McpError(None, "client is not started", kind="transport_error")
         line = json.dumps(
             {"jsonrpc": "2.0", "method": method, "params": params},
             separators=(",", ":"),
@@ -397,7 +406,7 @@ class StdioMcpClient(McpClient):
             except asyncio.CancelledError:
                 raise
             except OSError as exc:
-                self._fail_pending(McpError(None, f"read failed: {exc}"))
+                self._fail_pending(McpError(None, f"read failed: {exc}", kind="transport_error"))
                 return
             if not chunk:
                 break
@@ -417,7 +426,7 @@ class StdioMcpClient(McpClient):
                 self._handle_line(line)
 
         # The server closed its stdout or exited.
-        self._fail_pending(McpError(None, "server closed"))
+        self._fail_pending(McpError(None, "server closed", kind="transport_error"))
 
     def _handle_line(self, line: str) -> None:
         """Parse one JSON line and resolve or reject the matching request."""

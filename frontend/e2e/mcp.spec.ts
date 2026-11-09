@@ -81,6 +81,8 @@ test("MCP page fits the screen with long commands and opened details", async ({ 
   await page.locator('[data-server="docs"] [data-testid="mcp-check"]').click();
   await page.locator('[data-server="broken"] [data-testid="mcp-check"]').click();
   await expect(page.getByTestId("mcp-details")).toHaveCount(2);
+  await expect(page.locator('[data-server="docs"] [data-testid="mcp-check"]')).toContainText("Каталог получен");
+  await expect(page.getByTestId("mcp-settings")).toContainText("но не вызывает их и не проверяет доступ к их внешним сервисам");
   await expectNoHorizontalOverflow(page);
   // Every card action stays inside its card.
   for (const id of ["docs", "broken"]) {

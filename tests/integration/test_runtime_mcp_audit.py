@@ -10,9 +10,11 @@ from sqlalchemy import select
 
 from agent.database import session_factory
 from agent.mcp_client import McpError
-from agent.models import Message, OutboundAudit, Session, ToolCall, User
+from agent.models import Event, Message, OutboundAudit, Session, ToolCall, User
 from agent.session_fence import CURRENT_FENCE, FenceLostError, claim
+from agent.tools.registry import ToolRegistry
 from tests.integration.test_runtime_source_revision import (
+    CountingBuiltin,
     RuntimeCase,
     add_call,
     load_session,
@@ -37,6 +39,83 @@ async def execute(case: RuntimeCase, call_id: str) -> bool:
         call = await db.get(ToolCall, call_id)
         assert call is not None
         return await case.supervisor._execute_tool_call(db, session, call)
+
+
+@pytest.mark.parametrize("semantic_error", [True, False])
+@pytest.mark.parametrize("resume", [True, False])
+async def test_mcp_result_status_agrees_with_message_event_and_audit(
+    runtime_case: RuntimeCase,
+    monkeypatch: pytest.MonkeyPatch,
+    semantic_error: bool,
+    resume: bool,
+) -> None:
+    case = runtime_case
+    call_id = await add_call(case, revision=case.tool.approval_revision())
+    content = [{"type": "text", "text": "remote-result-canary"}]
+
+    async def remote(*args: Any) -> dict[str, Any]:
+        case.client.calls += 1
+        return {"content": content, "isError": semantic_error}
+
+    monkeypatch.setattr(case.client, "call_tool", remote)
+    if resume:
+        async with session_factory() as db:
+            session = await load_session(db, case.session_id)
+            assert await case.supervisor._resume_tool_calls(db, session) == "processed"
+    else:
+        assert await execute(case, call_id)
+    expected_status = "error" if semantic_error else "completed"
+    rows = await audit_rows(case)
+    assert [row.status for row in rows] == ["started", expected_status]
+    assert json.loads(rows[-1].detail)["outcome"] == (
+        "tool_error" if semantic_error else "completed"
+    )
+    assert all("remote-result-canary" not in row.detail for row in rows)
+    async with session_factory() as db:
+        call = await db.get(ToolCall, call_id)
+        assert call is not None and call.status == expected_status
+        assert call.result is not None
+        assert call.result["success"] is (not semantic_error)
+        assert call.result["output"] == {"content": content, "is_error": semantic_error}
+        assert ("error" in call.result) is semantic_error
+        messages = list(await db.scalars(select(Message).where(Message.tool_call_id == call_id)))
+        assert len(messages) == 1 and json.loads(messages[0].content or "") == call.result
+        events = list(
+            await db.scalars(
+                select(Event).where(
+                    Event.session_id == case.session_id, Event.type == "tool.completed"
+                )
+            )
+        )
+        assert len(events) == 1 and events[0].payload["status"] == expected_status
+        assert events[0].payload["tool_call_id"] == call_id
+        session = await load_session(db, case.session_id)
+        assert await case.supervisor._resume_tool_calls(db, session) == "ready"
+    assert not await execute(case, call_id)
+    assert case.client.calls == 1
+
+
+async def test_non_mcp_dictionary_is_not_interpreted_as_a_remote_error(
+    runtime_case: RuntimeCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = runtime_case
+    builtin = CountingBuiltin("local_probe")
+
+    async def run(*args: Any) -> dict[str, Any]:
+        return {"is_error": True, "value": "ordinary tool data"}
+
+    monkeypatch.setattr(builtin, "execute", run)
+    case.supervisor.registry = ToolRegistry(tools=(builtin,))
+    call_id = await add_call(case, revision=None, name=builtin.name)
+    assert await execute(case, call_id)
+    async with session_factory() as db:
+        call = await db.get(ToolCall, call_id)
+        assert call is not None and call.status == "completed"
+        assert call.result == {
+            "success": True,
+            "output": {"is_error": True, "value": "ordinary tool data"},
+        }
+    assert not await audit_rows(case)
 
 
 async def test_mcp_call_has_durable_started_and_linked_terminal_without_raw_payload(
@@ -154,7 +233,7 @@ async def test_remote_exception_is_not_saved_in_audit_or_runtime_error(
     assert await execute(case, call_id)
     rows = await audit_rows(case)
     assert [row.status for row in rows] == ["started", "error"]
-    assert json.loads(rows[-1].detail)["outcome"] == "invocation_error"
+    assert json.loads(rows[-1].detail)["outcome"] == "protocol_error"
     assert all("credential-canary" not in row.detail for row in rows)
     async with session_factory() as db:
         call = await db.get(ToolCall, call_id)

@@ -249,7 +249,8 @@ it("a check shows the tools of a working server", async () => {
   await flushPromises();
 
   expect(mcpApi.check).toHaveBeenCalledWith("docs");
-  expect(wrapper.find('[data-testid="mcp-check"]').text()).toBe("Работает · 2 инструмента · docs 1.2");
+  expect(wrapper.find('[data-testid="mcp-check"]').text()).toBe("Каталог получен · 2 инструмента · docs 1.2");
+  expect(wrapper.text()).toContain("но не вызывает их и не проверяет доступ к их внешним сервисам");
   expect(wrapper.find('[data-testid="mcp-details"]').text()).toContain("search");
   // The result line folds the details away.
   await wrapper.find('[data-testid="mcp-check"]').trigger("click");

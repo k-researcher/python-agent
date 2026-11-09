@@ -222,6 +222,8 @@ def profile(
     ]
     if allow_network:
         lines.append("(allow network*)")
+        # Native TLS clients ask this service to verify certificate trust.
+        lines.append('(allow mach-lookup (global-name "com.apple.trustd.agent"))')
     return "\n".join(lines) + "\n"
 
 

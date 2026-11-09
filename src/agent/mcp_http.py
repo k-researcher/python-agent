@@ -97,10 +97,10 @@ def url_refusal(url: str) -> str | None:
 def _connection_error(error: httpx.HTTPError) -> McpError:
     # The address may hold a key in its query, so it never goes into the message.
     if isinstance(error, httpx.TimeoutException):
-        return McpError(None, "timed out")
+        return McpError(None, "timed out", kind="timeout")
     if isinstance(error, httpx.ConnectError):
-        return McpError(None, "could not connect")
-    return McpError(None, "connection failed")
+        return McpError(None, "could not connect", kind="transport_error")
+    return McpError(None, "connection failed", kind="transport_error")
 
 
 class HttpMcpClient(McpClient):
@@ -249,7 +249,7 @@ class HttpMcpClient(McpClient):
 
     async def _request_once(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if self._client is None:
-            raise McpError(None, "client is not started")
+            raise McpError(None, "client is not started", kind="transport_error")
         call_id = self._next_id
         self._next_id += 1
         if self._modern:
@@ -259,7 +259,7 @@ class HttpMcpClient(McpClient):
             async with asyncio.timeout(self._request_timeout):
                 result = await self._send(message, call_id)
         except TimeoutError:
-            raise McpError(None, "timed out") from None
+            raise McpError(None, "timed out", kind="timeout") from None
         assert result is not None
         result_type = result.get("resultType", "complete")
         if result_type == "input_required":
@@ -276,7 +276,7 @@ class HttpMcpClient(McpClient):
 
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
         if self._client is None:
-            raise McpError(None, "client is not started")
+            raise McpError(None, "client is not started", kind="transport_error")
         if self._modern:
             # A modern server keeps no connection state to notify about.
             return
@@ -285,7 +285,7 @@ class HttpMcpClient(McpClient):
             async with asyncio.timeout(self._request_timeout):
                 await self._send(message, None)
         except TimeoutError:
-            raise McpError(None, "timed out") from None
+            raise McpError(None, "timed out", kind="timeout") from None
 
     async def _send(self, message: dict[str, Any], call_id: int | None) -> dict[str, Any] | None:
         """Post one message; return the result of a request, or None for a notification."""
@@ -399,7 +399,7 @@ class HttpMcpClient(McpClient):
             found = await self._dispatch("\n".join(data), call_id)
             if found is not None:
                 return found
-        raise McpError(None, "server closed the stream without a response")
+        raise McpError(None, "server closed the stream without a response", kind="transport_error")
 
     async def _dispatch(self, text: str, call_id: int) -> dict[str, Any] | None:
         if not text.strip():
