@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from importlib.util import module_from_spec, spec_from_file_location
@@ -16,6 +17,7 @@ from pydantic import ValidationError
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from agent import model_overrides
 from agent.config import PROJECT_ROOT, Settings
 from agent.model_config import ModelConfigError, ModelsConfig, load_models
 from agent.model_overrides import (
@@ -223,6 +225,23 @@ def test_embedded_secret_is_encrypted_and_master_key_is_private(tmp_path: Path) 
     assert decrypt_secret(token, settings, {}) == "private-secret"
     assert (tmp_path / "secret.key").stat().st_mode & 0o777 == 0o600
     assert encrypt_secret("private-secret", settings, {}) != token
+
+
+def test_embedded_master_key_works_without_posix_file_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Windows has neither O_NOFOLLOW nor a usable fchmod.
+    monkeypatch.setattr(model_overrides, "_WINDOWS", True)
+    monkeypatch.delattr(os, "O_NOFOLLOW")
+    monkeypatch.delattr(os, "fchmod")
+    settings = Settings(_env_file=None, data_dir=tmp_path)
+    token = encrypt_secret("private-secret", settings, {})
+    assert decrypt_secret(token, settings, {}) == "private-secret"
+    key = tmp_path / "secret.key"
+    key.rename(tmp_path / "real.key")
+    key.symlink_to(tmp_path / "real.key")
+    with pytest.raises(SecretKeyError, match="regular file"):
+        decrypt_secret(token, settings, {})
 
 
 def test_concurrent_embedded_key_creation_uses_one_master_key(tmp_path: Path) -> None:

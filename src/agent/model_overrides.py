@@ -111,6 +111,9 @@ async def lock_model_settings(db: AsyncSession) -> None:
     )
 
 
+_WINDOWS = os.name == "nt"
+
+
 class SecretKeyError(RuntimeError):
     """Report credential failures without secret values."""
 
@@ -135,11 +138,20 @@ def _local_key(settings: Settings, *, create: bool) -> bytes:
         finally:
             os.unlink(temporary)
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        if _WINDOWS:
+            # Windows has no O_NOFOLLOW, so the link check comes before the open.
+            if path.is_symlink():
+                raise SecretKeyError("secret.key must be a regular file")
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        else:
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
         with os.fdopen(descriptor, "rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise SecretKeyError("secret.key must be a regular file")
-            os.fchmod(stream.fileno(), 0o600)
+            # Windows has no owner-only file mode; the data folder access rules apply there.
+            if not _WINDOWS:
+                os.fchmod(stream.fileno(), 0o600)
             return stream.read(128).strip()
     except OSError:
         raise SecretKeyError("Cannot read secret.key; restore the original master key") from None
