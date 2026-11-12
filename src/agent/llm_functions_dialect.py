@@ -123,6 +123,80 @@ def _convert_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _is_null(schema: Any) -> bool:
+    return isinstance(schema, dict) and schema.get("type") == "null"
+
+
+_TYPES: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "integer": (int,),
+    "number": (int, float),
+    "boolean": (bool,),
+    "array": (list,),
+    "object": (dict,),
+}
+
+
+def _matches(value: Any, kind: Any) -> bool:
+    """Return True when a default value has the JSON type of its property."""
+    if value is None:
+        return False
+    expected = _TYPES.get(kind) if isinstance(kind, str) else None
+    if expected is None:
+        return True
+    if isinstance(value, bool) and kind != "boolean":
+        return False
+    return isinstance(value, expected)
+
+
+def _function_schema(schema: Any) -> Any:
+    """Return a copy of a JSON schema that the functions dialect accepts.
+
+    The provider needs one ``type`` for each property and refuses unions.
+    A nullable union, for example ``anyOf: [integer, null]``, becomes its
+    non-null branch. The parameter stays optional through ``required``.
+    A union of several types keeps its first branch. A default value that does
+    not have the property type is removed: the provider refuses it.
+    """
+    if isinstance(schema, list):
+        return [_function_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    result = {key: value for key, value in schema.items() if key not in ("anyOf", "oneOf")}
+    branches = [
+        branch
+        for key in ("anyOf", "oneOf")
+        if isinstance(schema.get(key), list)
+        for branch in schema[key]
+        if isinstance(branch, dict) and not _is_null(branch)
+    ]
+    if branches and "type" not in result:
+        # The keys of the property, for example its description, have priority.
+        for key, value in _function_schema(branches[0]).items():
+            result.setdefault(key, value)
+    types = result.get("type")
+    if isinstance(types, list):
+        concrete = [name for name in types if name != "null"]
+        result["type"] = concrete[0] if concrete else "string"
+    if "default" in result and not _matches(result["default"], result.get("type")):
+        del result["default"]
+    for key in ("properties", "$defs", "definitions"):
+        if isinstance(result.get(key), dict):
+            result[key] = {name: _function_schema(item) for name, item in result[key].items()}
+    for key in ("items", "additionalProperties", "allOf"):
+        if isinstance(result.get(key), (dict, list)):
+            result[key] = _function_schema(result[key])
+    return result
+
+
+def _function(tool: Any) -> Any:
+    """Return the bare function object with a schema that the dialect accepts."""
+    function = tool.get("function", tool) if isinstance(tool, dict) else tool
+    if isinstance(function, dict) and isinstance(function.get("parameters"), dict):
+        function = {**function, "parameters": _function_schema(function["parameters"])}
+    return function
+
+
 def to_functions_request(body: dict[str, Any]) -> dict[str, Any]:
     """Convert a chat-completions request body to the dialect body.
 
@@ -131,10 +205,7 @@ def to_functions_request(body: dict[str, Any]) -> dict[str, Any]:
     converted = copy.deepcopy(body)
     if "tools" in converted:
         # The dialect takes the bare function objects, without the {"type", "function"} wrapper.
-        converted["functions"] = [
-            tool.get("function", tool) if isinstance(tool, dict) else tool
-            for tool in converted.pop("tools")
-        ]
+        converted["functions"] = [_function(tool) for tool in converted.pop("tools")]
     converted["messages"] = _convert_messages(converted["messages"])
     if "tool_choice" in converted:
         choice = converted.pop("tool_choice")
