@@ -96,11 +96,14 @@ Clock = Callable[[], float]
 
 
 def build_ssl_context(ca_bundle: str | None) -> ssl.SSLContext | bool:
-    """Build an SSL context for an extra CA bundle file.
+    """Build an SSL context that trusts only the CA bundle file.
 
     Return ``True`` when no bundle is given. That keeps the default TLS
-    verification. A missing bundle raises :class:`AuthError`. TLS
-    verification is never disabled.
+    verification. With a bundle, the context trusts only the certificates in
+    that file and does not load the default trust store. The context applies
+    only to the connections of one provider. It never changes the trust of
+    other connections or of the system. A missing or unreadable bundle raises
+    :class:`AuthError`. TLS verification is never disabled.
     """
     if ca_bundle is None:
         return True
@@ -108,12 +111,29 @@ def build_ssl_context(ca_bundle: str | None) -> ssl.SSLContext | bool:
 
     if not Path(ca_bundle).is_file():
         raise AuthError("CA bundle file was not found")
-    context = ssl.create_default_context()
     try:
-        context.load_verify_locations(cafile=ca_bundle)
+        # A cafile argument replaces the default trust store; it does not add to it.
+        context = ssl.create_default_context(cafile=ca_bundle)
     except OSError:
         raise AuthError("CA bundle file could not be read") from None
+    if not context.get_ca_certs():
+        raise AuthError("CA bundle file contains no CA certificates")
     return context
+
+
+def provider_ssl_context(ca_bundle: str | None) -> ssl.SSLContext:
+    """Return the TLS context for the connections of one provider.
+
+    With a bundle, the context trusts only that bundle. Without a bundle, the
+    context trusts the default certifi roots. The environment never changes the
+    trust: SSL_CERT_FILE and SSL_CERT_DIR are ignored, so a provider without a
+    bundle cannot trust the CA of another provider. Errors are the same as for
+    :func:`build_ssl_context`.
+    """
+    context = build_ssl_context(ca_bundle)
+    if isinstance(context, ssl.SSLContext):
+        return context
+    return httpx.create_ssl_context(trust_env=False)
 
 
 class _CachedToken:

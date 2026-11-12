@@ -372,3 +372,50 @@ def test_empty_master_key_uses_the_local_key_file(tmp_path: Path, value: str) ->
     token = encrypt_secret("private-secret", settings, {"AGENT_SECRET_KEY": value})
     assert (tmp_path / "secret.key").exists()
     assert decrypt_secret(token, settings, {"AGENT_SECRET_KEY": value}) == "private-secret"
+
+
+def test_ui_key_becomes_the_oauth_key_of_a_file_provider(tmp_path: Path) -> None:
+    """A key saved in the UI is the OAuth key of a provider that the file describes."""
+    settings = Settings(_env_file=None, data_dir=tmp_path)
+    base = ModelsConfig.model_validate(
+        {
+            "providers": {
+                "sber": {
+                    "kind": "openai",
+                    "base_url": "https://chat.example.test/api/v1",
+                    "dialect": "functions",
+                    "ca_bundle": "config/certs/russian_trusted_ca.pem",
+                    "auth": {
+                        "type": "oauth_client_credentials",
+                        "token_url": "https://auth.example.test/api/v2/oauth",
+                        "key_env": "GIGACHAT_AUTH_KEY",
+                        "scope": "GIGACHAT_API_PERS",
+                    },
+                }
+            },
+            "models": {
+                "sber": {
+                    "provider": "sber",
+                    "model": "GigaChat-2-Max",
+                    "context_window": 32768,
+                    "max_tokens": 4096,
+                }
+            },
+            "routing": {"default": "sber"},
+        }
+    )
+    missing = merge_layers(base, None, OverrideSnapshot(), {}, settings=settings)
+    assert missing.registry.get("sber").configured is False
+    encrypted = encrypt_secret("ui-oauth-key-5678", settings, {})
+    overrides = OverrideSnapshot(
+        providers={"sber": OverrideEntry({}, api_key_ciphertext=encrypted, key_source="ui")}
+    )
+    model = merge_layers(base, None, overrides, {}, settings=settings).registry.get("sber")
+    assert model.configured is True
+    assert model.auth_secret == "ui-oauth-key-5678"
+    # The OAuth key is never sent as a plain Bearer key.
+    assert model.api_key == ""
+    assert model.auth is not None and model.auth.type == "oauth_client_credentials"
+    assert model.ca_bundle is not None and model.ca_bundle.endswith(
+        "config/certs/russian_trusted_ca.pem"
+    )
