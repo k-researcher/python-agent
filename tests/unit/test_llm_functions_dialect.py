@@ -319,3 +319,43 @@ def test_streamed_tool_call_has_an_index() -> None:
     assert streamed["finish_reason"] == "tool_calls"
     full = {"choices": [{"message": {"role": "assistant", "function_call": call}}]}
     assert "index" not in from_functions_response(full)["choices"][0]["message"]["tool_calls"][0]
+
+
+def test_nullable_parameters_get_one_type() -> None:
+    """The provider refuses anyOf unions; a nullable parameter keeps its real type."""
+    parameters = {
+        "type": "object",
+        "properties": {
+            "max_pages": {
+                "anyOf": [{"type": "integer", "minimum": 1, "maximum": 20}, {"type": "null"}],
+                "default": None,
+                "description": "Pages to fetch",
+            },
+            "tolerance": {
+                "anyOf": [{"type": "number", "minimum": 0}, {"type": "string"}],
+                "default": "0",
+            },
+            "labels": {"type": ["array", "null"], "items": {"anyOf": [{"type": "string"}]}},
+            "query": {"type": "string"},
+        },
+        "required": ["query"],
+    }
+    body = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "search", "parameters": parameters}}],
+    }
+    original = copy.deepcopy(body)
+    properties = to_functions_request(body)["functions"][0]["parameters"]["properties"]
+    assert properties["max_pages"] == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20,
+        "description": "Pages to fetch",
+    }
+    # The string default of the dropped branch does not match the number type.
+    assert properties["tolerance"] == {"type": "number", "minimum": 0}
+    assert properties["labels"] == {"type": "array", "items": {"type": "string"}}
+    assert properties["query"] == {"type": "string"}
+    assert all("anyOf" not in json.dumps(item) for item in properties.values())
+    assert body == original
