@@ -18,7 +18,8 @@ from typing import Any, Self
 import httpx
 
 from agent.llm_errors import classify_exception, classify_http_error
-from agent.model_config import ProviderSpec
+from agent.model_config import ProviderSpec, bundle_path
+from agent.provider_auth import AuthError, provider_ssl_context
 from agent.redaction import redact
 from agent.retry_policy import backoff
 
@@ -61,9 +62,14 @@ class EmbeddingClient:
     def _client(self) -> httpx.AsyncClient:
         """Return the pooled HTTP client, creating it on first use."""
         if self._http is None or self._http.is_closed:
+            try:
+                verify = provider_ssl_context(bundle_path(self._provider.ca_bundle))
+            except AuthError as exc:
+                raise EmbeddingError(str(exc)) from None
             self._http = httpx.AsyncClient(
                 timeout=httpx.Timeout(self._provider.timeout_seconds, connect=15.0),
                 follow_redirects=False,
+                verify=verify,
             )
         return self._http
 

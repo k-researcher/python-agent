@@ -29,7 +29,7 @@ from agent.provider_auth import (
     HeaderKeyAuth,
     NoAuth,
     OAuthClientCredentials,
-    build_ssl_context,
+    provider_ssl_context,
 )
 from agent.reasoning_tags import split_reasoning
 from agent.redaction import redact
@@ -201,17 +201,19 @@ class LLMClient:
             )
         return self._http
 
-    def _verify(self) -> ssl.SSLContext | bool:
-        """Return a verifying TLS setting; an extra CA bundle adds to the system roots."""
+    def _verify(self) -> ssl.SSLContext:
+        """Return the TLS context of this provider; a CA bundle replaces the default roots."""
         try:
-            return build_ssl_context(self.model.ca_bundle)
+            return provider_ssl_context(self.model.ca_bundle)
         except AuthError as exc:
             raise LLMError(f"Model {self.model.id}: {exc}") from None
 
     async def transport_settings(self) -> tuple[dict[str, str], ssl.SSLContext | bool]:
         """Share authentication and TLS settings with explicit connection checks."""
         headers, _ = await self._headers()
-        return headers, self._verify()
+        # Without a bundle, the connection check client uses its default roots and
+        # ignores the environment (trust_env=False), so True is safe there.
+        return headers, self._verify() if self.model.ca_bundle else True
 
     def _auth_provider(self) -> AuthProvider | None:
         if self.model.auth is None:

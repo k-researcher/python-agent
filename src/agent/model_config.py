@@ -30,7 +30,7 @@ from pydantic_core import InitErrorDetails
 from yaml.error import MarkedYAMLError
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
 
-from agent.config import EngineProfileSettings
+from agent.config import PROJECT_ROOT, EngineProfileSettings
 
 # openai: OpenAI-compatible /chat/completions (OpenAI, GLM, LM Studio, MLX, Ollama, gateways).
 # openai_responses: OpenAI Responses API (Codex/GPT reasoning models). anthropic: Messages API.
@@ -537,6 +537,14 @@ def secret_env(provider: ProviderSpec) -> str | None:
     return provider.api_key_env
 
 
+def bundle_path(ca_bundle: str | None) -> str | None:
+    """Return an absolute CA bundle path; a relative path starts at the project root."""
+    if ca_bundle is None:
+        return None
+    path = Path(ca_bundle).expanduser()
+    return str(path if path.is_absolute() else PROJECT_ROOT / path)
+
+
 def resolve_model(
     model_id: str,
     model: ModelSpec,
@@ -586,7 +594,7 @@ def resolve_model(
         auth=provider.auth,
         auth_secret=secret if provider.auth is not None else "",
         headers=headers,
-        ca_bundle=provider.ca_bundle,
+        ca_bundle=bundle_path(provider.ca_bundle),
         dialect=provider.dialect,
         data_in_russia=provider.data_in_russia,
     )

@@ -9,6 +9,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from agent.config import PROJECT_ROOT
 from agent.model_config import ModelsConfig, ProviderSpec, load_models
 from agent.model_overrides import OverrideSnapshot, merge_layers
 
@@ -96,7 +97,8 @@ def test_oauth_command_and_none_auth_types_parse(tmp_path: Path) -> None:
     model = _load(tmp_path, oauth, {"AUTH_KEY": _SECRET}).get("main")
     assert model.auth is not None and model.auth.type == "oauth_client_credentials"
     assert model.dialect == "functions"
-    assert model.ca_bundle == "config/certs/root.pem"
+    # A relative bundle path starts at the project root, not at the working directory.
+    assert model.ca_bundle == str(PROJECT_ROOT / "config/certs/root.pem")
     command = ProviderSpec.model_validate(
         {
             "kind": "openai",

@@ -451,7 +451,7 @@ def test_probe_uses_the_configured_trust_store(
             follow_redirects=False,
         )
 
-    monkeypatch.setattr(llm, "build_ssl_context", trust_store)
+    monkeypatch.setattr(llm, "provider_ssl_context", trust_store)
     monkeypatch.setattr(settings_api, "connection_client", connection)
     response = client.post(f"{PREFIX}/models/fast/probe")
     assert response.status_code == 200
