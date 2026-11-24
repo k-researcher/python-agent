@@ -32,7 +32,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.config import Settings
 from agent.models import Project, ProjectSkillSetting, SharedSkillDefault
-from agent.safe_fs import SafeProjectFS
+from agent.safe_fs import project_fs
+from agent.security import PathSecurityError
 from agent.skill_prompt import (
     SkillSet,
     load_scoped_skills,
@@ -58,6 +59,7 @@ MAX_PACKAGE_BYTES = 5 * 1024 * 1024
 MAX_PACKAGE_FILES = 200
 MAX_UNPACKED_BYTES = 20 * 1024 * 1024
 _IGNORED_ENTRIES = frozenset({".DS_Store", "Thumbs.db"})
+_REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT: symlink, junction, mount point
 
 
 class SkillConflictError(SkillError):
@@ -107,7 +109,10 @@ def revision(content: str) -> str:
 
 
 def skill_text(skill: Skill) -> str:
-    return (skill.root / SKILL_MD).read_text(encoding="utf-8")
+    # newline="" keeps CRLF as written: the revision and the unchanged-compare must see
+    # the same text the file layer compares against the file on disk.
+    with (skill.root / SKILL_MD).open(encoding="utf-8", newline="") as stream:
+        return stream.read()
 
 
 async def load_catalog(
@@ -241,7 +246,7 @@ def _base(settings: Settings, scope: Scope, project: Project | None) -> tuple[Pa
     return root, project_skills_dir(root).relative_to(root).as_posix() + "/"
 
 
-def _fs_error(exc: ToolError) -> SkillError:
+def _fs_error(exc: ToolError | PathSecurityError) -> SkillError:
     if "conflict" in str(exc) or "already exists" in str(exc):
         return SkillConflictError("Навык изменился или уже есть. Обновите страницу.")
     return SkillError(str(exc))
@@ -249,6 +254,13 @@ def _fs_error(exc: ToolError) -> SkillError:
 
 def _skill_path(state: SkillState, base: Path) -> str:
     return (state.skill.root / SKILL_MD).relative_to(base.resolve()).as_posix()
+
+
+def _plain_directory(entry: os.stat_result) -> bool:
+    """Return True for a real directory: not a link and not a Windows reparse point."""
+    if not stat.S_ISDIR(entry.st_mode):
+        return False
+    return not int(getattr(entry, "st_file_attributes", 0)) & _REPARSE_POINT
 
 
 def create_skill(
@@ -285,8 +297,8 @@ def _create(
     _check_free(catalog, scope, name)
     content = _checked_text(header, body, base / prefix / name)
     try:
-        SafeProjectFS(base).create_text_exclusive(f"{prefix}{name}/{SKILL_MD}", content)
-    except ToolError as exc:
+        project_fs(base).create_text_exclusive(f"{prefix}{name}/{SKILL_MD}", content)
+    except (ToolError, PathSecurityError) as exc:
         raise _fs_error(exc) from exc
     return load_skill(base / prefix / name)
 
@@ -301,14 +313,23 @@ def update_skill(
 ) -> Skill:
     """Replace the description and the instructions; keep the other header fields."""
     base, _ = _base(settings, state.scope, project)
+    # The file layer checks the manifest path before anything reads it: a link or a
+    # reparse point in place of a skill directory is refused, not traversed.
+    try:
+        if not project_fs(base).exists(_skill_path(state, base)):
+            raise ToolError("Навык изменился или недоступен. Обновите страницу.")
+    except (ToolError, PathSecurityError) as exc:
+        raise _fs_error(exc) from exc
     current = skill_text(state.skill)
     if revision(current) != expected:
         raise SkillConflictError("Навык изменился в другом месте. Обновите страницу.")
-    header, _ = parse_skill_text(current, state.skill.root)
+    # A CRLF manifest keeps its raw text for the revision and the unchanged-compare;
+    # only the parsing sees the normalized form.
+    header, _ = parse_skill_text(current.replace("\r\n", "\n"), state.skill.root)
     content = _checked_text({**header, "description": description}, body, state.skill.root)
     try:
-        SafeProjectFS(base).replace_if_unchanged(_skill_path(state, base), current, content)
-    except ToolError as exc:
+        project_fs(base).replace_if_unchanged(_skill_path(state, base), current, content)
+    except (ToolError, PathSecurityError) as exc:
         raise _fs_error(exc) from exc
     return load_skill(state.skill.root)
 
@@ -322,7 +343,10 @@ def delete_skill(
         raise SkillConflictError("Навык изменился в другом месте. Обновите страницу.")
     directory = state.skill.root
     parent = (base / prefix).resolve()
-    if directory.parent != parent or not stat.S_ISDIR(os.lstat(directory).st_mode):
+    # The entry is read only for a directory in its place: a directory that is gone
+    # must give the same error as one outside the skills directory.
+    entry = os.lstat(directory) if directory.parent == parent else None
+    if entry is None or not _plain_directory(entry):
         raise SkillError("Skill directory is not a plain directory in the skills directory")
     if not shutil.rmtree.avoids_symlink_attacks:
         raise SkillError("This system cannot remove a directory safely")

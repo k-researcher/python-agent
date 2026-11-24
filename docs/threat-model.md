@@ -15,7 +15,7 @@ English version: [threat-model.en.md](threat-model.en.md).
 Browser ──cookie + CSRF──> API ──session ID──> Redis Stream ──> Workers
                               └──────────────> PostgreSQL <───────┘
 Workers ──approved egress──> LLM / HTTP / DB / SSH / embeddings
-Workers ──SafeProjectFS────> /workspace projects
+Workers ──project_fs───────> /workspace projects
 ```
 
 Вывод LLM и содержимое проекта — недоверенные данные. Redis и PostgreSQL находятся во
@@ -28,7 +28,7 @@ Workers ──SafeProjectFS────> /workspace projects
 | --- | --- |
 | Prompt injection вызывает побочный эффект | Центральный реестр рисков. Подтверждение до выполнения. Проверка аргументов по JSON Schema до подтверждения |
 | Кража ключей через `read_file` или shell | Блокировка файлов с секретами. Shell без унаследованных секретов. Non-root контейнер |
-| Выход за проект через `..` или symlink | `SafeProjectFS`: дескрипторы, `O_NOFOLLOW`, атомарная замена. `PathGuard` для чтения |
+| Выход за проект через `..` или symlink | POSIX: `SafeProjectFS` — дескрипторы, `O_NOFOLLOW`, атомарная замена. Windows (NTFS): `PortableProjectFS` — отказ symlink, junction и reparse point при проверке пути, атомарная замена; проверка и действие разнесены. `PathGuard` для чтения |
 | SSRF через HTTP-инструмент | Allowlist хостов. Проверка DNS и частных диапазонов IP. Редиректы выключены. Заголовок `Host` запрещён |
 | DNS rebinding к локальному API | Точная проверка `Host`. Проверка `Origin`. Cookie-сессия и CSRF-токен |
 | Кража или подделка входа в браузере | Одноразовая ссылка во fragment URL. Хеши кодов и сессий в БД. Cookie `HttpOnly; SameSite=Strict`, при HTTPS `__Host-` и `Secure`. Отзыв сессий |
@@ -45,6 +45,9 @@ Workers ──SafeProjectFS────> /workspace projects
 
 - Одобренный shell, SSH или SQL — мощная операция. Подтверждение не доказывает её
   безопасность.
+- На Windows файловый слой не держит дескриптор каталога: компоненту пути могут заменить
+  ссылкой между проверкой и действием. Приёмочного прогона на NTFS ещё не было
+  ([ADR 0006](adr/0006-windows-file-fallback.md)).
 - Сервер проверяет DNS перед запросом. Но DNS хостов из allowlist остаётся частью доверенной
   базы.
 - Вход однопользовательский. Ролей и изоляции арендаторов нет.

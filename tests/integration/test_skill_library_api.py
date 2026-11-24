@@ -216,6 +216,28 @@ def test_update_keeps_other_header_fields_and_refuses_a_stale_revision(
         assert stale.status_code == 409
 
 
+def test_update_accepts_a_crlf_manifest_without_a_false_conflict(
+    tmp_path: Path, shared: Path
+) -> None:
+    """The revision and the unchanged-compare see the raw text, CRLF included."""
+    (shared / "notes").mkdir(parents=True)
+    (shared / "notes/SKILL.md").write_bytes(
+        skill_md("notes", "Old", "Old body").replace("\n", "\r\n").encode("utf-8")
+    )
+    with authed_client() as client:
+        detail = client.get("/api/skills/shared/notes").json()
+        saved = client.put(
+            "/api/skills/shared/notes",
+            json={
+                "description": "New",
+                "instructions": "New body",
+                "revision": detail["revision"],
+            },
+        )
+        assert saved.status_code == 200, saved.text
+        assert "description: New" in (shared / "notes/SKILL.md").read_text("utf-8")
+
+
 def test_delete_removes_the_directory_and_its_switches(tmp_path: Path, shared: Path) -> None:
     write_skill(shared, "review", "Review code", "Steps")
     (shared / "review/checklist.md").write_text("- tests", "utf-8")

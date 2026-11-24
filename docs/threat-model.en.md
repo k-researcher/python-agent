@@ -15,7 +15,7 @@ Russian version: [threat-model.md](threat-model.md).
 Browser ──cookie + CSRF──> API ──session ID──> Redis Stream ──> Workers
                               └──────────────> PostgreSQL <───────┘
 Workers ──approved egress──> LLM / HTTP / DB / SSH / embeddings
-Workers ──SafeProjectFS────> /workspace projects
+Workers ──project_fs───────> /workspace projects
 ```
 
 LLM output and project content are untrusted data. Redis and PostgreSQL are in the internal
@@ -28,7 +28,7 @@ Compose network. The trusted control inputs are the administrator configuration
 | --- | --- |
 | Prompt injection causes a side effect | Central risk registry. Approval before execution. JSON Schema validation of arguments before approval |
 | Key theft through `read_file` or the shell | Block of files with secrets. Shell without inherited secrets. Non-root container |
-| Escape from the project through `..` or a symlink | `SafeProjectFS`: descriptors, `O_NOFOLLOW`, atomic replacement. `PathGuard` for reads |
+| Escape from the project through `..` or a symlink | POSIX: `SafeProjectFS` — descriptors, `O_NOFOLLOW`, atomic replacement. Windows (NTFS): `PortableProjectFS` — a symlink, a junction and a reparse point are rejected by the path check, atomic replacement; the check and the action are separated in time. `PathGuard` for reads |
 | SSRF through the HTTP tool | Host allowlist. DNS and private IP range checks. Redirects off. `Host` header not permitted |
 | DNS rebinding to the local API | Exact `Host` check. `Origin` check. Cookie session and CSRF token |
 | Theft or forgery of a browser login | One-time link in the URL fragment. Hashes of codes and sessions in the database. `HttpOnly; SameSite=Strict` cookie; on HTTPS `__Host-` and `Secure`. Session revocation |
@@ -45,6 +45,9 @@ Compose network. The trusted control inputs are the administrator configuration
 
 - An approved shell, SSH or SQL operation is powerful. An approval does not prove that it is
   safe.
+- On Windows the file layer holds no directory descriptor: a path component can be replaced
+  with a link between the check and the action. There was no acceptance run on NTFS yet
+  ([ADR 0006](adr/0006-windows-file-fallback.en.md)).
 - The server examines DNS before a request. The DNS of allowlisted hosts stays part of the
   trusted base.
 - The login is for one user. There are no roles and no tenant isolation.

@@ -11,6 +11,7 @@ from agent.tools.patch_tools import (
     ApplyPatchTool,
     EditByLinesTool,
     Hunk,
+    _parse_paths,
     apply_hunks,
     parse_unified_diff,
 )
@@ -783,3 +784,19 @@ async def test_apply_patch_rollback_does_not_delete_replaced_created_file(
         await ApplyPatchTool().execute(_context(tmp_path), {"patch": patch})
     # The foreign file must be preserved, not deleted by rollback.
     assert (tmp_path / "new.txt").read_text() == "someone else\n"
+
+
+def test_parse_paths_strips_the_name_except_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows keeps trailing dots and spaces for the file layer; other systems strip them."""
+    monkeypatch.setattr("agent.tools.patch_tools.os.name", "nt")
+    assert _parse_paths("+++ b/notes.txt ", "+++ ") == "notes.txt "
+    assert _parse_paths("+++ b/notes.txt.", "+++ ") == "notes.txt."
+    assert _parse_paths("--- a/CON.txt\r", "--- ") == "CON.txt"
+    assert _parse_paths("+++ /dev/null\r", "+++ ") is None
+    assert _parse_paths("+++ b/file\t2026-01-01", "+++ ") == "file"
+
+    monkeypatch.setattr("agent.tools.patch_tools.os.name", "posix")
+    assert _parse_paths("+++ b/notes.txt ", "+++ ") == "notes.txt"
+    assert _parse_paths("+++ b/notes.txt.", "+++ ") == "notes.txt."
+    assert _parse_paths("+++ /dev/null ", "+++ ") is None
+    assert _parse_paths("+++ b/file\t2026-01-01", "+++ ") == "file"
