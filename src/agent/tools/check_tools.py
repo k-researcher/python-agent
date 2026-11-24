@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent.safe_fs import SafeProjectFS
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 from agent.tools.builtin import ShellTool
 
@@ -28,12 +27,19 @@ class CheckCommand:
 def _read_project_config(name: str, root: Path) -> str | None:
     """Read a config file in the project root without following symlinks.
 
-    SafeProjectFS opens every path component with O_NOFOLLOW and checks the size on the
-    open descriptor, so the file cannot be swapped between the check and the read.
-    A symlink, a file larger than 1 MB and a missing or unreadable file return None.
+    The project file layer opens every path component without following links and
+    checks the size during the read, so the file cannot be swapped between the check
+    and the read. A symlink, a file larger than 1 MB and a missing or unreadable file
+    return None. The layer itself is built outside the except clause: a platform with
+    no layer must fail loudly instead of looking like a project without check commands.
     """
+    # Imported lazily, like in the other tool modules: agent.safe_fs imports
+    # agent.tools.base, which initialises this package.
+    from agent.safe_fs import project_fs
+
+    fs = project_fs(root)
     try:
-        return SafeProjectFS(root).read_text(name, max_bytes=MAX_CONFIG_BYTES)
+        return fs.read_text(name, max_bytes=MAX_CONFIG_BYTES)
     except (OSError, ValueError, ToolError):
         return None
 

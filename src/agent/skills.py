@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -114,8 +115,25 @@ def validate_header(
     return name, description, version, tuple(tool_names)
 
 
+def _is_unsafe_entry(path: Path) -> bool:
+    """Return True for symlinks and Windows reparse points.
+
+    A junction or a symlink in place of a skill directory must not be traversed:
+    the manifest inside it would be read before any file layer check runs.
+    """
+    try:
+        entry = path.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(entry.st_mode):
+        return True
+    return bool(int(getattr(entry, "st_file_attributes", 0)) & 0x400)
+
+
 def load_skill(directory: Path) -> Skill:
     """Load a skill from its directory."""
+    if _is_unsafe_entry(directory):
+        raise SkillError(f"Skill directory is a link or a reparse point: {directory}")
     root = directory.resolve()
     content = _read_skill_md(directory)
     data, body = parse_skill_text(content, directory)
@@ -159,7 +177,7 @@ def scan_skills(root: Path) -> tuple[list[Skill], list[str]]:
     errors: list[str] = []
     seen: set[str] = set()
     for entry in sorted(root.iterdir(), key=lambda p: p.name):
-        if entry.name.startswith(".") or not entry.is_dir() or entry.is_symlink():
+        if entry.name.startswith(".") or not entry.is_dir() or _is_unsafe_entry(entry):
             continue
         if not (entry / SKILL_MD).is_file():
             continue

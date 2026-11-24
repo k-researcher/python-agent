@@ -305,3 +305,15 @@ def test_skill_index_keeps_one_line_per_skill(tmp_path: Path) -> None:
     content = '---\nname: multi\ndescription: "first line\\nsecond line"\n---\nBody.\n'
     skill = load_skill(_write_skill(tmp_path, "multi", content))
     assert skill_index([skill]) == "- multi: first line second line"
+
+
+def test_load_skill_refuses_link_directories(tmp_path: Path) -> None:
+    """A symlink (or, on Windows, a junction) must not act as a skill directory."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "SKILL.md").write_text(_VALID_HEADER, encoding="utf-8")
+    link = tmp_path / "linked-skill"
+    link.symlink_to(real)
+
+    with pytest.raises(SkillError, match="link or a reparse point"):
+        load_skill(link)

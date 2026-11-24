@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.safe_fs import SafeProjectFS
+from agent.safe_fs import PortableProjectFS, SafeProjectFS
 from agent.security import PathGuard
 from agent.tools import ToolRegistry
 from agent.tools.base import ToolContext, ToolError
@@ -216,10 +216,15 @@ async def test_read_many_rejects_symlink_without_leak(tmp_path: Path) -> None:
     assert result["files"][1] == {"path": "ok.txt", "content": "fine", "truncated": False}
 
 
-async def test_read_many_rejects_symlink_swapped_after_check(
+async def test_read_many_reads_before_name_normalization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A symlink planted after the path check must not leak external bytes."""
+    """A symlink planted during the later name normalization must not leak bytes.
+
+    The file layer validates and reads first; PathGuard afterwards only normalizes
+    the display name. A swap at that point happens after the content is already
+    read, so the tool must report the checked content and never read the target.
+    """
     project = tmp_path / "project"
     project.mkdir()
     (project / "doc.txt").write_text("safe content")
@@ -248,8 +253,42 @@ async def test_read_many_rejects_symlink_swapped_after_check(
         {"paths": ["doc.txt", "ok.txt"], "max_bytes_per_file": 100},
     )
 
-    assert "error" in result["files"][0]
+    assert result["files"][0] == {"path": "doc.txt", "content": "safe content", "truncated": False}
     assert "TOP SECRET content" not in str(result)
+    assert result["files"][1] == {"path": "ok.txt", "content": "fine", "truncated": False}
+
+
+async def test_read_many_refuses_forbidden_name_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file layer refuses a forbidden path before anything resolves it."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "ok.txt").write_text("fine")
+    real_resolve = PathGuard.resolve
+
+    def fail_on_forbidden(
+        self: PathGuard,
+        value: str,
+        *,
+        must_exist: bool = True,
+        allow_sensitive: bool = False,
+    ) -> Path:
+        assert value == "ok.txt", "PathGuard must not see the refused path"
+        return real_resolve(self, value, must_exist=must_exist, allow_sensitive=allow_sensitive)
+
+    def portable(root: Path) -> PortableProjectFS:
+        return PortableProjectFS(root)
+
+    monkeypatch.setattr(PathGuard, "resolve", fail_on_forbidden)
+    monkeypatch.setattr("agent.tools.builtin._safe_fs", portable)
+
+    result = await ReadManyTool().execute(
+        context(project),
+        {"paths": ["CON", "ok.txt"], "max_bytes_per_file": 100},
+    )
+
+    assert "Reserved device names" in result["files"][0]["error"]
     assert result["files"][1] == {"path": "ok.txt", "content": "fine", "truncated": False}
 
 

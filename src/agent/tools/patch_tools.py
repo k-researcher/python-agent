@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from contextlib import suppress
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from agent.safe_fs import SafeProjectFS
+    from agent.safe_fs import ProjectFS
 
 _MAX_FILE_BYTES = 1_000_000
 _MAX_PATCH_BYTES = 200_000
@@ -36,21 +37,26 @@ class FilePatch:
     hunks: list[Hunk]
 
 
-def _restrip(path: str) -> str:
+def _restrip(path: str, *, keep_ends: bool = False) -> str:
     """Strip the ``a/`` and ``b/`` prefixes and trailing timestamp metadata."""
     name = path
     if "\t" in name:
         name = name.split("\t", 1)[0]
     if name.startswith("a/") or name.startswith("b/"):
         name = name[2:]
-    return name.strip()
+    return name if keep_ends else name.strip()
 
 
 def _parse_paths(line: str, marker: str) -> str | None:
-    raw = line[len(marker) :].strip()
-    if raw == "/dev/null":
+    raw = line[len(marker) :]
+    if raw.strip() == "/dev/null":
         return None
-    return _restrip(raw)
+    # Windows drops or refuses trailing dots and spaces of a name. The file layer has to see
+    # them to refuse the spelling, so there the name keeps them. Other systems strip the
+    # name as before: a stray space in a model-written header must not break the patch.
+    if os.name == "nt":
+        return _restrip(raw.lstrip().rstrip("\r\n"), keep_ends=True)
+    return _restrip(raw.strip())
 
 
 def _parse_hunk(lines: list[str], i: int) -> tuple[Hunk, int]:
@@ -175,10 +181,10 @@ def apply_hunks(original: str, hunks: Iterable[Hunk], *, path: str) -> str:
     return "".join(old)
 
 
-def _safe_fs(root: Path) -> SafeProjectFS:
-    from agent.safe_fs import SafeProjectFS
+def _safe_fs(root: Path) -> ProjectFS:
+    from agent.safe_fs import project_fs
 
-    return SafeProjectFS(root)
+    return project_fs(root)
 
 
 def _validate_path(path: str) -> str:
@@ -194,7 +200,7 @@ def _validate_path(path: str) -> str:
     return path
 
 
-def _try_read(fs: SafeProjectFS, path: str) -> str | None:
+def _try_read(fs: ProjectFS, path: str) -> str | None:
     try:
         return fs.read_text(path, max_bytes=_MAX_FILE_BYTES)
     except ToolError:
@@ -206,7 +212,9 @@ def _try_read(fs: SafeProjectFS, path: str) -> str | None:
         raise
 
 
-def _rollback(fs: SafeProjectFS, applied: list[tuple[str, str, str | None, str | None]]) -> None:
+def _rollback(
+    fs: ProjectFS, applied: list[tuple[str, str, str | None, str | None]]
+) -> None:
     """Restore files changed by a failed patch application.
 
     Iterates the applied changes in reverse order. Each restore reverts a

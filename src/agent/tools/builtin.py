@@ -15,7 +15,7 @@ from agent.sandbox import prepare as prepare_sandbox
 from agent.security import PathGuard, PathSecurityError
 
 if TYPE_CHECKING:
-    from agent.safe_fs import SafeProjectFS
+    from agent.safe_fs import ProjectFS
 from agent.tools.base import RiskLevel, Tool, ToolContext, ToolError
 from agent.trusted_commands import trusted_local_command, trusted_program_path
 
@@ -35,11 +35,11 @@ def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
             process.kill()
 
 
-def _safe_fs(root: Path) -> SafeProjectFS:
+def _safe_fs(root: Path) -> ProjectFS:
     # Imported lazily: agent.safe_fs imports agent.tools.base, which initialises this package.
-    from agent.safe_fs import SafeProjectFS
+    from agent.safe_fs import project_fs
 
-    return SafeProjectFS(root)
+    return project_fs(root)
 
 
 def _read_text(path: Path) -> str:
@@ -264,10 +264,12 @@ class ReadManyTool(Tool):
         for value in paths:
             relative = value
             try:
+                # The file layer validates the raw path first: platform name forms and
+                # link entries are refused before anything resolves the path. PathGuard
+                # afterwards only normalizes the display name of a validated path.
+                content = fs.read_text(value, max_bytes=MAX_TEXT_BYTES)
                 path = guard.resolve(value)
                 relative = str(path.relative_to(project_root))
-                # SafeProjectFS re-validates no-follow, regular-file, size and UTF-8.
-                content = fs.read_text(value, max_bytes=MAX_TEXT_BYTES)
             except (ToolError, OSError, RuntimeError, ValueError) as exc:
                 files.append({"path": relative, "error": str(exc)})
                 continue

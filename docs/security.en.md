@@ -40,10 +40,19 @@ Details: [ADR 0003](adr/0003-browser-authentication.en.md).
 
 ## Local boundaries
 
-`SafeProjectFS` writes, edits and removes files through file descriptors. It does not follow a
-symlink in any path component. It makes the temporary file in the same directory. The file
-replacement is atomic. `PathGuard` prevents `..`, absolute paths outside the project and
-symlink escapes for reads.
+The factory `project_fs` selects the file layer. On macOS and Linux it is `SafeProjectFS`:
+it writes, edits and removes files through file descriptors and does not follow a symlink in
+any path component. It makes the temporary file in the same directory. The file replacement
+is atomic. `PathGuard` keeps a read inside the project root, also through `..` and a symlink,
+and blocks files with secrets.
+
+On Windows the layer is `PortableProjectFS`: the same path checks on other primitives. A
+symlink, a junction and other reparse points are rejected by the check, but the check and the
+action are separated in time, so the protection is weaker than the descriptor one. The layer
+works only for a root on a local NTFS drive. The import of a skill ZIP archive, the removal of
+a skill directory and reading a skill file with the `read_skill` tool do not work on Windows.
+The acceptance run on Windows is not done yet. Details:
+[ADR 0006](adr/0006-windows-file-fallback.en.md).
 
 The shell gets the project root as `cwd`, a limited timeout and a limited output. The shell
 always requires approval. The command runs in its own process group. Stop, timeout and output

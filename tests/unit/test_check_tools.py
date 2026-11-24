@@ -401,3 +401,17 @@ async def test_run_checks_tool_filters_typecheck(tmp_path: Path) -> None:
 
     assert shell.commands == ["mypy"]
     assert [item["kind"] for item in result["results"]] == ["typecheck"]
+
+
+def test_read_project_config_refuses_when_no_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A platform without a file layer must fail loudly, not look like a project."""
+    from agent.tools.check_tools import _read_project_config
+
+    def no_layer(root: Path) -> None:
+        raise ToolError("No safe file layer is available")
+
+    monkeypatch.setattr("agent.safe_fs.project_fs", no_layer)
+    with pytest.raises(ToolError, match="No safe file layer"):
+        _read_project_config("pyproject.toml", tmp_path)
